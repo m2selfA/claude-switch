@@ -130,6 +130,12 @@ cswitch aliases >> ~/.zshrc   # or ~/.bashrc
 source ~/.zshrc
 ```
 
+If you have a `~/.bashrc.d/` directory, aliases are automatically written to `~/.bashrc.d/38-claude-switch.sh` instead. Source it from your `~/.bashrc`:
+
+```bash
+source ~/.bashrc.d/38-claude-switch.sh
+```
+
 This gives you commands like:
 
 ```bash
@@ -144,7 +150,7 @@ On Windows, `cswitch aliases` outputs PowerShell functions instead. Add them to 
 | | macOS | Linux | Windows |
 |---|---|---|---|
 | Profile management | Yes | Yes | Yes |
-| Credential handling | Keychain | File-based | Credential Manager |
+| Credential handling | Keychain | File-based | File-based |
 | Shell aliases | bash/zsh | bash/zsh | PowerShell |
 | TUI | Yes | Yes | Yes |
 
