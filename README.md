@@ -46,13 +46,13 @@ cargo install --path .
 
 ```bash
 # Save current ~/.claude as a full profile
-cswitch add work
+cswitch add --full work
 
-# Create a lightweight profile (env-var based)
+# Create a lightweight profile (env-var based, interactive prompts)
 cswitch add my-api-key --alias mykey
 
-# Launch with a profile
-cswitch use work
+# Launch with a profile (with stored launch args)
+cswitch use -e work
 
 # Or open the interactive TUI
 cswitch
@@ -63,10 +63,10 @@ cswitch
 | Command | Description |
 |---|---|
 | `cswitch` | Open interactive TUI |
-| `cswitch add <name>` | Add a profile (full by default, lightweight with interactive prompts) |
+| `cswitch add <name>` | Add a lightweight profile (env vars, interactive prompts) |
 | `cswitch add --full <name>` | Add a full profile (copies ~/.claude) |
 | `cswitch add --alias <a> <name>` | Add with a short CLI-friendly alias |
-| `cswitch use <name>` | Launch Claude Code with a profile (accepts name, alias, or id) |
+| `cswitch use [-e] <name> [-- <claude-args>]` | Launch Claude Code with a profile; `-e` enables stored launch args |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
@@ -83,12 +83,13 @@ Run `cswitch` with no arguments to open the TUI.
 |---|---|
 | `↑/↓` or `j/k` | Navigate profiles |
 | `Enter` | Launch Claude with selected profile |
+| `Shift+Enter` | Launch with stored launch args |
 | `/` | Search profiles by name or alias |
 | `t` | Add lightweight profile (env vars) |
 | `a` | Add full profile (directory isolation) |
-| `e` | Edit profile name / alias |
-| `E` | Edit lightweight env vars |
+| `e` | Edit profile (name/alias/flags, or full model editor for lite) |
 | `m` | Toggle [1m] suffix on model slots |
+| `Tab` | Complete: cycle model IDs / env vars / CLI flags |
 | `r` | Refresh — re-copy ~/.claude into selected |
 | `d` | Delete selected profile |
 | `?` | Help overlay |
@@ -125,6 +126,7 @@ Profiles are tracked in `~/.claude-switch/registry.json`, keyed by UUID. Each pr
 - `name` — display name (supports Chinese, spaces, any characters)
 - `alias` — optional short CLI-friendly name (alphanumeric, `-`, `_`)
 - `kind` — `full` or `lightweight`
+- `launch_args` — optional CLI flags passed to claude on launch (e.g. `--dangerously-skip-permissions`)
 
 ### Full profiles
 

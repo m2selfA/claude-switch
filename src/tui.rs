@@ -8,6 +8,8 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 
+use crate::cli_args::all_flag_names;
+use crate::env_vars::all_var_names;
 use crate::profile::{fetch_models, LightweightEnv, Profile, ProfileKind, ProfileManager};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
@@ -89,6 +91,7 @@ pub struct App {
     lite_mod_model: String,
     lite_mod_subagent: String,
     lite_extras: Vec<String>,
+    lite_launch_args: String,
 }
 
 impl App {
@@ -129,6 +132,7 @@ impl App {
             lite_mod_model: String::new(),
             lite_mod_subagent: String::new(),
             lite_extras: Vec::new(),
+            lite_launch_args: "--dangerously-skip-permissions".to_string(),
         })
     }
 
@@ -338,12 +342,21 @@ impl App {
                 self.mode = Mode::Help;
             }
 
+            KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
+                // Shift+Enter: launch with stored launch_args
+                if let Some(p) = self.selected_profile() {
+                    ratatui::restore();
+                    println!("Launching Claude with profile '{}' (with extra args)...", p.name);
+                    self.manager.launch_claude(&p.id, &[], true)?;
+                }
+            }
+
             KeyCode::Enter => {
                 if let Some(p) = self.selected_profile() {
                     let name = p.name.clone();
                     ratatui::restore();
                     println!("Launching Claude with profile '{}'…", name);
-                    self.manager.launch_claude(&p.id, &[])?;
+                    self.manager.launch_claude(&p.id, &[], false)?;
                 }
             }
 
@@ -357,6 +370,7 @@ impl App {
                 self.lite_model_page = 0;
                 self.lite_1m = [false; 5];
                 self.lite_extras.clear();
+                self.lite_launch_args = "--dangerously-skip-permissions".to_string();
                 self.lite_mod_opus.clear();
                 self.lite_mod_sonnet.clear();
                 self.lite_mod_haiku.clear();
@@ -400,6 +414,9 @@ impl App {
                         self.lite_edit_id = profile.id.clone();
                         self.lite_step = 0;
                         self.lite_extras = env.extras.clone();
+                        self.lite_launch_args = profile.launch_args
+                            .map(|v| v.join(" "))
+                            .unwrap_or_default();
                         let token = self.lite_token.clone();
                         let base_url = self.lite_url.clone();
                         self.mode = Mode::LiteFetching;
@@ -417,9 +434,12 @@ impl App {
                         self.mode = Mode::Message("No env config found.".into(), true);
                     }
                 } else {
-                    // Full profile: edit name/alias only
+                    // Full profile: edit name/alias + launch args
                     self.lite_name = profile.name.clone();
                     self.lite_alias = profile.alias.clone().unwrap_or_default();
+                    self.lite_launch_args = profile.launch_args
+                        .map(|v| v.join(" "))
+                        .unwrap_or_default();
                     self.mode = Mode::EditProfile {
                         profile_id: profile.id.clone(),
                         step: 0,
@@ -560,7 +580,7 @@ impl App {
         Ok(())
     }
 
-    // ── Edit Profile (name/alias) ────────────────────────────────────────────
+    // ── Edit Profile (name / alias / launch args) ──────────────────────────────
 
     fn handle_edit_profile(&mut self, code: KeyCode) -> Result<()> {
         match code {
@@ -577,8 +597,17 @@ impl App {
                     Mode::EditProfile { profile_id, .. } => profile_id.clone(),
                     _ => return Ok(()),
                 };
+                // Save launch args
+                let launch: Option<Vec<String>> = {
+                    let s = self.lite_launch_args.trim();
+                    if s.is_empty() { None } else {
+                        Some(s.split_whitespace().map(String::from).collect())
+                    }
+                };
                 match self.manager.rename_profile(&id, &new_name, alias_opt) {
                     Ok(p) => {
+                        // Update launch_args
+                        let _ = self.manager.set_launch_args(&p.id, launch);
                         self.refresh()?;
                         self.select_by_id(&p.id);
                         self.mode = Mode::Message(format!("Profile '{}' updated.", p.name), false);
@@ -590,15 +619,16 @@ impl App {
                 match self.mode {
                     Mode::EditProfile { step: 0, .. } => { self.lite_name.pop(); }
                     Mode::EditProfile { step: 1, .. } => { self.lite_alias.pop(); }
+                    Mode::EditProfile { step: 2, .. } => { self.lite_launch_args.pop(); }
                     _ => {}
                 }
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
-                // Toggle between name (0) and alias (1)
+                // Cycle: 0=name → 1=alias → 2=launch_args → 0
                 self.mode = match &self.mode {
                     Mode::EditProfile { profile_id, step } => Mode::EditProfile {
                         profile_id: profile_id.clone(),
-                        step: (step + 1) % 2,
+                        step: (step + 1) % 3,
                     },
                     _ => return Ok(()),
                 };
@@ -611,6 +641,7 @@ impl App {
                             self.lite_alias.push(c);
                         }
                     }
+                    Mode::EditProfile { step: 2, .. } => { self.lite_launch_args.push(c); }
                     _ => {}
                 }
             }
@@ -701,8 +732,8 @@ impl App {
         }
         let models_per_page: usize = 15;
         let is_edit = matches!(self.mode, Mode::LiteEdit { .. });
-        // 8 steps: 0=name, 1=alias, 2-6=models, 7=extras
-        let total_steps: usize = 8;
+        // 9 steps: 0=name, 1=alias, 2-6=models, 7=extras, 8=launch_args
+        let total_steps: usize = 9;
 
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
@@ -715,7 +746,48 @@ impl App {
                 self.lite_step = if self.lite_step == 0 { total_steps - 1 } else { self.lite_step - 1 };
             }
             KeyCode::Tab => {
-                self.lite_step = (self.lite_step + 1) % total_steps;
+                // Tab = completion on model slots, extras, and launch_args.
+                // On name/alias steps it advances to the next field.
+                if self.lite_step >= 2 && self.lite_step <= 6 && !self.lite_models.is_empty() {
+                    // Model slots: cycle through fetched model IDs
+                    let current = self.current_slot_value();
+                    if let Some(pos) = self.lite_models.iter().position(|m| m == &current) {
+                        let next = (pos + 1) % self.lite_models.len();
+                        self.set_slot_value(self.lite_models[next].clone());
+                    } else if !current.is_empty() {
+                        if let Some(m) = self.lite_models.iter().find(|m| m.contains(&current)) {
+                            self.set_slot_value(m.clone());
+                        }
+                    }
+                } else if self.lite_step == 7 {
+                    // Extras: cycle through known Claude Code env var names
+                    let prefix = self.input_buffer.split('=').next().unwrap_or("");
+                    let vars = all_var_names();
+                    if let Some(pos) = vars.iter().position(|v| v == &prefix) {
+                        let next = (pos + 1) % vars.len();
+                        self.input_buffer = format!("{}=", vars[next]);
+                    } else if !prefix.is_empty() {
+                        if let Some(v) = vars.iter().find(|v| v.starts_with(prefix)) {
+                            self.input_buffer = format!("{}=", v);
+                        }
+                    }
+                } else if self.lite_step == 8 {
+                    // Launch args: cycle through known CLI flags (replace the last word)
+                    let flags = all_flag_names();
+                    if !flags.is_empty() {
+                        let last_word = self.lite_launch_args.split_whitespace().last().unwrap_or("");
+                        if let Some(pos) = flags.iter().position(|f| f == &last_word) {
+                            let next = (pos + 1) % flags.len();
+                            self.lite_launch_args = replace_last_word(&self.lite_launch_args, flags[next]);
+                        } else if !last_word.is_empty() {
+                            if let Some(f) = flags.iter().find(|f| f.starts_with(last_word)) {
+                                self.lite_launch_args = replace_last_word(&self.lite_launch_args, f);
+                            }
+                        }
+                    }
+                } else {
+                    self.lite_step = (self.lite_step + 1) % total_steps;
+                }
             }
 
             // [1m] toggle (steps 2-6 are model slots)
@@ -816,6 +888,7 @@ impl App {
                     let id = self.lite_edit_id.clone();
                     match self.manager.update_lightweight(&id, &name, alias_opt, env) {
                         Ok(p) => {
+                            let _ = self.manager.set_launch_args(&p.id, launch_args_from_str(&self.lite_launch_args));
                             self.refresh()?;
                             self.select_by_id(&p.id);
                             self.mode = Mode::Message(format!("Profile '{}' updated.", p.name), false);
@@ -825,6 +898,7 @@ impl App {
                 } else {
                     match self.manager.create_lightweight_profile(&name, alias_opt, env) {
                         Ok(p) => {
+                            let _ = self.manager.set_launch_args(&p.id, launch_args_from_str(&self.lite_launch_args));
                             self.refresh()?;
                             self.select_by_id(&p.id);
                             self.mode = Mode::Message(format!("Profile '{}' created.", p.name), false);
@@ -851,6 +925,7 @@ impl App {
                             self.lite_extras.pop();
                         }
                     }
+                    8 => { self.lite_launch_args.pop(); }
                     _ => {}
                 }
             }
@@ -870,6 +945,7 @@ impl App {
                     5 => { self.lite_mod_model.push(c); }
                     6 => { self.lite_mod_subagent.push(c); }
                     7 => { self.input_buffer.push(c); }
+                    8 => { self.lite_launch_args.push(c); }
                     _ => {}
                 }
             }
@@ -1250,6 +1326,7 @@ impl App {
             vec![
                 ("↑↓/jk", "nav"),
                 ("enter", "launch"),
+                ("Shift+Enter", "w/ args"),
                 ("/", "search"),
                 ("t", "lite"),
                 ("a", "add"),
@@ -1295,6 +1372,7 @@ impl App {
         let help_entries: Vec<(&str, &str)> = vec![
             ("↑/↓  j/k", "Navigate profiles"),
             ("Enter", "Launch Claude with selected profile"),
+            ("Shift+Enter", "Launch with stored flags"),
             ("/", "Search profiles by name or alias"),
             ("t", "Add lightweight (env-var based) profile"),
             ("a", "Add full (directory-isolated) profile"),
@@ -1440,7 +1518,7 @@ impl App {
     }
 
     fn render_edit_profile_popup(&self, f: &mut Frame, step: usize) {
-        let area = centered_rect(60, 9, f.area());
+        let area = centered_rect(70, 12, f.area());
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -1453,12 +1531,16 @@ impl App {
             .border_style(Style::default().fg(ACCENT))
             .style(Style::default().bg(PANEL));
 
-        let name_cursor = if step == 0 { "█" } else { "" };
-        let alias_cursor = if step == 1 { "█" } else { "" };
-        let alias_display = if self.lite_alias.is_empty() && step != 1 { "(none)" } else { &self.lite_alias };
-
         let name_prefix = if step == 0 { "▶ " } else { "  " };
         let alias_prefix = if step == 1 { "▶ " } else { "  " };
+        let args_prefix = if step == 2 { "▶ " } else { "  " };
+
+        let name_cursor = if step == 0 { "█" } else { "" };
+        let alias_cursor = if step == 1 { "█" } else { "" };
+        let args_cursor = if step == 2 { "█" } else { "" };
+
+        let alias_display = if self.lite_alias.is_empty() && step != 1 { "(none)" } else { &self.lite_alias };
+        let args_display = if self.lite_launch_args.is_empty() && step != 2 { "(none)" } else { &self.lite_launch_args };
 
         f.render_widget(
             Paragraph::new(Text::from(vec![
@@ -1473,6 +1555,12 @@ impl App {
                     Span::styled(alias_prefix, Style::default().fg(ACCENT).bold()),
                     Span::styled("Alias: ", Style::default().fg(DIM)),
                     Span::styled(format!("{}{}", alias_display, alias_cursor), Style::default().fg(Color::Rgb(140, 200, 140))),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(args_prefix, Style::default().fg(ACCENT).bold()),
+                    Span::styled("Flags: ", Style::default().fg(DIM)),
+                    Span::styled(format!("{}{}", args_display, args_cursor), Style::default().fg(Color::Rgb(200, 160, 100))),
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1677,17 +1765,31 @@ impl App {
             lines.push(Line::from(Span::styled("  Enter to add, Backspace to remove last entry", Style::default().fg(DIM))));
         }
 
+        // Launch args (step 8)
+        lines.push(Line::from(Span::styled("  ───────────────────────────────────────────────────────────────────", Style::default().fg(BORDER))));
+        let la_focus = self.lite_step == 8;
+        let la_prefix = if la_focus { "▶ " } else { "  " };
+        let la_val = if self.lite_launch_args.is_empty() && !la_focus { "(none)" } else { &self.lite_launch_args };
+        let la_cursor = if la_focus { "█" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(la_prefix, Style::default().fg(ACCENT).bold()),
+            Span::styled("L. args  ", Style::default().fg(DIM)),
+            Span::styled(format!("{}{}", la_val, la_cursor), Style::default().fg(Color::Rgb(200, 160, 100))),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "  CLI flags to pass to claude on launch (space-separated, e.g. --dangerously-skip-permissions)",
+            Style::default().fg(DIM),
+        )));
+
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("  ↑↓/", Style::default().fg(DIM)),
             Span::styled("Cp/Cn", Style::default().fg(ACCENT).bold()),
             Span::styled(" nav  ", Style::default().fg(DIM)),
             Span::styled("Tab", Style::default().fg(ACCENT).bold()),
-            Span::styled(" next  ", Style::default().fg(DIM)),
+            Span::styled(" complete  ", Style::default().fg(DIM)),
             Span::styled("Cm", Style::default().fg(ACCENT).bold()),
             Span::styled(" 1m  ", Style::default().fg(DIM)),
-            Span::styled("Ap/An", Style::default().fg(ACCENT).bold()),
-            Span::styled(" cycle  ", Style::default().fg(DIM)),
             Span::styled("Enter", Style::default().fg(ACCENT).bold()),
             Span::styled(" save", Style::default().fg(DIM)),
         ]));
@@ -1724,6 +1826,26 @@ impl App {
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
+
+fn launch_args_from_str(s: &str) -> Option<Vec<String>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() { None } else {
+        Some(trimmed.split_whitespace().map(String::from).collect())
+    }
+}
+
+/// Replace the last whitespace-delimited word in `s` with `replacement`.
+fn replace_last_word(s: &str, replacement: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return replacement.to_string();
+    }
+    if let Some(last_space) = trimmed.rfind(char::is_whitespace) {
+        format!("{} {}", &trimmed[..last_space], replacement)
+    } else {
+        replacement.to_string()
+    }
+}
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let w = area.width * percent_x / 100;

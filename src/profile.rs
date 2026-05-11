@@ -65,6 +65,9 @@ pub struct Profile {
     pub kind: ProfileKind,
     #[serde(default)]
     pub env: Option<LightweightEnv>,
+    /// Extra CLI args to pass to `claude` on launch (e.g. `--dangerously-skip-permissions`).
+    #[serde(default)]
+    pub launch_args: Option<Vec<String>>,
 }
 
 impl Profile {
@@ -111,6 +114,16 @@ impl ProfileManager {
         let content = serde_json::to_string_pretty(registry)?;
         fs::write(&self.registry_path, content)?;
         Ok(())
+    }
+
+    /// Update just the launch_args field for a profile.
+    pub fn set_launch_args(&self, query: &str, args: Option<Vec<String>>) -> Result<()> {
+        let (id, _) = self.find_profile(query)?;
+        let mut registry = self.load_registry()?;
+        if let Some(p) = registry.profiles.get_mut(&id) {
+            p.launch_args = args;
+        }
+        self.save_registry(&registry)
     }
 
     // ── Lookup helpers ───────────────────────────────────────────────────────
@@ -385,6 +398,7 @@ impl ProfileManager {
             last_used: None,
             kind: ProfileKind::Lightweight,
             env: Some(env),
+            launch_args: None,
         };
         let mut registry = self.load_registry()?;
         registry.profiles.insert(profile.id.clone(), profile.clone());
@@ -417,6 +431,7 @@ impl ProfileManager {
             last_used: existing.last_used,
             kind: ProfileKind::Lightweight,
             env: Some(env),
+            launch_args: existing.launch_args.clone(),
         };
 
         let mut registry = self.load_registry()?;
@@ -427,7 +442,7 @@ impl ProfileManager {
 
     // ── Launch ───────────────────────────────────────────────────────────────
 
-    pub fn launch_claude(&self, query: &str, args: &[String]) -> Result<()> {
+    pub fn launch_claude(&self, query: &str, args: &[String], use_stored_args: bool) -> Result<()> {
         let (id, profile) = self.find_profile(query)?;
 
         // Update last_used
@@ -438,6 +453,11 @@ impl ProfileManager {
         self.save_registry(&registry)?;
 
         let mut cmd = std::process::Command::new("claude");
+        if use_stored_args {
+            if let Some(ref stored) = profile.launch_args {
+                cmd.args(stored);
+            }
+        }
         cmd.args(args);
 
         if profile.kind == ProfileKind::Lightweight {
@@ -608,6 +628,7 @@ impl ProfileManager {
             last_used: None,
             kind: ProfileKind::Full,
             env: None,
+            launch_args: None,
         })
     }
 
@@ -820,6 +841,7 @@ mod tests {
                 last_used: None,
                 kind: ProfileKind::Full,
                 env: None,
+            launch_args: None,
             },
         );
         mgr.save_registry(&reg).unwrap();
