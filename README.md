@@ -1,20 +1,14 @@
 # claude-switch
 
-Multi-account profile manager for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+Multi-account profile manager for [Claude Code](https://code.claude.com).
 
-Switch between multiple Claude accounts without logging out. Each profile is fully isolated — run different accounts in different terminals simultaneously.
+Switch between multiple Claude accounts without logging out. Each profile is fully isolated — use different accounts in different terminals simultaneously.
 
-## Why
-
-Claude Code ties one account to `~/.claude`. If you have a work account, a personal account, or a client account, you have to log out and back in every time you switch. claude-switch eliminates that entirely.
+Two isolation modes:
+- **Full** — copies `~/.claude` into an isolated directory per profile
+- **Lightweight** — stores API key, base URL, and model settings as env vars
 
 ## Install
-
-### Homebrew (macOS/Linux)
-
-```bash
-brew install Abhishek21k/tap/cc-switch
-```
 
 ### Cargo (requires Rust)
 
@@ -24,26 +18,26 @@ cargo install cswitch
 
 ### Pre-built binaries
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/Abhishek21k/claude-switch/releases).
+Download from [GitHub Releases](https://github.com/m2selfA/claude-switch/releases).
 
 ```bash
 # macOS (Apple Silicon)
-curl -fsSL https://github.com/Abhishek21k/claude-switch/releases/latest/download/cc-switch-aarch64-apple-darwin.tar.gz | tar xz
+curl -fsSL https://github.com/m2selfA/claude-switch/releases/latest/download/cc-switch-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv cswitch /usr/local/bin/
 
 # macOS (Intel)
-curl -fsSL https://github.com/Abhishek21k/claude-switch/releases/latest/download/cc-switch-x86_64-apple-darwin.tar.gz | tar xz
+curl -fsSL https://github.com/m2selfA/claude-switch/releases/latest/download/cc-switch-x86_64-apple-darwin.tar.gz | tar xz
 sudo mv cswitch /usr/local/bin/
 
 # Linux
-curl -fsSL https://github.com/Abhishek21k/claude-switch/releases/latest/download/cc-switch-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -fsSL https://github.com/m2selfA/claude-switch/releases/latest/download/cc-switch-x86_64-unknown-linux-gnu.tar.gz | tar xz
 sudo mv cswitch /usr/local/bin/
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/Abhishek21k/claude-switch.git
+git clone https://github.com/m2selfA/claude-switch.git
 cd claude-switch
 cargo install --path .
 ```
@@ -51,17 +45,16 @@ cargo install --path .
 ## Quick start
 
 ```bash
-# Save your currently logged-in account as a profile
+# Save current ~/.claude as a full profile
 cswitch add work
 
-# Add another account (opens Claude for you to log in)
-cswitch login personal
+# Create a lightweight profile (env-var based)
+cswitch add my-api-key --alias mykey
 
-# Switch between them
+# Launch with a profile
 cswitch use work
-cswitch use personal
 
-# Or just open the interactive TUI
+# Or open the interactive TUI
 cswitch
 ```
 
@@ -70,9 +63,10 @@ cswitch
 | Command | Description |
 |---|---|
 | `cswitch` | Open interactive TUI |
-| `cswitch add <name>` | Add a new profile (detects active session, asks to copy or login) |
-| `cswitch login <name>` | Create a profile by logging into a new account |
-| `cswitch use <name>` | Launch Claude Code with a specific profile |
+| `cswitch add <name>` | Add a profile (full by default, lightweight with interactive prompts) |
+| `cswitch add --full <name>` | Add a full profile (copies ~/.claude) |
+| `cswitch add --alias <a> <name>` | Add with a short CLI-friendly alias |
+| `cswitch use <name>` | Launch Claude Code with a profile (accepts name, alias, or id) |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
@@ -83,21 +77,6 @@ cswitch
 
 Run `cswitch` with no arguments to open the TUI.
 
-```
-┌─ ◆ claude-switch  profile manager ──────── 3 profiles ┐
-┌─ Profiles ────────┐┌─ Details ─────────────────────────┐
-│ ▶ work            ││  Name       work                  │
-│   work@co.com     ││  Email      work@co.com           │
-│                   ││  Added      2025-03-15 10:30 UTC  │
-│   personal        ││  Last used  2025-03-15 14:22 UTC  │
-│   me@gmail.com    ││                                   │
-│                   ││  Launch command                    │
-│   client          ││  CLAUDE_CONFIG_DIR='...' claude   │
-│   dev@client.io   ││                                   │
-└───────────────────┘└───────────────────────────────────┘
-┌ ↑↓/jk nav  enter launch  / search  l login  a add ... ┐
-```
-
 ### TUI keybindings
 
 | Key | Action |
@@ -105,64 +84,59 @@ Run `cswitch` with no arguments to open the TUI.
 | `↑/↓` or `j/k` | Navigate profiles |
 | `Enter` | Launch Claude with selected profile |
 | `/` | Search profiles by name or alias |
-| `l` | Login — add a new account |
-| `a` | Add — copy current session as a profile |
-| `r` | Refresh — re-copy current session into selected profile |
+| `t` | Add lightweight profile (env vars) |
+| `a` | Add full profile (directory isolation) |
+| `e` | Edit profile name / alias |
+| `E` | Edit lightweight env vars |
+| `m` | Toggle [1m] suffix on model slots |
+| `r` | Refresh — re-copy ~/.claude into selected |
 | `d` | Delete selected profile |
 | `?` | Help overlay |
 | `q` / `Esc` | Quit |
 
-## Adding your first profile
-
-When you run `cswitch` for the first time, it detects your active Claude session and offers two options:
-
-1. **Copy active session** — saves your current credentials as a profile, no re-login needed
-2. **Login to a new account** — opens Claude so you can authenticate with a different account
-
-For every additional account after the first, use `cswitch login <name>`.
-
 ## Shell aliases
 
-Generate aliases so you can launch profiles directly without `cswitch use`:
+Generate aliases so you can launch profiles directly:
 
 ```bash
 cswitch aliases >> ~/.zshrc   # or ~/.bashrc
 source ~/.zshrc
 ```
 
-If you have a `~/.bashrc.d/` directory, aliases are automatically written to `~/.bashrc.d/38-claude-switch.sh` instead. Source it from your `~/.bashrc`:
+If `~/.bashrc.d/` exists, aliases are written to `~/.bashrc.d/38-claude-switch.sh`. Add to your `~/.bashrc`:
 
 ```bash
 source ~/.bashrc.d/38-claude-switch.sh
 ```
 
-This gives you commands like:
+This produces commands like:
 
 ```bash
-claude-work       # launches Claude with the "work" profile
-claude-personal   # launches Claude with the "personal" profile
+claude-work       # launch with the "work" profile
+claude-personal   # launch with the "personal" profile
 ```
 
-On Windows, `cswitch aliases` outputs PowerShell functions instead. Add them to your `$PROFILE`.
-
-## Platform support
-
-| | macOS | Linux | Windows |
-|---|---|---|---|
-| Profile management | Yes | Yes | Yes |
-| Credential handling | Keychain | File-based | File-based |
-| Shell aliases | bash/zsh | bash/zsh | PowerShell |
-| TUI | Yes | Yes | Yes |
+On Windows, `cswitch aliases` outputs PowerShell functions. Add them to your `$PROFILE`.
 
 ## How profiles are stored
 
-Profiles live in `~/.claude-switch/profiles/<name>/`. Each profile is a self-contained Claude Code config directory. When you run `cswitch use <name>`, it simply sets `CLAUDE_CONFIG_DIR` to point at that directory — Claude reads its credentials and config from there instead of the default `~/.claude`.
+Profiles are tracked in `~/.claude-switch/registry.json`, keyed by UUID. Each profile has:
+- `id` — UUID v4 (stable internal key)
+- `name` — display name (supports Chinese, spaces, any characters)
+- `alias` — optional short CLI-friendly name (alphanumeric, `-`, `_`)
+- `kind` — `full` or `lightweight`
 
-Nothing in your original `~/.claude` is modified. Profiles are fully isolated from each other.
+### Full profiles
 
-## Running multiple accounts simultaneously
+Stored in `~/.claude-switch/profiles/<alias-or-name>/`. Launch sets `CLAUDE_CONFIG_DIR` to that directory.
 
-Open separate terminals and run different profiles in each:
+### Lightweight profiles
+
+No directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` JSON on launch.
+
+Nothing in `~/.claude` is modified.
+
+## Running multiple profiles simultaneously
 
 ```bash
 # Terminal 1
@@ -171,8 +145,6 @@ cswitch use work
 # Terminal 2
 cswitch use personal
 ```
-
-Both run independently with their own credentials and config.
 
 ## License
 
