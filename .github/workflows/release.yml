@@ -34,6 +34,7 @@ jobs:
         run: |
           yum install -y curl gcc glibc-static
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Install Rust
         if: matrix.container != 'centos:7'
@@ -46,17 +47,11 @@ jobs:
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../cc-switch-${{ matrix.target }}.tar.gz cswitch
-          cd ../../..
+        run: tar czf cc-switch-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release cswitch
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../cc-switch-${{ matrix.target }}.zip cswitch.exe
-          cd ../../..
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/cswitch.exe -DestinationPath cc-switch-${{ matrix.target }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

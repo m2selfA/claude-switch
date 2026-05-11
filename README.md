@@ -104,7 +104,7 @@ Run `cswitch` with no arguments to open the TUI.
 |---|---|
 | `↑/↓` or `j/k` | Navigate profiles |
 | `Enter` | Launch Claude with selected profile |
-| `/` | Search profiles by name or email |
+| `/` | Search profiles by name or alias |
 | `l` | Login — add a new account |
 | `a` | Add — copy current session as a profile |
 | `r` | Refresh — re-copy current session into selected profile |

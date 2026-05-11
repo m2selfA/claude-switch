@@ -1,23 +1,22 @@
+mod env_vars;
 mod profile;
 mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use profile::{detect_current_account, ProfileManager};
+use profile::{fetch_models, LightweightEnv, ProfileManager};
 use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(
     name = "cswitch",
     about = "Multi-account profile manager for Claude Code",
-    long_about = "Manage multiple Claude Code accounts using isolated config directories.\n\
-                  Each profile stores a complete ~/.claude snapshot and launches Claude\n\
-                  with CLAUDE_CONFIG_DIR set — no credential swapping, no side effects.",
+    long_about = "Manage multiple Claude Code accounts using per-profile env vars or isolated directories.",
     version,
     after_help = "\
 Quick start:
-  cswitch add work           Detect active session, copy or login
-  cswitch login personal     Login to a different account
+  cswitch add work           Create a lightweight profile (env vars)
+  cswitch add --full work    Create a full directory-isolated profile
   cswitch use work           Launch Claude with a profile
   cswitch list               Show all profiles
   cswitch                    Open interactive TUI (press ? for help)"
@@ -35,19 +34,19 @@ enum Commands {
     /// List all saved profiles
     List,
 
-    /// Add a new profile — detects active session and lets you choose
+    /// Add a new profile — lightweight (env vars) by default, or full with --full
     Add {
-        /// Profile name (alphanumeric, hyphens, underscores)
+        /// Profile name (any characters, including Chinese)
         name: String,
+        /// Short CLI-friendly alias (alphanumeric, hyphens, underscores)
+        #[arg(short, long)]
+        alias: Option<String>,
         /// Overwrite if profile already exists
         #[arg(short, long)]
         force: bool,
-    },
-
-    /// Log in to a new Claude account and save it as a profile (skips detection prompt)
-    Login {
-        /// Profile name (alphanumeric, hyphens, underscores)
-        name: String,
+        /// Use full directory isolation instead of lightweight env-var isolation
+        #[arg(long)]
+        full: bool,
     },
 
     /// Remove a saved profile
@@ -93,24 +92,21 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            println!("{:<20} {:<35} {}", "NAME", "EMAIL", "LAST USED");
-            println!("{}", "─".repeat(75));
+            println!("{:<20} {:<12} {:<8} {}", "NAME", "ALIAS", "KIND", "LAST USED");
+            println!("{}", "─".repeat(70));
             for p in profiles {
-                let email = p.email.as_deref().unwrap_or("—");
+                let kind = if p.kind == profile::ProfileKind::Full { "full" } else { "lite" };
+                let alias = p.alias.as_deref().unwrap_or("—");
                 let last_used = p
                     .last_used
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or("never".to_string());
-                println!("{:<20} {:<35} {}", p.name, email, last_used);
+                println!("{:<20} {:<12} {:<8} {}", p.name, alias, kind, last_used);
             }
         }
 
-        Some(Commands::Add { name, force }) => {
-            handle_add(&manager, &name, force)?;
-        }
-
-        Some(Commands::Login { name }) => {
-            manager.login_profile(&name)?;
+        Some(Commands::Add { name, alias, force, full }) => {
+            handle_add(&manager, &name, alias.as_deref(), force, full)?;
         }
 
         Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
@@ -127,9 +123,11 @@ fn main() -> Result<()> {
 
         Some(Commands::Info { name }) => match manager.get_profile(&name) {
             Ok(p) => {
-                let dir = manager.profile_dir(&p.name);
+                let kind = if p.kind == profile::ProfileKind::Full { "full" } else { "lightweight" };
+                println!("Id:        {}", p.id);
                 println!("Name:      {}", p.name);
-                println!("Email:     {}", p.email.as_deref().unwrap_or("unknown"));
+                if let Some(ref a) = p.alias { println!("Alias:     {}", a); }
+                println!("Kind:      {}", kind);
                 println!("Added:     {}", p.added.format("%Y-%m-%d %H:%M UTC"));
                 println!(
                     "Last used: {}",
@@ -137,10 +135,25 @@ fn main() -> Result<()> {
                         .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
                         .unwrap_or("never".to_string())
                 );
-                println!("Directory: {}", dir.display());
-                println!();
-                println!("Launch:");
-                println!("  CLAUDE_CONFIG_DIR='{}' claude", dir.display());
+                if p.kind == profile::ProfileKind::Full {
+                    let dir = manager.profile_dir(&p);
+                    println!("Directory: {}", dir.display());
+                    println!();
+                    println!("Launch:");
+                    println!("  CLAUDE_CONFIG_DIR='{}' claude", dir.display());
+                } else {
+                    println!();
+                    println!("Environment variables set on launch:");
+                    if let Some(ref env) = p.env {
+                        if env.auth_token.is_some() { println!("  ANTHROPIC_AUTH_TOKEN=***"); }
+                        if env.base_url.is_some() { println!("  ANTHROPIC_BASE_URL={}", env.base_url.as_deref().unwrap_or("")); }
+                        if let Some(ref m) = env.default_opus_model { println!("  ANTHROPIC_DEFAULT_OPUS_MODEL={}", m); }
+                        if let Some(ref m) = env.default_sonnet_model { println!("  ANTHROPIC_DEFAULT_SONNET_MODEL={}", m); }
+                        if let Some(ref m) = env.default_haiku_model { println!("  ANTHROPIC_DEFAULT_HAIKU_MODEL={}", m); }
+                        if let Some(ref m) = env.model { println!("  ANTHROPIC_MODEL={}", m); }
+                        if let Some(ref m) = env.subagent_model { println!("  CLAUDE_CODE_SUBAGENT_MODEL={}", m); }
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -156,69 +169,131 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Smart add: detects an active Claude session and asks the user whether to
-/// copy it or login fresh.
-fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
-    match detect_current_account() {
-        Some(acct) => {
-            let email = acct.email.as_deref().unwrap_or("unknown");
-            println!("Active Claude session detected: {}\n", email);
-            println!("  [c]  Copy this session as profile '{}'", name);
-            println!("  [l]  Login to a different account for profile '{}'", name);
-            println!();
+/// Smart add: creates a lightweight profile (default) or full directory-isolated profile.
+fn handle_add(manager: &ProfileManager, name: &str, alias: Option<&str>, force: bool, full: bool) -> Result<()> {
+    if full {
+        // Full isolation: copy ~/.claude directory
+        let result = if force {
+            manager.add_profile_force(name, alias)
+        } else {
+            manager.add_profile(name, alias)
+        };
+        match result {
+            Ok(p) => {
+                println!("Profile '{}' added (full isolation).", p.name);
+                println!("  Launch with: cswitch use {}", p.name);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Ok(())
+    } else {
+        // Lightweight flow
+        println!("Creating lightweight profile '{}' (env-var based isolation).\n", name);
 
-            let choice = prompt_choice("Choice [c/l]: ", &['c', 'l'])?;
+        print!("ANTHROPIC_AUTH_TOKEN: ");
+        io::stdout().flush()?;
+        let mut token = String::new();
+        io::stdin().read_line(&mut token)?;
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            eprintln!("Error: ANTHROPIC_AUTH_TOKEN is required.");
+            std::process::exit(1);
+        }
 
-            match choice {
-                'c' => {
-                    let result = if force {
-                        manager.add_profile_force(name)
-                    } else {
-                        manager.add_profile(name)
-                    };
-                    match result {
-                        Ok(p) => {
-                            println!("\nProfile '{}' added.", p.name);
-                            if let Some(email) = p.email {
-                                println!("  Account: {}", email);
-                            }
-                            println!("  Launch with: cswitch use {}", p.name);
-                        }
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
+        print!("ANTHROPIC_BASE_URL [https://api.anthropic.com]: ");
+        io::stdout().flush()?;
+        let mut base_url = String::new();
+        io::stdin().read_line(&mut base_url)?;
+        let base_url = base_url.trim().to_string();
+        let base_url = if base_url.is_empty() {
+            "https://api.anthropic.com".to_string()
+        } else {
+            base_url
+        };
+
+        // Try to fetch models
+        println!("\nFetching available models from {}/v1/models...", base_url);
+        let models = match fetch_models(&base_url, &token) {
+            Ok(m) => {
+                println!("Found {} models:", m.len());
+                for (i, model) in m.iter().enumerate() {
+                    println!("  {}. {}", i + 1, model);
+                }
+                println!();
+                Some(m)
+            }
+            Err(e) => {
+                eprintln!("Warning: could not fetch models: {}", e);
+                eprintln!("You can enter model IDs manually.\n");
+                None
+            }
+        };
+
+        fn prompt_model(prompt: &str, models: &Option<Vec<String>>) -> Option<String> {
+            print!("{}", prompt);
+            io::stdout().flush().ok()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok()?;
+            let input = input.trim().to_string();
+            if input.is_empty() { return None; }
+
+            if let Some(models_list) = models {
+                if let Ok(idx) = input.parse::<usize>() {
+                    if idx >= 1 && idx <= models_list.len() {
+                        return Some(models_list[idx - 1].clone());
                     }
                 }
-                'l' => {
-                    manager.login_profile(name)?;
-                }
-                _ => unreachable!(),
             }
+            Some(input)
         }
-        None => {
-            // No active session — go straight to login
-            println!("No active Claude session found. Opening Claude for login…\n");
-            manager.login_profile(name)?;
-        }
-    }
-    Ok(())
-}
 
-fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
-    loop {
-        print!("{}", prompt);
+        println!("Configure model settings (press Enter to skip any):");
+        println!("  You can enter a model ID directly, or a number to select from the list above.");
+
+        print!("Append [1m] suffix to model IDs for Claude Code context window recognition? [y/N]: ");
         io::stdout().flush()?;
+        let mut suffix = String::new();
+        io::stdin().read_line(&mut suffix)?;
+        let append_1m = suffix.trim().to_lowercase() == "y";
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        let default_opus_model = prompt_model("  Default Opus Model []: ", &models);
+        let default_sonnet_model = prompt_model("  Default Sonnet Model []: ", &models);
+        let default_haiku_model = prompt_model("  Default Haiku Model []: ", &models);
+        let model = prompt_model("  Default Model (ANTHROPIC_MODEL) []: ", &models);
+        let subagent_model = prompt_model("  Subagent Model (CLAUDE_CODE_SUBAGENT_MODEL) []: ", &models);
 
-        if let Some(c) = input.trim().chars().next() {
-            let c = c.to_ascii_lowercase();
-            if valid.contains(&c) {
-                return Ok(c);
+        fn apply_suffix(val: Option<String>, append: bool) -> Option<String> {
+            match (val, append) {
+                (Some(v), true) if !v.ends_with("[1m]") => Some(format!("{}[1m]", v)),
+                (v, _) => v,
             }
         }
-        println!("Please enter one of: {}", valid.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "));
+
+        let env = LightweightEnv {
+            auth_token: Some(token),
+            base_url: Some(base_url),
+            default_opus_model: apply_suffix(default_opus_model, append_1m),
+            default_sonnet_model: apply_suffix(default_sonnet_model, append_1m),
+            default_haiku_model: apply_suffix(default_haiku_model, append_1m),
+            model: apply_suffix(model, append_1m),
+            subagent_model: apply_suffix(subagent_model, append_1m),
+            extras: Vec::new(),
+        };
+
+        match manager.create_lightweight_profile(name, alias, env) {
+            Ok(p) => {
+                println!("\nLightweight profile '{}' created.", p.name);
+                println!("  Launch with: cswitch use {}", p.name);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Ok(())
     }
 }
+

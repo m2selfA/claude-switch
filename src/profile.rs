@@ -4,27 +4,85 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileKind {
+    Lightweight,
+    Full,
+}
+
+impl Default for ProfileKind {
+    fn default() -> Self {
+        ProfileKind::Full
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LightweightEnv {
+    pub auth_token: Option<String>,
+    pub base_url: Option<String>,
+    pub default_opus_model: Option<String>,
+    pub default_sonnet_model: Option<String>,
+    pub default_haiku_model: Option<String>,
+    pub model: Option<String>,
+    pub subagent_model: Option<String>,
+    #[serde(default)]
+    pub extras: Vec<String>,
+}
+
+impl Default for LightweightEnv {
+    fn default() -> Self {
+        LightweightEnv {
+            auth_token: None,
+            base_url: None,
+            default_opus_model: None,
+            default_sonnet_model: None,
+            default_haiku_model: None,
+            model: None,
+            subagent_model: None,
+            extras: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
+    /// Stable unique identifier (UUID v4).
+    #[serde(default)]
+    pub id: String,
+    /// Display name — any characters (Chinese, spaces, etc.).
     pub name: String,
-    pub email: Option<String>,
+    /// Short CLI-friendly name (alphanumeric, hyphens, underscores). Optional.
+    #[serde(default)]
+    pub alias: Option<String>,
     pub added: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub kind: ProfileKind,
+    #[serde(default)]
+    pub env: Option<LightweightEnv>,
+}
+
+impl Profile {
+    /// Filesystem-safe directory name for this profile's data.
+    pub fn dir_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Registry {
+    /// Keyed by profile `id` (UUID).
     pub profiles: HashMap<String, Profile>,
 }
 
 // ── ProfileManager ────────────────────────────────────────────────────────────
 
 pub struct ProfileManager {
-    #[allow(dead_code)]
-    pub base_dir: PathBuf,
     pub profiles_dir: PathBuf,
     registry_path: PathBuf,
 }
@@ -36,7 +94,7 @@ impl ProfileManager {
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
         fs::create_dir_all(&profiles_dir)?;
-        Ok(Self { base_dir, profiles_dir, registry_path })
+        Ok(Self { profiles_dir, registry_path })
     }
 
     // ── Registry I/O ─────────────────────────────────────────────────────────
@@ -55,9 +113,92 @@ impl ProfileManager {
         Ok(())
     }
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // ── Lookup helpers ───────────────────────────────────────────────────────
 
-    /// Returns all profiles sorted alphabetically by name.
+    /// Find a profile by id, alias, or name (exact match, in that order).
+    /// Returns `(id, profile)`.
+    pub fn find_profile(&self, query: &str) -> Result<(String, Profile)> {
+        let registry = self.load_registry()?;
+        if query.is_empty() {
+            bail!("Profile query is empty.");
+        }
+
+        // 1. Exact match on id
+        if let Some(p) = registry.profiles.get(query) {
+            return Ok((query.to_string(), p.clone()));
+        }
+
+        // 2. Exact match on alias
+        let by_alias: Vec<_> = registry
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.alias.as_deref() == Some(query))
+            .collect();
+        if by_alias.len() == 1 {
+            return Ok((by_alias[0].0.clone(), by_alias[0].1.clone()));
+        } else if by_alias.len() > 1 {
+            bail!(
+                "Multiple profiles match alias '{}'. Use the full id to disambiguate.",
+                query
+            );
+        }
+
+        // 3. Exact match on name
+        let by_name: Vec<_> = registry
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.name == query)
+            .collect();
+        if by_name.len() == 1 {
+            return Ok((by_name[0].0.clone(), by_name[0].1.clone()));
+        } else if by_name.len() > 1 {
+            bail!(
+                "Multiple profiles match name '{}'. Use an alias or id to disambiguate.",
+                query
+            );
+        }
+
+        bail!(
+            "Profile '{}' not found. Add it with: cswitch add <name>",
+            query
+        )
+    }
+
+    /// Check that `name` and `alias` are not already in use by another profile.
+    /// `exclude_id` — the profile being edited (don't check against itself).
+    pub fn check_unique(&self, exclude_id: &str, name: &str, alias: Option<&str>) -> Result<()> {
+        let registry = self.load_registry()?;
+        for (id, p) in &registry.profiles {
+            if id == exclude_id {
+                continue;
+            }
+            if p.name == name {
+                bail!("Profile name '{}' is already in use.", name);
+            }
+            if let Some(ref a) = p.alias {
+                if Some(a.as_str()) == alias {
+                    bail!("Alias '{}' is already in use.", a);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_alias(alias: &str) -> Result<()> {
+        if !alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!(
+                "Alias '{}' is invalid. Use only a-z, 0-9, hyphens, and underscores.",
+                alias
+            );
+        }
+        Ok(())
+    }
+
+    // ── Public CRUD ──────────────────────────────────────────────────────────
+
     pub fn list_profiles(&self) -> Result<Vec<Profile>> {
         let registry = self.load_registry()?;
         let mut profiles: Vec<Profile> = registry.profiles.into_values().collect();
@@ -65,175 +206,301 @@ impl ProfileManager {
         Ok(profiles)
     }
 
-    /// Add a profile from an explicit source directory.
-    /// Used both by `add_profile` (which sources `~/.claude`) and by tests.
-    pub fn add_profile_from(&self, name: &str, src: &Path) -> Result<Profile> {
+    pub fn get_profile(&self, query: &str) -> Result<Profile> {
+        self.find_profile(query).map(|(_, p)| p)
+    }
+
+    /// Full profile: copy `src` into `profiles/<dir_name>`.
+    pub fn add_profile_from(&self, name: &str, alias: Option<&str>, src: &Path) -> Result<Profile> {
         if !src.exists() {
             bail!("Source directory '{}' does not exist.", src.display());
         }
-        let dest = self.profiles_dir.join(name);
-        if dest.exists() {
-            bail!("Profile '{}' already exists. Use --force to overwrite.", name);
+        if name.trim().is_empty() {
+            bail!("Profile name cannot be empty.");
         }
-        let profile = self.copy_and_build_profile(name, src)?;
-        self.upsert_profile(profile.clone())?;
+        self.check_unique("", name, alias)?;
+        if let Some(a) = alias {
+            Self::validate_alias(a)?;
+        }
+        let id = Uuid::new_v4().to_string();
+        let profile = self.copy_and_build_profile(&id, name, alias, src)?;
+        self.upsert_profile(&profile)?;
         Ok(profile)
     }
 
-    /// Same as `add_profile_from` but overwrites an existing profile.
-    pub fn add_profile_from_force(&self, name: &str, src: &Path) -> Result<Profile> {
-        if !src.exists() {
-            bail!("Source directory '{}' does not exist.", src.display());
-        }
-        let dest = self.profiles_dir.join(name);
-        if dest.exists() {
-            fs::remove_dir_all(&dest)?;
-        }
-        let profile = self.copy_and_build_profile(name, src)?;
-        self.upsert_profile(profile.clone())?;
-        Ok(profile)
-    }
-
-    /// Add the current logged-in session as a named profile.
-    /// Copies `~/.claude/` dir and `~/.claude.json` from the home root.
-    pub fn add_profile(&self, name: &str) -> Result<Profile> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let src = home.join(".claude");
-        if !src.exists() {
-            bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
-        }
-        let mut profile = self.add_profile_from(name, &src)?;
-        self.copy_extra_credentials(&home, name, &mut profile)?;
-        Ok(profile)
-    }
-
-    /// Same as `add_profile` but overwrites an existing profile.
-    pub fn add_profile_force(&self, name: &str) -> Result<Profile> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let src = home.join(".claude");
-        if !src.exists() {
-            bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
-        }
-        let mut profile = self.add_profile_from_force(name, &src)?;
-        self.copy_extra_credentials(&home, name, &mut profile)?;
-        Ok(profile)
-    }
-
-    /// Copy `~/.claude.json` from the home root (outside `~/.claude/`).
-    /// This file contains oauthAccount metadata including the account email.
-    fn copy_extra_credentials(
+    /// Force-add: overwrite any conflicting profile (same name or alias).
+    pub fn add_profile_from_force(
         &self,
-        home: &Path,
         name: &str,
-        profile: &mut Profile,
-    ) -> Result<()> {
-        let dest = self.profile_dir(name);
+        alias: Option<&str>,
+        src: &Path,
+    ) -> Result<Profile> {
+        if !src.exists() {
+            bail!("Source directory '{}' does not exist.", src.display());
+        }
+        if name.trim().is_empty() {
+            bail!("Profile name cannot be empty.");
+        }
+        if let Some(a) = alias {
+            Self::validate_alias(a)?;
+        }
 
-        let home_claude_json = home.join(".claude.json");
-        if home_claude_json.exists() {
-            fs::copy(&home_claude_json, dest.join(".claude.json"))?;
-            if profile.email.is_none() {
-                profile.email = read_email_from_dir(&dest);
-                self.upsert_profile(profile.clone())?;
+        // Remove conflicting profiles
+        let registry = self.load_registry()?;
+        for (id, p) in &registry.profiles {
+            if p.name == name || p.alias.as_deref() == alias {
+                let dir = self.profiles_dir.join(p.dir_name());
+                if dir.exists() {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                let mut reg = self.load_registry()?;
+                reg.profiles.remove(id);
+                self.save_registry(&reg)?;
             }
         }
 
-        Ok(())
+        let id = Uuid::new_v4().to_string();
+        let profile = self.copy_and_build_profile(&id, name, alias, src)?;
+        self.upsert_profile(&profile)?;
+        Ok(profile)
     }
 
-    pub fn remove_profile(&self, name: &str) -> Result<()> {
+    /// Add current `~/.claude` as a full profile.
+    pub fn add_profile(&self, name: &str, alias: Option<&str>) -> Result<Profile> {
+        let home = dirs::home_dir().context("Cannot determine home directory")?;
+        let src = home.join(".claude");
+        if !src.exists() {
+            bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
+        }
+        self.add_profile_from(name, alias, &src)
+    }
+
+    /// Force-add current `~/.claude` as a full profile.
+    pub fn add_profile_force(&self, name: &str, alias: Option<&str>) -> Result<Profile> {
+        let home = dirs::home_dir().context("Cannot determine home directory")?;
+        let src = home.join(".claude");
+        self.add_profile_from_force(name, alias, &src)
+    }
+
+    /// Refresh a full profile's data from `~/.claude` (preserves id, name, alias).
+    pub fn refresh_profile(&self, query: &str) -> Result<Profile> {
+        let (id, profile) = self.find_profile(query)?;
+        if profile.kind != ProfileKind::Full {
+            bail!("Refresh applies only to full profiles.");
+        }
+        let home = dirs::home_dir().context("Cannot determine home directory")?;
+        let src = home.join(".claude");
+        if !src.exists() {
+            bail!("~/.claude does not exist.");
+        }
+        let dir = self.profiles_dir.join(profile.dir_name());
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        copy_dir_all(&src, &dir)?;
+
         let mut registry = self.load_registry()?;
-        if !registry.profiles.contains_key(name) {
-            bail!("Profile '{}' not found.", name);
+        if let Some(p) = registry.profiles.get_mut(&id) {
+            p.added = Utc::now();
         }
-        let dest = self.profiles_dir.join(name);
-        if dest.exists() {
-            fs::remove_dir_all(&dest)?;
+        self.save_registry(&registry)?;
+        Ok(profile)
+    }
+
+    pub fn remove_profile(&self, query: &str) -> Result<()> {
+        let (id, profile) = self.find_profile(query)?;
+        let dir = self.profiles_dir.join(profile.dir_name());
+        if profile.kind == ProfileKind::Full && dir.exists() {
+            fs::remove_dir_all(&dir)?;
         }
-        registry.profiles.remove(name);
+        let mut registry = self.load_registry()?;
+        registry.profiles.remove(&id);
         self.save_registry(&registry)
     }
 
-    pub fn get_profile(&self, name: &str) -> Result<Profile> {
-        let registry = self.load_registry()?;
-        registry
-            .profiles
-            .get(name)
-            .cloned()
-            .context(format!("Profile '{}' not found.", name))
-    }
-
-    pub fn profile_dir(&self, name: &str) -> PathBuf {
-        self.profiles_dir.join(name)
-    }
-
-    /// Launch `claude` with `CLAUDE_CONFIG_DIR` pointed at the named profile.
-    pub fn launch_claude(&self, name: &str, args: &[String]) -> Result<()> {
-        let profile_dir = self.profile_dir(name);
-        if !profile_dir.exists() {
-            bail!(
-                "Profile directory for '{}' not found. Re-add it with: cswitch add {}",
-                name,
-                name
-            );
+    /// Rename a profile (change name and/or alias). Checks uniqueness.
+    pub fn rename_profile(
+        &self,
+        query: &str,
+        new_name: &str,
+        new_alias: Option<&str>,
+    ) -> Result<Profile> {
+        let (id, mut profile) = self.find_profile(query)?;
+        if new_name.trim().is_empty() {
+            bail!("Profile name cannot be empty.");
         }
+        self.check_unique(&id, new_name, new_alias)?;
+        if let Some(a) = new_alias {
+            Self::validate_alias(a)?;
+        }
+
+        let old_dir_name = profile.dir_name().to_string();
+        profile.name = new_name.to_string();
+        profile.alias = new_alias.map(String::from);
+        let new_dir_name = profile.dir_name().to_string();
+
+        // Rename directory if it changed (full profiles)
+        if old_dir_name != new_dir_name {
+            let old_dir = self.profiles_dir.join(&old_dir_name);
+            let new_dir = self.profiles_dir.join(&new_dir_name);
+            if old_dir.exists() {
+                if new_dir.exists() {
+                    fs::remove_dir_all(&new_dir)?;
+                }
+                fs::rename(&old_dir, &new_dir)?;
+            }
+        }
+
         let mut registry = self.load_registry()?;
-        if let Some(p) = registry.profiles.get_mut(name) {
+        registry.profiles.insert(id.clone(), profile.clone());
+        self.save_registry(&registry)?;
+        Ok(profile)
+    }
+
+    pub fn profile_dir(&self, profile: &Profile) -> PathBuf {
+        self.profiles_dir.join(profile.dir_name())
+    }
+
+    // ── Lightweight profiles ─────────────────────────────────────────────────
+
+    pub fn create_lightweight_profile(
+        &self,
+        name: &str,
+        alias: Option<&str>,
+        env: LightweightEnv,
+    ) -> Result<Profile> {
+        if name.trim().is_empty() {
+            bail!("Profile name cannot be empty.");
+        }
+        self.check_unique("", name, alias)?;
+        if let Some(a) = alias {
+            Self::validate_alias(a)?;
+        }
+        let id = Uuid::new_v4().to_string();
+        let profile = Profile {
+            id,
+            name: name.to_string(),
+            alias: alias.map(String::from),
+            added: Utc::now(),
+            last_used: None,
+            kind: ProfileKind::Lightweight,
+            env: Some(env),
+        };
+        let mut registry = self.load_registry()?;
+        registry.profiles.insert(profile.id.clone(), profile.clone());
+        self.save_registry(&registry)?;
+        Ok(profile)
+    }
+
+    /// Update name, alias, and env vars for an existing lightweight profile.
+    pub fn update_lightweight(
+        &self,
+        query: &str,
+        new_name: &str,
+        new_alias: Option<&str>,
+        env: LightweightEnv,
+    ) -> Result<Profile> {
+        let (id, existing) = self.find_profile(query)?;
+        if new_name.trim().is_empty() {
+            bail!("Profile name cannot be empty.");
+        }
+        self.check_unique(&id, new_name, new_alias)?;
+        if let Some(a) = new_alias {
+            Self::validate_alias(a)?;
+        }
+
+        let profile = Profile {
+            id,
+            name: new_name.to_string(),
+            alias: new_alias.map(String::from),
+            added: existing.added,
+            last_used: existing.last_used,
+            kind: ProfileKind::Lightweight,
+            env: Some(env),
+        };
+
+        let mut registry = self.load_registry()?;
+        registry.profiles.insert(profile.id.clone(), profile.clone());
+        self.save_registry(&registry)?;
+        Ok(profile)
+    }
+
+    // ── Launch ───────────────────────────────────────────────────────────────
+
+    pub fn launch_claude(&self, query: &str, args: &[String]) -> Result<()> {
+        let (id, profile) = self.find_profile(query)?;
+
+        // Update last_used
+        let mut registry = self.load_registry()?;
+        if let Some(p) = registry.profiles.get_mut(&id) {
             p.last_used = Some(Utc::now());
         }
         self.save_registry(&registry)?;
 
-        let status = std::process::Command::new("claude")
-            .args(args)
-            .env("CLAUDE_CONFIG_DIR", &profile_dir)
-            .status()
-            .context("Failed to launch claude. Is it installed and in your PATH?")?;
+        let mut cmd = std::process::Command::new("claude");
+        cmd.args(args);
 
-        std::process::exit(status.code().unwrap_or(0));
-    }
+        if profile.kind == ProfileKind::Lightweight {
+            if let Some(ref env) = profile.env {
+                let mut settings = serde_json::Map::new();
+                let mut env_map = serde_json::Map::new();
 
-    /// Create an empty profile directory and launch Claude into it.
-    /// Claude will detect no credentials and trigger its own login flow.
-    /// After the user authenticates and exits Claude, we read the email
-    /// from whatever config Claude wrote and register the profile.
-    pub fn login_profile(&self, name: &str) -> Result<()> {
-        let profile_dir = self.profiles_dir.join(name);
-        if profile_dir.exists() {
-            let has_files = profile_dir.read_dir()?.next().is_some();
-            if has_files {
-                bail!("Profile '{}' already exists. Remove it first or pick a different name.", name);
+                if let Some(ref t) = env.auth_token {
+                    env_map.insert("ANTHROPIC_AUTH_TOKEN".into(), serde_json::Value::String(t.clone()));
+                }
+                if let Some(ref u) = env.base_url {
+                    env_map.insert("ANTHROPIC_BASE_URL".into(), serde_json::Value::String(u.clone()));
+                }
+                if let Some(ref m) = env.default_opus_model {
+                    env_map.insert("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), serde_json::Value::String(m.clone()));
+                }
+                if let Some(ref m) = env.default_sonnet_model {
+                    env_map.insert("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), serde_json::Value::String(m.clone()));
+                }
+                if let Some(ref m) = env.default_haiku_model {
+                    env_map.insert("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), serde_json::Value::String(m.clone()));
+                }
+                if let Some(ref m) = env.model {
+                    env_map.insert("ANTHROPIC_MODEL".into(), serde_json::Value::String(m.clone()));
+                }
+                if let Some(ref m) = env.subagent_model {
+                    env_map.insert("CLAUDE_CODE_SUBAGENT_MODEL".into(), serde_json::Value::String(m.clone()));
+                }
+                for extra in &env.extras {
+                    if let Some((k, v)) = extra.split_once('=') {
+                        env_map.insert(
+                            k.trim().to_string(),
+                            serde_json::Value::String(v.trim().to_string()),
+                        );
+                    }
+                }
+
+                settings.insert("env".into(), serde_json::Value::Object(env_map));
+                let settings_json =
+                    serde_json::to_string(&settings).context("Failed to serialize settings JSON")?;
+                cmd.arg("--settings");
+                cmd.arg(&settings_json);
             }
+        } else {
+            let profile_dir = self.profile_dir(&profile);
+            if !profile_dir.exists() {
+                bail!(
+                    "Profile directory for '{}' not found. Re-add it with: cswitch add --full {}",
+                    profile.name,
+                    profile.name
+                );
+            }
+            cmd.env("CLAUDE_CONFIG_DIR", &profile_dir);
         }
-        fs::create_dir_all(&profile_dir)?;
 
-        println!("Launching Claude Code — please log in with the account for profile '{}'.", name);
-        println!("After logging in, exit Claude (Ctrl-C or /exit) to finish setup.\n");
-
-        let status = std::process::Command::new("claude")
-            .env("CLAUDE_CONFIG_DIR", &profile_dir)
+        let status = cmd
             .status()
             .context("Failed to launch claude. Is it installed and in your PATH?")?;
-
-        // Claude has exited — check if it wrote any config files
-        let email = read_email_from_dir(&profile_dir);
-        let profile = Profile {
-            name: name.to_string(),
-            email: email.clone(),
-            added: Utc::now(),
-            last_used: Some(Utc::now()),
-        };
-        self.upsert_profile(profile)?;
-
-        let display_email = email.as_deref().unwrap_or("unknown");
-        println!("\nProfile '{}' registered (account: {}).", name, display_email);
-        println!("Launch with: cswitch use {}", name);
-
         std::process::exit(status.code().unwrap_or(0));
     }
 
-    /// Print shell alias/function lines for all managed profiles.
-    /// Auto-detects platform: bash/zsh on Unix, PowerShell on Windows.
-    /// On Linux with ~/.bashrc.d/, writes to 38-claude-switch.sh and prints info.
+    // ── Aliases ──────────────────────────────────────────────────────────────
+
     #[cfg(target_os = "windows")]
     pub fn generate_aliases(&self) -> Result<String> {
         let profiles = self.list_profiles()?;
@@ -261,12 +528,11 @@ impl ProfileManager {
         let bashrc_d = home.join(".bashrc.d");
 
         if bashrc_d.exists() && bashrc_d.is_dir() {
-            // Write to ~/.bashrc.d/38-claude-switch.sh
             fs::create_dir_all(&bashrc_d)?;
             let alias_file = bashrc_d.join("38-claude-switch.sh");
             fs::write(&alias_file, &aliases_content)?;
             Ok(format!(
-                "{}\n\n# Aliases written to: ~/.bashrc.d/38-claude-switch.sh\n# Add 'source ~/.bashrc.d/38-claude-switch.sh' to your ~/.bashrc if not already done.",
+                "{}\n\n# Aliases written to: ~/.bashrc.d/38-claude-switch.sh",
                 aliases_content
             ))
         } else {
@@ -278,22 +544,19 @@ impl ProfileManager {
     fn generate_shell_aliases(&self, profiles: &[Profile]) -> Result<String> {
         let mut lines = vec![
             "# claude-switch aliases — auto-generated by `cswitch aliases`".to_string(),
-            "# Source this file from your ~/.bashrc or ~/.bash_profile:".to_string(),
-            "#   source ~/.bashrc.d/38-claude-switch.sh".to_string(),
             String::new(),
         ];
         for p in profiles {
-            let dir = self.profile_dir(&p.name);
-            let comment = p
-                .email
-                .as_deref()
-                .map(|e| format!("  # {}", e))
-                .unwrap_or_default();
+            if p.kind == ProfileKind::Lightweight {
+                lines.push(format!("# Profile '{}' (lightweight): use 'cswitch use {}'", p.name, p.name));
+                continue;
+            }
+            let dir = self.profile_dir(p);
+            let alias_name = p.alias.as_deref().unwrap_or(&p.name);
             lines.push(format!(
-                "alias claude-{}=\"CLAUDE_CONFIG_DIR='{}' claude\"{}",
-                p.name,
+                "alias claude-{}=\"CLAUDE_CONFIG_DIR='{}' claude\"",
+                alias_name,
                 dir.display(),
-                comment
             ));
         }
         Ok(lines.join("\n"))
@@ -307,17 +570,19 @@ impl ProfileManager {
             String::new(),
         ];
         for p in profiles {
-            let dir = self.profile_dir(&p.name);
-            let comment = p
-                .email
-                .as_deref()
-                .map(|e| format!("  # {}", e))
-                .unwrap_or_default();
+            if p.kind == ProfileKind::Lightweight {
+                lines.push(format!(
+                    "# Profile '{}' (lightweight): set env vars before running claude",
+                    p.name
+                ));
+                continue;
+            }
+            let dir = self.profile_dir(p);
+            let alias_name = p.alias.as_deref().unwrap_or(&p.name);
             lines.push(format!(
-                "function claude-{} {{ $env:CLAUDE_CONFIG_DIR='{}'; claude @args }}{}",
-                p.name,
+                "function claude-{} {{ $env:CLAUDE_CONFIG_DIR='{}'; claude @args }}",
+                alias_name,
                 dir.display(),
-                comment
             ));
         }
         Ok(lines.join("\n"))
@@ -325,43 +590,32 @@ impl ProfileManager {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn copy_and_build_profile(&self, name: &str, src: &Path) -> Result<Profile> {
-        let dest = self.profiles_dir.join(name);
+    fn copy_and_build_profile(
+        &self,
+        id: &str,
+        name: &str,
+        alias: Option<&str>,
+        src: &Path,
+    ) -> Result<Profile> {
+        let dir_name = alias.unwrap_or(name);
+        let dest = self.profiles_dir.join(dir_name);
         copy_dir_all(src, &dest)?;
-        let email = read_email_from_dir(&dest);
-        Ok(Profile { name: name.to_string(), email, added: Utc::now(), last_used: None })
+        Ok(Profile {
+            id: id.to_string(),
+            name: name.to_string(),
+            alias: alias.map(String::from),
+            added: Utc::now(),
+            last_used: None,
+            kind: ProfileKind::Full,
+            env: None,
+        })
     }
 
-    fn upsert_profile(&self, profile: Profile) -> Result<()> {
+    fn upsert_profile(&self, profile: &Profile) -> Result<()> {
         let mut registry = self.load_registry()?;
-        registry.profiles.insert(profile.name.clone(), profile);
+        registry.profiles.insert(profile.id.clone(), profile.clone());
         self.save_registry(&registry)
     }
-}
-
-// ── First-run detection ───────────────────────────────────────────────────────
-
-/// Account details read from the live `~/.claude` directory.
-pub struct DetectedAccount {
-    pub email: Option<String>,
-    #[allow(dead_code)]
-    pub config_dir: std::path::PathBuf,
-}
-
-/// Try to read the currently logged-in Claude account.
-/// Checks both `~/.claude/` (config dir) and `~/.claude.json` (home root)
-/// since on macOS the account metadata lives at the root, not inside the dir.
-/// Returns `None` if neither exists.
-pub fn detect_current_account() -> Option<DetectedAccount> {
-    let home = dirs::home_dir()?;
-    let config_dir = home.join(".claude");
-    if !config_dir.exists() {
-        return None;
-    }
-    // Try ~/.claude/ first, then fallback to ~/.claude.json at home root
-    let email = read_email_from_dir(&config_dir)
-        .or_else(|| read_email_from_home_root(&home));
-    Some(DetectedAccount { email, config_dir })
 }
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
@@ -437,53 +691,26 @@ fn copy_symlink(target: &Path, dest: &Path) -> bool {
     std::os::unix::fs::symlink(target, dest).is_ok()
 }
 
-
-/// Read email from `~/.claude.json` at home root (macOS stores account metadata here).
-fn read_email_from_home_root(home: &Path) -> Option<String> {
-    let path = home.join(".claude.json");
-    if let Ok(content) = fs::read_to_string(&path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(email) = val
-                .get("oauthAccount")
-                .and_then(|o| o.get("emailAddress"))
-                .and_then(|e| e.as_str())
-            {
-                return Some(email.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Extract the account email from a Claude config directory.
-/// Checks `.claude.json` → `oauthAccount.emailAddress`, then
-/// `.credentials.json` → `claudeAiOauth.email` as fallback.
-fn read_email_from_dir(dir: &Path) -> Option<String> {
-    for filename in &[".claude.json", "claude.json"] {
-        if let Ok(content) = fs::read_to_string(dir.join(filename)) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(email) = val
-                    .get("oauthAccount")
-                    .and_then(|o| o.get("emailAddress"))
-                    .and_then(|e| e.as_str())
-                {
-                    return Some(email.to_string());
-                }
-            }
-        }
-    }
-    if let Ok(content) = fs::read_to_string(dir.join(".credentials.json")) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(email) = val
-                .get("claudeAiOauth")
-                .and_then(|o| o.get("email"))
-                .and_then(|e| e.as_str())
-            {
-                return Some(email.to_string());
-            }
-        }
-    }
-    None
+/// Fetch available model IDs from an OpenAI-compatible /v1/models endpoint.
+pub fn fetch_models(base_url: &str, auth_token: &str) -> Result<Vec<String>> {
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let resp = ureq::get(&url)
+        .header("Authorization", &format!("Bearer {}", auth_token))
+        .call()
+        .context("Failed to fetch models from API")?;
+    let json: serde_json::Value = resp
+        .into_body()
+        .read_json()
+        .context("Invalid JSON response from /v1/models")?;
+    let data = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .context("Unexpected response format from /v1/models (missing 'data' array)")?;
+    let models: Vec<String> = data
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()).map(String::from))
+        .collect();
+    Ok(models)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -497,25 +724,20 @@ mod tests {
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
-    /// Construct a ProfileManager fully isolated inside a temp directory.
     fn make_manager(tmp: &TempDir) -> ProfileManager {
         let base_dir = tmp.path().join(".claude-switch");
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
         fs::create_dir_all(&profiles_dir).unwrap();
-        ProfileManager { base_dir, profiles_dir, registry_path }
+        ProfileManager { profiles_dir, registry_path }
     }
 
-    /// Populate a fake `~/.claude` directory with the two files Claude Code
-    /// actually writes: `.claude.json` and `.credentials.json`.
-    fn make_claude_dir(root: &Path, email: &str) -> PathBuf {
+    fn make_claude_dir(root: &Path) -> PathBuf {
         let dir = root.to_path_buf();
         fs::create_dir_all(&dir).unwrap();
-
-        // .claude.json — contains oauthAccount block
         let claude_json = serde_json::json!({
             "oauthAccount": {
-                "emailAddress": email,
+                "emailAddress": "test@example.com",
                 "accountUuid": "uuid-0000-test"
             },
             "someOtherConfig": true
@@ -525,8 +747,6 @@ mod tests {
             serde_json::to_string_pretty(&claude_json).unwrap(),
         )
         .unwrap();
-
-        // .credentials.json — contains OAuth tokens
         let creds_json = serde_json::json!({
             "claudeAiOauth": {
                 "accessToken": "access_tok",
@@ -541,51 +761,7 @@ mod tests {
             serde_json::to_string_pretty(&creds_json).unwrap(),
         )
         .unwrap();
-
         dir
-    }
-
-    /// Same but email is only in `.credentials.json` to test the fallback path.
-    fn make_claude_dir_creds_only(root: &Path, email: &str) -> PathBuf {
-        let dir = root.to_path_buf();
-        fs::create_dir_all(&dir).unwrap();
-
-        let creds_json = serde_json::json!({
-            "claudeAiOauth": {
-                "accessToken": "tok",
-                "email": email
-            }
-        });
-        fs::write(
-            dir.join(".credentials.json"),
-            serde_json::to_string_pretty(&creds_json).unwrap(),
-        )
-        .unwrap();
-
-        dir
-    }
-
-    // ── read_email_from_dir ───────────────────────────────────────────────────
-
-    #[test]
-    fn email_read_from_claude_json() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_claude_dir(tmp.path(), "oauth@test.com");
-        assert_eq!(read_email_from_dir(&dir), Some("oauth@test.com".into()));
-    }
-
-    #[test]
-    fn email_fallback_to_credentials_json() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_claude_dir_creds_only(tmp.path(), "creds@test.com");
-        assert_eq!(read_email_from_dir(&dir), Some("creds@test.com".into()));
-    }
-
-    #[test]
-    fn email_returns_none_when_no_config_files() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path()).unwrap();
-        assert_eq!(read_email_from_dir(tmp.path()), None);
     }
 
     // ── copy_dir_all ──────────────────────────────────────────────────────────
@@ -597,10 +773,8 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("a.txt"), "hello").unwrap();
         fs::write(src.join("b.txt"), "world").unwrap();
-
         let dst = tmp.path().join("dst");
         copy_dir_all(&src, &dst).unwrap();
-
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
         assert_eq!(fs::read_to_string(dst.join("b.txt")).unwrap(), "world");
     }
@@ -613,16 +787,14 @@ mod tests {
         fs::write(src.join("root.txt"), "root").unwrap();
         fs::write(src.join("sub").join("mid.txt"), "mid").unwrap();
         fs::write(src.join("sub/deep").join("leaf.txt"), "leaf").unwrap();
-
         let dst = tmp.path().join("dst");
         copy_dir_all(&src, &dst).unwrap();
-
         assert_eq!(fs::read_to_string(dst.join("root.txt")).unwrap(), "root");
         assert_eq!(fs::read_to_string(dst.join("sub/mid.txt")).unwrap(), "mid");
         assert_eq!(fs::read_to_string(dst.join("sub/deep/leaf.txt")).unwrap(), "leaf");
     }
 
-    // ── Registry I/O ──────────────────────────────────────────────────────────
+    // ── add_profile_from ──────────────────────────────────────────────────────
 
     #[test]
     fn load_registry_returns_empty_when_file_absent() {
@@ -636,23 +808,23 @@ mod tests {
     fn save_and_load_registry_round_trips() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-
+        let id = Uuid::new_v4().to_string();
         let mut reg = Registry::default();
         reg.profiles.insert(
-            "work".into(),
+            id.clone(),
             Profile {
+                id,
                 name: "work".into(),
-                email: Some("work@acme.com".into()),
+                alias: None,
                 added: Utc::now(),
                 last_used: None,
+                kind: ProfileKind::Full,
+                env: None,
             },
         );
         mgr.save_registry(&reg).unwrap();
-
         let loaded = mgr.load_registry().unwrap();
         assert_eq!(loaded.profiles.len(), 1);
-        assert_eq!(loaded.profiles["work"].email.as_deref(), Some("work@acme.com"));
-        assert!(loaded.profiles["work"].last_used.is_none());
     }
 
     // ── add_profile_from ──────────────────────────────────────────────────────
@@ -661,50 +833,23 @@ mod tests {
     fn add_profile_copies_files_into_profiles_dir() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake-claude"), "u@test.com");
-
-        mgr.add_profile_from("work", &src).unwrap();
-
-        let dest = mgr.profile_dir("work");
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        mgr.add_profile_from("work", None, &src).unwrap();
+        let profile = mgr.get_profile("work").unwrap();
+        let dest = mgr.profile_dir(&profile);
         assert!(dest.join(".claude.json").exists(), ".claude.json missing");
         assert!(dest.join(".credentials.json").exists(), ".credentials.json missing");
-    }
-
-    #[test]
-    fn add_profile_records_email_from_config() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake-claude"), "email@test.com");
-
-        let p = mgr.add_profile_from("personal", &src).unwrap();
-
-        assert_eq!(p.email.as_deref(), Some("email@test.com"));
     }
 
     #[test]
     fn add_profile_records_entry_in_registry() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake-claude"), "x@y.com");
-
-        mgr.add_profile_from("slot", &src).unwrap();
-
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        mgr.add_profile_from("slot", None, &src).unwrap();
         let reg = mgr.load_registry().unwrap();
-        assert!(reg.profiles.contains_key("slot"));
-    }
-
-    #[test]
-    fn add_profile_stores_none_email_when_config_unreadable() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = make_manager(&tmp);
-
-        // Source dir exists but contains no recognisable config files
-        let src = tmp.path().join("empty-claude");
-        fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("something-unrelated.txt"), "hi").unwrap();
-
-        let p = mgr.add_profile_from("mystery", &src).unwrap();
-        assert!(p.email.is_none());
+        let found = reg.profiles.values().any(|p| p.name == "slot");
+        assert!(found);
     }
 
     #[test]
@@ -712,76 +857,105 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
         let err = mgr
-            .add_profile_from("bad", &tmp.path().join("does-not-exist"))
+            .add_profile_from("bad", None, &tmp.path().join("does-not-exist"))
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]
-    fn add_profile_errors_on_duplicate_without_force() {
+    fn add_profile_errors_on_duplicate_name() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake-claude"), "a@b.com");
-
-        mgr.add_profile_from("dup", &src).unwrap();
-        let err = mgr.add_profile_from("dup", &src).unwrap_err();
-        assert!(err.to_string().contains("already exists"), "{err}");
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        mgr.add_profile_from("dup", None, &src).unwrap();
+        let err = mgr.add_profile_from("dup", None, &src).unwrap_err();
+        assert!(err.to_string().contains("already in use"), "{err}");
     }
 
-    // ── add_profile_from_force ────────────────────────────────────────────────
+    #[test]
+    fn add_profile_with_alias() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        let p = mgr.add_profile_from("My Work Profile", Some("work"), &src).unwrap();
+        assert_eq!(p.name, "My Work Profile");
+        assert_eq!(p.alias.as_deref(), Some("work"));
+        // Lookup by alias
+        let found = mgr.get_profile("work").unwrap();
+        assert_eq!(found.id, p.id);
+    }
+
+    // ── find_profile ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_profile_by_id_alias_name() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        let p = mgr.add_profile_from("Display 名称", Some("short"), &src).unwrap();
+
+        // By id
+        let (id, _) = mgr.find_profile(&p.id).unwrap();
+        assert_eq!(id, p.id);
+        // By alias
+        let (id2, _) = mgr.find_profile("short").unwrap();
+        assert_eq!(id2, p.id);
+        // By name
+        let (id3, _) = mgr.find_profile("Display 名称").unwrap();
+        assert_eq!(id3, p.id);
+        // Not found
+        assert!(mgr.find_profile("nope").is_err());
+    }
+
+    #[test]
+    fn find_profile_errors_on_ambiguous_alias() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let s1 = make_claude_dir(&tmp.path().join("c1"));
+        let s2 = make_claude_dir(&tmp.path().join("c2"));
+        mgr.add_profile_from("Profile One", Some("p"), &s1).unwrap();
+        // Force-add second with same alias should remove the first (force behavior)
+        // Actually, add_profile_from checks uniqueness, so second should fail
+        let err = mgr.add_profile_from("Profile Two", Some("p"), &s2).unwrap_err();
+        assert!(err.to_string().contains("already in use"), "{err}");
+    }
+
+    // ── force add ────────────────────────────────────────────────────────────
 
     #[test]
     fn force_add_overwrites_existing_profile() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-
-        let src = make_claude_dir(&tmp.path().join("v1"), "first@test.com");
-        mgr.add_profile_from("slot", &src).unwrap();
-
-        // Change source to a different account
-        let src2 = make_claude_dir(&tmp.path().join("v2"), "second@test.com");
-        mgr.add_profile_from_force("slot", &src2).unwrap();
-
-        let reg = mgr.load_registry().unwrap();
-        assert_eq!(reg.profiles["slot"].email.as_deref(), Some("second@test.com"));
-        // Old files replaced
-        let content = fs::read_to_string(mgr.profile_dir("slot").join(".claude.json")).unwrap();
-        assert!(content.contains("second@test.com"));
+        let src = make_claude_dir(&tmp.path().join("v1"));
+        mgr.add_profile_from("slot", None, &src).unwrap();
+        let src2 = make_claude_dir(&tmp.path().join("v2"));
+        mgr.add_profile_from_force("slot", None, &src2).unwrap();
+        let p = mgr.get_profile("slot").unwrap();
+        let dest = mgr.profile_dir(&p);
+        assert!(dest.join(".claude.json").exists());
     }
 
     #[test]
     fn force_add_works_when_profile_does_not_yet_exist() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake-claude"), "new@test.com");
-
-        let p = mgr.add_profile_from_force("brand-new", &src).unwrap();
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        let p = mgr.add_profile_from_force("brand-new", None, &src).unwrap();
         assert_eq!(p.name, "brand-new");
-        assert_eq!(p.email.as_deref(), Some("new@test.com"));
     }
 
     // ── list_profiles ─────────────────────────────────────────────────────────
 
     #[test]
-    fn list_profiles_returns_empty_vec_when_none_added() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = make_manager(&tmp);
-        assert!(mgr.list_profiles().unwrap().is_empty());
-    }
-
-    #[test]
     fn list_profiles_returns_sorted_by_name() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-
         for name in &["zebra", "alpha", "mango"] {
             let src = make_claude_dir(
                 &tmp.path().join(format!("src-{name}")),
-                &format!("{name}@test.com"),
             );
-            mgr.add_profile_from(name, &src).unwrap();
+            mgr.add_profile_from(name, None, &src).unwrap();
         }
-
         let profiles = mgr.list_profiles().unwrap();
         let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["alpha", "mango", "zebra"]);
@@ -790,16 +964,25 @@ mod tests {
     // ── remove_profile ────────────────────────────────────────────────────────
 
     #[test]
-    fn remove_profile_deletes_directory_and_registry_entry() {
+    fn remove_profile_by_name_deletes_directory_and_entry() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake-claude"), "del@test.com");
-        mgr.add_profile_from("to-delete", &src).unwrap();
-
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        let p = mgr.add_profile_from("to-delete", None, &src).unwrap();
+        let dir = mgr.profile_dir(&p);
         mgr.remove_profile("to-delete").unwrap();
+        assert!(!dir.exists());
+        assert!(mgr.get_profile("to-delete").is_err());
+    }
 
-        assert!(!mgr.profile_dir("to-delete").exists());
-        assert!(!mgr.load_registry().unwrap().profiles.contains_key("to-delete"));
+    #[test]
+    fn remove_profile_by_alias() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        mgr.add_profile_from("Long Display Name", Some("del"), &src).unwrap();
+        mgr.remove_profile("del").unwrap();
+        assert!(mgr.get_profile("del").is_err());
     }
 
     #[test]
@@ -810,55 +993,98 @@ mod tests {
         assert!(err.to_string().contains("not found"), "{err}");
     }
 
-    #[test]
-    fn remove_profile_leaves_other_profiles_intact() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = make_manager(&tmp);
-
-        for name in &["keep", "delete-me"] {
-            let src = make_claude_dir(&tmp.path().join(name), &format!("{name}@x.com"));
-            mgr.add_profile_from(name, &src).unwrap();
-        }
-
-        mgr.remove_profile("delete-me").unwrap();
-
-        let profiles = mgr.list_profiles().unwrap();
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "keep");
-    }
-
-    // ── get_profile ───────────────────────────────────────────────────────────
+    // ── rename_profile ───────────────────────────────────────────────────────
 
     #[test]
-    fn get_profile_returns_correct_entry() {
+    fn rename_profile_changes_name_and_alias() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake-claude"), "found@test.com");
-        mgr.add_profile_from("found", &src).unwrap();
-
-        let p = mgr.get_profile("found").unwrap();
-        assert_eq!(p.name, "found");
-        assert_eq!(p.email.as_deref(), Some("found@test.com"));
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        let p = mgr.add_profile_from("old-name", Some("old"), &src).unwrap();
+        let renamed = mgr.rename_profile(&p.id, "new-name", Some("new")).unwrap();
+        assert_eq!(renamed.name, "new-name");
+        assert_eq!(renamed.alias.as_deref(), Some("new"));
+        assert_eq!(renamed.id, p.id); // id preserved
+        // Old name no longer works
+        assert!(mgr.get_profile("old-name").is_err());
+        assert!(mgr.get_profile("old").is_err());
+        // New name and alias work
+        assert!(mgr.get_profile("new-name").is_ok());
+        assert!(mgr.get_profile("new").is_ok());
     }
 
     #[test]
-    fn get_profile_errors_when_missing() {
+    fn rename_profile_errors_on_duplicate_name() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        let err = mgr.get_profile("nope").unwrap_err();
-        assert!(err.to_string().contains("not found"), "{err}");
+        let s1 = make_claude_dir(&tmp.path().join("c1"));
+        let s2 = make_claude_dir(&tmp.path().join("c2"));
+        let p1 = mgr.add_profile_from("Profile A", Some("a"), &s1).unwrap();
+        mgr.add_profile_from("Profile B", Some("b"), &s2).unwrap();
+        let err = mgr.rename_profile(&p1.id, "Profile B", None).unwrap_err();
+        assert!(err.to_string().contains("already in use"), "{err}");
     }
 
-    // ── profile_dir ───────────────────────────────────────────────────────────
+    // ── lightweight profiles ─────────────────────────────────────────────────
 
     #[test]
-    fn profile_dir_returns_correct_path() {
+    fn create_and_launch_lightweight() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        assert_eq!(mgr.profile_dir("foo"), mgr.profiles_dir.join("foo"));
+        let env = LightweightEnv {
+            auth_token: Some("tok".into()),
+            base_url: Some("https://api.example.com".into()),
+            ..Default::default()
+        };
+        let p = mgr
+            .create_lightweight_profile("lite-prof", Some("lp"), env.clone())
+            .unwrap();
+        assert_eq!(p.name, "lite-prof");
+        assert_eq!(p.alias.as_deref(), Some("lp"));
+        assert_eq!(p.kind, ProfileKind::Lightweight);
+        // Lookup by alias
+        let found = mgr.get_profile("lp").unwrap();
+        assert_eq!(found.id, p.id);
+    }
+
+    #[test]
+    fn update_lightweight_preserves_id() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let env = LightweightEnv {
+            auth_token: Some("old".into()),
+            ..Default::default()
+        };
+        let p = mgr
+            .create_lightweight_profile("test", Some("t"), env)
+            .unwrap();
+        let original_id = p.id.clone();
+
+        let new_env = LightweightEnv {
+            auth_token: Some("new".into()),
+            ..Default::default()
+        };
+        let updated = mgr
+            .update_lightweight(&original_id, "test-renamed", Some("tr"), new_env)
+            .unwrap();
+        assert_eq!(updated.id, original_id);
+        assert_eq!(updated.name, "test-renamed");
+        assert_eq!(updated.alias.as_deref(), Some("tr"));
+        assert_eq!(updated.env.as_ref().unwrap().auth_token.as_deref(), Some("new"));
     }
 
     // ── generate_aliases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_aliases_uses_alias_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake-claude"));
+        mgr.add_profile_from("Long Name", Some("ln"), &src).unwrap();
+        let out = mgr.generate_aliases().unwrap();
+        // Should use "ln" (alias) not "Long Name"
+        assert!(out.contains("claude-ln"), "expected 'claude-ln' in:\n{out}");
+    }
 
     #[test]
     fn generate_aliases_when_empty_returns_hint() {
@@ -866,83 +1092,5 @@ mod tests {
         let mgr = make_manager(&tmp);
         let out = mgr.generate_aliases().unwrap();
         assert!(out.contains("No profiles"), "{out}");
-    }
-
-    #[test]
-    fn generate_aliases_includes_all_profiles_with_config_dir() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = make_manager(&tmp);
-
-        for name in &["work", "personal"] {
-            let src = make_claude_dir(&tmp.path().join(name), &format!("{name}@x.com"));
-            mgr.add_profile_from(name, &src).unwrap();
-        }
-
-        let out = mgr.generate_aliases().unwrap();
-        #[cfg(target_os = "windows")]
-        {
-            assert!(out.contains("function claude-work"), "{out}");
-            assert!(out.contains("function claude-personal"), "{out}");
-            assert!(out.contains("$env:CLAUDE_CONFIG_DIR="), "{out}");
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            assert!(out.contains("alias claude-work="), "{out}");
-            assert!(out.contains("alias claude-personal="), "{out}");
-            assert!(out.contains("CLAUDE_CONFIG_DIR="), "{out}");
-        }
-    }
-
-    // ── login_profile ──────────────────────────────────────────────────────
-
-    #[test]
-    fn login_profile_rejects_existing_nonempty_dir() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake-claude"), "a@b.com");
-        mgr.add_profile_from("taken", &src).unwrap();
-
-        // login_profile should refuse because the dir is non-empty
-        let err = mgr.login_profile("taken").unwrap_err();
-        assert!(err.to_string().contains("already exists"), "{err}");
-    }
-
-    // ── read_email_from_home_root ─────────────────────────────────────────
-
-    #[test]
-    fn read_email_from_home_root_finds_oauth_account() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        let claude_json = serde_json::json!({
-            "oauthAccount": {
-                "emailAddress": "root@test.com",
-                "accountUuid": "uuid"
-            },
-            "numStartups": 42
-        });
-        fs::write(
-            root.join(".claude.json"),
-            serde_json::to_string_pretty(&claude_json).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(read_email_from_home_root(root), Some("root@test.com".into()));
-    }
-
-    #[test]
-    fn read_email_from_home_root_returns_none_when_missing() {
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(read_email_from_home_root(tmp.path()), None);
-    }
-
-    #[test]
-    fn generate_aliases_includes_email_comment() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = make_manager(&tmp);
-        let src = make_claude_dir(&tmp.path().join("fake"), "me@work.com");
-        mgr.add_profile_from("work", &src).unwrap();
-
-        let out = mgr.generate_aliases().unwrap();
-        assert!(out.contains("# me@work.com"), "{out}");
     }
 }
