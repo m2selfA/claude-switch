@@ -594,27 +594,8 @@ impl App {
                     _ => {}
                 }
             }
-            KeyCode::Up | KeyCode::Char('p') if code == KeyCode::Char('p') => {
-                // Ctrl+p navigation
-                self.mode = match &self.mode {
-                    Mode::EditProfile { profile_id, step } => Mode::EditProfile {
-                        profile_id: profile_id.clone(),
-                        step: if *step == 0 { 1 } else { 0 },
-                    },
-                    _ => return Ok(()),
-                };
-            }
-            KeyCode::Down | KeyCode::Char('n') if code == KeyCode::Char('n') => {
-                self.mode = match &self.mode {
-                    Mode::EditProfile { profile_id, step } => Mode::EditProfile {
-                        profile_id: profile_id.clone(),
-                        step: (step + 1) % 2,
-                    },
-                    _ => return Ok(()),
-                };
-            }
-            KeyCode::Tab => {
-                // Toggle between name and alias
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
+                // Toggle between name (0) and alias (1)
                 self.mode = match &self.mode {
                     Mode::EditProfile { profile_id, step } => Mode::EditProfile {
                         profile_id: profile_id.clone(),
