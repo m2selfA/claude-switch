@@ -382,49 +382,48 @@ impl App {
                     Some(p) => p.clone(),
                     None => return Ok(false),
                 };
-                self.input_buffer = profile.name.clone();
-                self.lite_name = profile.name.clone();
-                self.lite_alias = profile.alias.clone().unwrap_or_default();
-                self.mode = Mode::EditProfile {
-                    profile_id: profile.id.clone(),
-                    step: 0,
-                };
-            }
 
-            KeyCode::Char('E') => {
-                // Edit lightweight env vars (existing 'e' behavior for lite profiles)
-                let profile = match self.selected_profile() {
-                    Some(p) if p.kind == ProfileKind::Lightweight => p.clone(),
-                    _ => return Ok(false),
-                };
-                if let Some(ref env) = profile.env {
-                    self.lite_token = env.auth_token.clone().unwrap_or_default();
-                    self.lite_url = env.base_url.clone().unwrap_or_else(|| "https://api.anthropic.com".to_string());
-                    self.lite_mod_opus = env.default_opus_model.clone().unwrap_or_default();
-                    self.lite_mod_sonnet = env.default_sonnet_model.clone().unwrap_or_default();
-                    self.lite_mod_haiku = env.default_haiku_model.clone().unwrap_or_default();
-                    self.lite_mod_model = env.model.clone().unwrap_or_default();
-                    self.lite_mod_subagent = env.subagent_model.clone().unwrap_or_default();
-                    let ends_1m: [&str; 5] = [&self.lite_mod_opus, &self.lite_mod_sonnet, &self.lite_mod_haiku, &self.lite_mod_model, &self.lite_mod_subagent];
-                    for i in 0..5 { self.lite_1m[i] = ends_1m[i].ends_with("[1m]"); }
+                if profile.kind == ProfileKind::Lightweight {
+                    // Lightweight: full edit with models + extras
+                    if let Some(ref env) = profile.env {
+                        self.lite_token = env.auth_token.clone().unwrap_or_default();
+                        self.lite_url = env.base_url.clone().unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                        self.lite_mod_opus = env.default_opus_model.clone().unwrap_or_default();
+                        self.lite_mod_sonnet = env.default_sonnet_model.clone().unwrap_or_default();
+                        self.lite_mod_haiku = env.default_haiku_model.clone().unwrap_or_default();
+                        self.lite_mod_model = env.model.clone().unwrap_or_default();
+                        self.lite_mod_subagent = env.subagent_model.clone().unwrap_or_default();
+                        let ends_1m: [&str; 5] = [&self.lite_mod_opus, &self.lite_mod_sonnet, &self.lite_mod_haiku, &self.lite_mod_model, &self.lite_mod_subagent];
+                        for i in 0..5 { self.lite_1m[i] = ends_1m[i].ends_with("[1m]"); }
+                        self.lite_name = profile.name.clone();
+                        self.lite_alias = profile.alias.clone().unwrap_or_default();
+                        self.lite_edit_id = profile.id.clone();
+                        self.lite_step = 0;
+                        self.lite_extras = env.extras.clone();
+                        let token = self.lite_token.clone();
+                        let base_url = self.lite_url.clone();
+                        self.mode = Mode::LiteFetching;
+                        match fetch_models(&base_url, &token) {
+                            Ok(models) => {
+                                self.lite_models = models;
+                                self.mode = Mode::LiteEdit { profile_id: profile.id.clone() };
+                            }
+                            Err(_) => {
+                                self.lite_models = Vec::new();
+                                self.mode = Mode::LiteEdit { profile_id: profile.id.clone() };
+                            }
+                        }
+                    } else {
+                        self.mode = Mode::Message("No env config found.".into(), true);
+                    }
+                } else {
+                    // Full profile: edit name/alias only
                     self.lite_name = profile.name.clone();
                     self.lite_alias = profile.alias.clone().unwrap_or_default();
-                    self.lite_edit_id = profile.id.clone();
-                    self.lite_step = 0;
-                    self.lite_extras = env.extras.clone();
-                    let token = self.lite_token.clone();
-                    let base_url = self.lite_url.clone();
-                    self.mode = Mode::LiteFetching;
-                    match fetch_models(&base_url, &token) {
-                        Ok(models) => {
-                            self.lite_models = models;
-                            self.mode = Mode::LiteEdit { profile_id: profile.id.clone() };
-                        }
-                        Err(_) => {
-                            self.lite_models = Vec::new();
-                            self.mode = Mode::LiteEdit { profile_id: profile.id.clone() };
-                        }
-                    }
+                    self.mode = Mode::EditProfile {
+                        profile_id: profile.id.clone(),
+                        step: 0,
+                    };
                 }
             }
 
@@ -1254,7 +1253,7 @@ impl App {
                 ("/", "search"),
                 ("t", "lite"),
                 ("a", "add"),
-                ("e/E", "edit"),
+                ("e", "edit"),
                 ("m", "[1m]"),
                 ("r", "refresh"),
                 ("d", "delete"),
@@ -1299,8 +1298,7 @@ impl App {
             ("/", "Search profiles by name or alias"),
             ("t", "Add lightweight (env-var based) profile"),
             ("a", "Add full (directory-isolated) profile"),
-            ("e", "Edit profile name / alias"),
-            ("E", "Edit lightweight env vars (lite only)"),
+            ("e", "Edit profile (name/alias, or models for lite)"),
             ("m", "Toggle [1m] suffix (lightweight profiles)"),
             ("r", "Refresh — re-copy ~/.claude into selected"),
             ("d / Del", "Delete selected profile"),
