@@ -31,7 +31,7 @@ jobs:
       - name: Install system deps (container)
         if: matrix.container == 'rockylinux:8'
         run: |
-          dnf install -y git curl gcc glibc-static
+          dnf install -y git curl gcc
 
       - uses: actions/checkout@v4
 
