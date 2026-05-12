@@ -991,7 +991,7 @@ impl ProfileManager {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let fname = path.file_name().unwrap().to_string_lossy();
-                if !written.contains(&fname) {
+                if !written.contains(fname.as_ref()) {
                     if let Ok(content) = fs::read_to_string(&path) {
                         if content.contains(SH_MARKER) {
                             let _ = fs::remove_file(&path);
