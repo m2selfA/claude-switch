@@ -625,11 +625,69 @@ impl ProfileManager {
         Ok(home.join(".local").join("bin"))
     }
 
-    /// Escape a value for use inside `set "VAR=..."` in a CMD batch file.
-    /// Only `%` needs doubling; `"` can't appear inside the quoted form.
+    /// Escape a JSON string so it can appear as a CMD command-line argument.
+    /// Internal `"` become `^"` (CMD literal-quote escape); `%`, `&`, etc.
+    /// are also escaped so the shell passes them through unchanged.
     #[cfg(target_os = "windows")]
-    fn escape_cmd_set_value(s: &str) -> String {
-        s.replace('%', "%%")
+    fn escape_cmd_arg(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '"' => out.push_str("^\""),
+                '%' => out.push_str("%%"),
+                '^' => out.push_str("^^"),
+                '&' => out.push_str("^&"),
+                '|' => out.push_str("^|"),
+                '<' => out.push_str("^<"),
+                '>' => out.push_str("^>"),
+                '!' => out.push_str("^^!"),
+                '\n' | '\r' => {}
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
+    /// Build the `--settings` JSON for a lightweight profile (mirrors
+    /// `launch_claude`), then escape it for embedding in a CMD command line.
+    #[cfg(target_os = "windows")]
+    fn build_escaped_settings(env: &LightweightEnv) -> String {
+        let mut env_map = serde_json::Map::new();
+
+        if let Some(ref t) = env.auth_token {
+            env_map.insert("ANTHROPIC_AUTH_TOKEN".into(), serde_json::Value::String(t.clone()));
+        }
+        if let Some(ref u) = env.base_url {
+            env_map.insert("ANTHROPIC_BASE_URL".into(), serde_json::Value::String(u.clone()));
+        }
+        if let Some(ref m) = env.default_opus_model {
+            env_map.insert("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), serde_json::Value::String(m.clone()));
+        }
+        if let Some(ref m) = env.default_sonnet_model {
+            env_map.insert("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), serde_json::Value::String(m.clone()));
+        }
+        if let Some(ref m) = env.default_haiku_model {
+            env_map.insert("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), serde_json::Value::String(m.clone()));
+        }
+        if let Some(ref m) = env.model {
+            env_map.insert("ANTHROPIC_MODEL".into(), serde_json::Value::String(m.clone()));
+        }
+        if let Some(ref m) = env.subagent_model {
+            env_map.insert("CLAUDE_CODE_SUBAGENT_MODEL".into(), serde_json::Value::String(m.clone()));
+        }
+        for extra in &env.extras {
+            if let Some((k, v)) = extra.split_once('=') {
+                env_map.insert(
+                    k.trim().to_string(),
+                    serde_json::Value::String(v.trim().to_string()),
+                );
+            }
+        }
+
+        let mut settings = serde_json::Map::new();
+        settings.insert("env".into(), serde_json::Value::Object(env_map));
+        let json = serde_json::to_string(&settings).unwrap_or_default();
+        Self::escape_cmd_arg(&json)
     }
 
     /// Generate the content of a self-contained `.cmd` file for a profile.
@@ -645,70 +703,26 @@ impl ProfileManager {
         lines.push(CMD_MARKER.into());
         lines.push(format!(":: Profile: {} ({})", profile.name, kind_label));
 
-        // Env vars / config dir (set before delayed expansion to avoid ! issues)
+        // Full profile: set CLAUDE_CONFIG_DIR
         if profile.kind == ProfileKind::Full {
             let dir = self.profile_dir(profile);
             lines.push(format!("set \"CLAUDE_CONFIG_DIR={}\"", dir.display()));
-        } else if let Some(ref env) = profile.env {
-            if let Some(ref t) = env.auth_token {
-                lines.push(format!(
-                    "set \"ANTHROPIC_AUTH_TOKEN={}\"",
-                    Self::escape_cmd_set_value(t)
-                ));
-            }
-            if let Some(ref u) = env.base_url {
-                lines.push(format!(
-                    "set \"ANTHROPIC_BASE_URL={}\"",
-                    Self::escape_cmd_set_value(u)
-                ));
-            }
-            if let Some(ref m) = env.default_opus_model {
-                lines.push(format!(
-                    "set \"ANTHROPIC_DEFAULT_OPUS_MODEL={}\"",
-                    Self::escape_cmd_set_value(m)
-                ));
-            }
-            if let Some(ref m) = env.default_sonnet_model {
-                lines.push(format!(
-                    "set \"ANTHROPIC_DEFAULT_SONNET_MODEL={}\"",
-                    Self::escape_cmd_set_value(m)
-                ));
-            }
-            if let Some(ref m) = env.default_haiku_model {
-                lines.push(format!(
-                    "set \"ANTHROPIC_DEFAULT_HAIKU_MODEL={}\"",
-                    Self::escape_cmd_set_value(m)
-                ));
-            }
-            if let Some(ref m) = env.model {
-                lines.push(format!(
-                    "set \"ANTHROPIC_MODEL={}\"",
-                    Self::escape_cmd_set_value(m)
-                ));
-            }
-            if let Some(ref m) = env.subagent_model {
-                lines.push(format!(
-                    "set \"CLAUDE_CODE_SUBAGENT_MODEL={}\"",
-                    Self::escape_cmd_set_value(m)
-                ));
-            }
-            for extra in &env.extras {
-                if let Some((k, v)) = extra.split_once('=') {
-                    lines.push(format!(
-                        "set \"{}={}\"",
-                        k.trim(),
-                        Self::escape_cmd_set_value(v.trim())
-                    ));
-                }
-            }
         }
+
+        // Lightweight profile: build the --settings JSON (embedded in
+        // the launch command, not set as env vars — matches launch_claude).
+        let settings_arg = if profile.kind == ProfileKind::Lightweight {
+            profile.env.as_ref().map(|e| Self::build_escaped_settings(e))
+        } else {
+            None
+        };
 
         if has_launch {
             let args_str = profile.launch_args.as_ref().unwrap().join(" ");
             lines.push(format!("set \"_LAUNCH_ARGS={}\"", args_str));
         }
 
-        // Delayed expansion enabled here — after all env-var sets — so `!` in
+        // Delayed expansion enabled here — after env-var sets — so `!` in
         // values is safe.  Only `_E` and `_R` are used with `!` expansion.
         lines.push("setlocal enabledelayedexpansion".into());
         lines.push("set \"_E=\" & set \"_R=\"".into());
@@ -719,13 +733,20 @@ impl ProfileManager {
         lines.push("set \"_R=!_R! %1\" & shift & goto :loop".into());
         lines.push(":launch".into());
 
-        // Build the claude command invocation
-        if has_launch {
-            lines.push(
-                "if defined _E (claude %_LAUNCH_ARGS%!_R!) else (claude !_R!)".into(),
-            );
+        // Build the claude command prefix (may include --settings for lite)
+        let claude_prefix = if let Some(ref json) = settings_arg {
+            format!("claude --settings {}", json)
         } else {
-            lines.push("claude !_R!".into());
+            "claude".to_string()
+        };
+
+        if has_launch {
+            lines.push(format!(
+                "if defined _E ({} %_LAUNCH_ARGS%!_R!) else ({} !_R!)",
+                claude_prefix, claude_prefix
+            ));
+        } else {
+            lines.push(format!("{} !_R!", claude_prefix));
         }
 
         Ok(lines.join("\r\n") + "\r\n")
