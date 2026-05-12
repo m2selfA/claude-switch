@@ -625,26 +625,25 @@ impl ProfileManager {
         Ok(home.join(".local").join("bin"))
     }
 
-    /// Escape a JSON string so it can appear as a CMD command-line argument.
-    /// Internal `"` become `^"` (CMD literal-quote escape); `%`, `&`, etc.
-    /// are also escaped so the shell passes them through unchanged.
+    /// Escape a JSON string for use as a CMD `--settings` argument.
+    /// Wraps the value in `"..."` (CMD argument grouping) and escapes internal
+    /// `"` as `\"` so the Windows C runtime preserves them when the child
+    /// process parses argv.  Also escapes `%` (`%%`) and `!` (`^!`) so the
+    /// batch-file parser passes them through.
     #[cfg(target_os = "windows")]
-    fn escape_cmd_arg(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for ch in s.chars() {
+    fn escape_cmd_json_arg(json: &str) -> String {
+        let mut out = String::with_capacity(json.len() + 16);
+        out.push('"');
+        for ch in json.chars() {
             match ch {
-                '"' => out.push_str("^\""),
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
                 '%' => out.push_str("%%"),
-                '^' => out.push_str("^^"),
-                '&' => out.push_str("^&"),
-                '|' => out.push_str("^|"),
-                '<' => out.push_str("^<"),
-                '>' => out.push_str("^>"),
-                '!' => out.push_str("^^!"),
-                '\n' | '\r' => {}
+                '!' => out.push_str("^!"),
                 _ => out.push(ch),
             }
         }
+        out.push('"');
         out
     }
 
@@ -687,7 +686,7 @@ impl ProfileManager {
         let mut settings = serde_json::Map::new();
         settings.insert("env".into(), serde_json::Value::Object(env_map));
         let json = serde_json::to_string(&settings).unwrap_or_default();
-        Self::escape_cmd_arg(&json)
+        Self::escape_cmd_json_arg(&json)
     }
 
     /// Generate the content of a self-contained `.cmd` file for a profile.
