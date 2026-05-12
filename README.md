@@ -119,6 +119,8 @@ claude-personal   # launch with the "personal" profile
 
 On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs self-contained `.cmd` files into `~/.local/bin` (`%USERPROFILE%\.local\bin`). Each `.cmd` is fully stand-alone (no dependency on `cswitch`) and supports `-e`/`--extra` for stored launch args. The files are maintained automatically — added, updated, and cleaned up when profiles change.
 
+On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs self-contained bash scripts there instead of printing aliases. Each script is executable, stand-alone, supports `-e`/`--extra`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
+
 ## How profiles are stored
 
 Profiles are tracked in `~/.claude-switch/registry.json`, keyed by UUID. Each profile has:

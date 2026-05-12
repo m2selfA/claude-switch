@@ -111,13 +111,13 @@ fn main() -> Result<()> {
 
         Some(Commands::Add { name, alias, force, full }) => {
             handle_add(&manager, &name, alias.as_deref(), force, full)?;
-            sync_cmd_on_windows(&manager);
+            sync_shims(&manager);
         }
 
         Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
             Ok(_) => {
                 println!("Profile '{}' removed.", name);
-                sync_cmd_on_windows(&manager);
+                sync_shims(&manager);
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -306,12 +306,17 @@ fn handle_add(manager: &ProfileManager, name: &str, alias: Option<&str>, force: 
 }
 
 #[cfg(target_os = "windows")]
-fn sync_cmd_on_windows(manager: &profile::ProfileManager) {
+fn sync_shims(manager: &profile::ProfileManager) {
     if let Err(e) = manager.sync_cmd_aliases() {
         eprintln!("Note: failed to sync CMD aliases: {}", e);
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn sync_cmd_on_windows(_manager: &profile::ProfileManager) {}
+fn sync_shims(manager: &profile::ProfileManager) {
+    // Sync shell scripts if ~/.varusers/bin exists
+    if let Err(e) = manager.sync_sh_scripts() {
+        eprintln!("Note: failed to sync shell scripts: {}", e);
+    }
+}
 
