@@ -70,7 +70,7 @@ cswitch
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
-| `cswitch aliases` | Print shell aliases for all profiles |
+| `cswitch aliases` | Generate shell aliases / sync self-contained wrappers |
 | `cswitch --help` | Full CLI help |
 
 ## Interactive TUI
