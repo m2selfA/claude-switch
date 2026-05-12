@@ -117,7 +117,7 @@ claude-work       # launch with the "work" profile
 claude-personal   # launch with the "personal" profile
 ```
 
-On Windows, `cswitch aliases` outputs PowerShell functions. Add them to your `$PROFILE`.
+On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs self-contained `.cmd` files into `~/.local/bin` (`%USERPROFILE%\.local\bin`). Each `.cmd` is fully stand-alone (no dependency on `cswitch`) and supports `-e`/`--extra` for stored launch args. The files are maintained automatically — added, updated, and cleaned up when profiles change.
 
 ## How profiles are stored
 

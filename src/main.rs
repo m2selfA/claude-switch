@@ -111,10 +111,14 @@ fn main() -> Result<()> {
 
         Some(Commands::Add { name, alias, force, full }) => {
             handle_add(&manager, &name, alias.as_deref(), force, full)?;
+            sync_cmd_on_windows(&manager);
         }
 
         Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
-            Ok(_) => println!("Profile '{}' removed.", name),
+            Ok(_) => {
+                println!("Profile '{}' removed.", name);
+                sync_cmd_on_windows(&manager);
+            }
             Err(e) => {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -300,4 +304,14 @@ fn handle_add(manager: &ProfileManager, name: &str, alias: Option<&str>, force: 
         Ok(())
     }
 }
+
+#[cfg(target_os = "windows")]
+fn sync_cmd_on_windows(manager: &profile::ProfileManager) {
+    if let Err(e) = manager.sync_cmd_aliases() {
+        eprintln!("Note: failed to sync CMD aliases: {}", e);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sync_cmd_on_windows(_manager: &profile::ProfileManager) {}
 
