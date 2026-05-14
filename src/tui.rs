@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     DefaultTerminal, Frame,
 };
 
@@ -65,6 +65,7 @@ pub struct App {
     manager: ProfileManager,
     profiles: Vec<Profile>,
     list_state: ListState,
+    list_scroll: ScrollbarState,
     mode: Mode,
     input_buffer: String,
     search_query: String,
@@ -113,6 +114,7 @@ impl App {
             manager,
             profiles,
             list_state,
+            list_scroll: ScrollbarState::default(),
             mode,
             input_buffer,
             search_query: String::new(),
@@ -143,10 +145,12 @@ impl App {
         self.apply_filter();
         if self.filtered_indices.is_empty() {
             self.list_state.select(None);
+            self.list_scroll = ScrollbarState::default();
         } else {
             let idx = self.list_state.selected().unwrap_or(0);
             self.list_state
                 .select(Some(idx.min(self.filtered_indices.len() - 1)));
+            self.list_scroll = self.list_scroll.content_length(self.filtered_indices.len()).position(idx);
         }
         Ok(())
     }
@@ -169,10 +173,12 @@ impl App {
         }
         if self.filtered_indices.is_empty() {
             self.list_state.select(None);
+            self.list_scroll = ScrollbarState::default();
         } else {
             let sel = self.list_state.selected().unwrap_or(0);
             self.list_state
                 .select(Some(sel.min(self.filtered_indices.len() - 1)));
+            self.list_scroll = self.list_scroll.content_length(self.filtered_indices.len()).position(sel.min(self.filtered_indices.len() - 1));
         }
     }
 
@@ -183,6 +189,7 @@ impl App {
             .position(|&i| self.profiles[i].id == id)
         {
             self.list_state.select(Some(fi));
+            self.list_scroll = self.list_scroll.position(fi);
         }
     }
 
@@ -202,6 +209,7 @@ impl App {
             Some(i) => i - 1,
         };
         self.list_state.select(Some(i));
+        self.list_scroll = self.list_scroll.position(i);
     }
 
     fn move_down(&mut self) {
@@ -213,6 +221,7 @@ impl App {
             None => 0,
         };
         self.list_state.select(Some(i));
+        self.list_scroll = self.list_scroll.position(i);
     }
 
     fn current_slot_value(&self) -> String {
@@ -517,6 +526,7 @@ impl App {
                     let id = p.id.clone();
                     match self.manager.remove_profile(&id) {
                         Ok(_) => {
+                            self.sync_shims();
                             self.refresh()?;
                             self.mode = Mode::Message(format!("Profile '{}' removed.", name), false);
                         }
@@ -561,6 +571,7 @@ impl App {
                 let name = self.lite_name.clone();
                 match self.manager.add_profile(&name, alias_opt) {
                     Ok(p) => {
+                        self.sync_shims();
                         self.refresh()?;
                         self.select_by_id(&p.id);
                         self.mode = Mode::Message(format!("Profile '{}' added.", name), false);
@@ -578,6 +589,23 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    // ── Shim sync ─────────────────────────────────────────────────────────────
+
+    fn sync_shims(&self) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Err(e) = self.manager.sync_cmd_aliases() {
+                eprintln!("Note: failed to sync CMD aliases: {}", e);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Err(e) = self.manager.sync_sh_scripts() {
+                eprintln!("Note: failed to sync shell scripts: {}", e);
+            }
+        }
     }
 
     // ── Edit Profile (name / alias / launch args) ──────────────────────────────
@@ -608,6 +636,7 @@ impl App {
                     Ok(p) => {
                         // Update launch_args
                         let _ = self.manager.set_launch_args(&p.id, launch);
+                        self.sync_shims();
                         self.refresh()?;
                         self.select_by_id(&p.id);
                         self.mode = Mode::Message(format!("Profile '{}' updated.", p.name), false);
@@ -730,7 +759,7 @@ impl App {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
-        let models_per_page: usize = 15;
+        let models_per_page: usize = 8;
         let is_edit = matches!(self.mode, Mode::LiteEdit { .. });
         // 9 steps: 0=name, 1=alias, 2-6=models, 7=extras, 8=launch_args
         let total_steps: usize = 9;
@@ -889,6 +918,7 @@ impl App {
                     match self.manager.update_lightweight(&id, &name, alias_opt, env) {
                         Ok(p) => {
                             let _ = self.manager.set_launch_args(&p.id, launch_args_from_str(&self.lite_launch_args));
+                            self.sync_shims();
                             self.refresh()?;
                             self.select_by_id(&p.id);
                             self.mode = Mode::Message(format!("Profile '{}' updated.", p.name), false);
@@ -899,6 +929,7 @@ impl App {
                     match self.manager.create_lightweight_profile(&name, alias_opt, env) {
                         Ok(p) => {
                             let _ = self.manager.set_launch_args(&p.id, launch_args_from_str(&self.lite_launch_args));
+                            self.sync_shims();
                             self.refresh()?;
                             self.select_by_id(&p.id);
                             self.mode = Mode::Message(format!("Profile '{}' created.", p.name), false);
@@ -1172,6 +1203,20 @@ impl App {
             .highlight_symbol("▶ ");
 
         f.render_stateful_widget(list, area, &mut self.list_state);
+
+        // Scrollbar
+        let count = self.filtered_indices.len();
+        let selected = self.list_state.selected().unwrap_or(0);
+        if count > 1 {
+            let scrollbar = Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(ACCENT))
+                .track_style(Style::default().fg(BORDER));
+            let mut scrollbar_state = ScrollbarState::new(count).position(selected);
+            f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+        }
     }
 
     fn render_detail_panel(&self, f: &mut Frame, area: Rect) {
@@ -1655,20 +1700,27 @@ impl App {
         let total = self.lite_models.len();
         if !self.lite_models.is_empty() {
             let page_start = self.lite_model_page.min(total.saturating_sub(1));
-            let page_models: Vec<&str> = self.lite_models.iter().skip(page_start).take(models_per_page).map(|s| s.as_str()).collect();
-            let page_end = page_start + page_models.len();
+            let page_end = (page_start + models_per_page).min(total);
+            let current_page = if models_per_page > 0 { page_start / models_per_page + 1 } else { 1 };
+            let total_pages = (total + models_per_page - 1) / models_per_page;
             let page_info = if total > models_per_page {
-                format!("  Models ({}-{} of {}):", page_start + 1, page_end, total)
+                format!("  Models ({}-{} of {}, page {}/{}):", page_start + 1, page_end, total, current_page, total_pages)
             } else {
                 "  Available models:".to_string()
             };
             lines.push(Line::from(Span::styled(page_info, Style::default().fg(DIM))));
+            let page_models: Vec<&str> = self.lite_models.iter().skip(page_start).take(models_per_page).map(|s| s.as_str()).collect();
             for (i, m) in page_models.iter().enumerate() {
                 let idx = page_start + i + 1;
                 lines.push(Line::from(Span::styled(format!("{:>4}. {}", idx, m), Style::default().fg(Color::Rgb(140, 200, 140)))));
             }
             if total > models_per_page {
                 lines.push(Line::from(Span::styled("     PgUp/PgDn scroll", Style::default().fg(Color::Rgb(80, 120, 80)))));
+                // Visual page indicator bar
+                let bar_width = 30usize;
+                let filled = (current_page as f64 / total_pages as f64 * bar_width as f64).round().max(1.0).min(bar_width as f64) as usize;
+                let bar = format!("     [{}{}]", "█".repeat(filled), "░".repeat(bar_width - filled));
+                lines.push(Line::from(Span::styled(bar, Style::default().fg(ACCENT))));
             }
         } else {
             lines.push(Line::from(Span::styled("  No models (type manually or use Alt+p/Alt+n to cycle)", Style::default().fg(DIM))));
