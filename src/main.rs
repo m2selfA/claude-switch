@@ -60,9 +60,9 @@ enum Commands {
     Use {
         /// Profile name to use
         name: String,
-        /// Enable profile's stored launch args (e.g. --dangerously-skip-permissions)
-        #[arg(short = 'e', long = "extra")]
-        extra: bool,
+        /// Skip profile's stored launch args (e.g. --dangerously-skip-permissions)
+        #[arg(long = "no-extras")]
+        no_extras: bool,
         /// Additional passthrough args passed directly to claude (use -- to separate)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -125,8 +125,8 @@ fn main() -> Result<()> {
             }
         },
 
-        Some(Commands::Use { name, extra, args }) => {
-            manager.launch_claude(&name, &args, extra)?;
+        Some(Commands::Use { name, no_extras, args }) => {
+            manager.launch_claude(&name, &args, !no_extras)?;
         }
 
         Some(Commands::Info { name }) => match manager.get_profile(&name) {

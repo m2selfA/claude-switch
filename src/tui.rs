@@ -352,11 +352,11 @@ impl App {
             }
 
             KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
-                // Shift+Enter: launch with stored launch_args
+                // Shift+Enter: launch WITHOUT stored launch_args
                 if let Some(p) = self.selected_profile() {
                     ratatui::restore();
-                    println!("Launching Claude with profile '{}' (with extra args)...", p.name);
-                    self.manager.launch_claude(&p.id, &[], true)?;
+                    println!("Launching Claude with profile '{}' (without extra args)...", p.name);
+                    self.manager.launch_claude(&p.id, &[], false)?;
                 }
             }
 
@@ -364,8 +364,8 @@ impl App {
                 if let Some(p) = self.selected_profile() {
                     let name = p.name.clone();
                     ratatui::restore();
-                    println!("Launching Claude with profile '{}'…", name);
-                    self.manager.launch_claude(&p.id, &[], false)?;
+                    println!("Launching Claude with profile '{}' (with extra args)…", name);
+                    self.manager.launch_claude(&p.id, &[], true)?;
                 }
             }
 
@@ -1371,7 +1371,7 @@ impl App {
             vec![
                 ("↑↓/jk", "nav"),
                 ("enter", "launch"),
-                ("Shift+Enter", "w/ args"),
+                ("Shift+Enter", "w/o args"),
                 ("/", "search"),
                 ("t", "lite"),
                 ("a", "add"),
@@ -1416,8 +1416,8 @@ impl App {
 
         let help_entries: Vec<(&str, &str)> = vec![
             ("↑/↓  j/k", "Navigate profiles"),
-            ("Enter", "Launch Claude with selected profile"),
-            ("Shift+Enter", "Launch with stored flags"),
+            ("Enter", "Launch with stored flags (default)"),
+            ("Shift+Enter", "Launch without stored flags"),
             ("/", "Search profiles by name or alias"),
             ("t", "Add lightweight (env-var based) profile"),
             ("a", "Add full (directory-isolated) profile"),

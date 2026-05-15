@@ -739,11 +739,10 @@ impl ProfileManager {
         // Delayed expansion enabled here — after env-var sets — so `!` in
         // values is safe.  Only `_E` and `_R` are used with `!` expansion.
         lines.push("setlocal enabledelayedexpansion".into());
-        lines.push("set \"_E=\" & set \"_R=\"".into());
+        lines.push("set \"_E=1\" & set \"_R=\"".into());
         lines.push(":loop".into());
         lines.push("if \"%~1\"==\"\" goto launch".into());
-        lines.push("if /i \"%~1\"==\"-e\" (set \"_E=1\" & shift & goto :loop)".into());
-        lines.push("if /i \"%~1\"==\"--extra\" (set \"_E=1\" & shift & goto :loop)".into());
+        lines.push("if /i \"%~1\"==\"--no-extras\" (set \"_E=\" & shift & goto :loop)".into());
         lines.push("set \"_R=!_R! %1\" & shift & goto :loop".into());
         lines.push(":launch".into());
 
@@ -919,11 +918,11 @@ impl ProfileManager {
         }
 
         lines.push(String::new());
-        lines.push("EXTRA=false".into());
+        lines.push("EXTRA=true".into());
         lines.push("ARGS=()".into());
         lines.push("while [[ $# -gt 0 ]]; do".into());
         lines.push("    case \"$1\" in".into());
-        lines.push("        -e|--extra) EXTRA=true; shift ;;".into());
+        lines.push("        --no-extras) EXTRA=false; shift ;;".into());
         lines.push("        *) ARGS+=(\"$1\"); shift ;;".into());
         lines.push("    esac".into());
         lines.push("done".into());
