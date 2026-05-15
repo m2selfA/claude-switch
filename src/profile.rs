@@ -934,7 +934,7 @@ impl ProfileManager {
 
         if has_launch {
             lines.push(format!(
-                "if $EXTRA; then{0}{1} exec claude{0}{1} \"${{ARGS[@]}}\"; else exec claude{0} \"${{ARGS[@]}}\"; fi",
+                "if $EXTRA; then exec claude{0}{1} \"${{ARGS[@]}}\"; else exec claude{0} \"${{ARGS[@]}}\"; fi",
                 settings_part, launch_part
             ));
         } else {
