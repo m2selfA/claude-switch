@@ -1,16 +1,25 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
+use arboard::Clipboard;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
+    DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
-    DefaultTerminal, Frame,
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 
 use crate::cli_args::all_flag_names;
 use crate::env_vars::all_var_names;
-use crate::profile::{fetch_models, LightweightEnv, Profile, ProfileKind, ProfileManager};
+use crate::profile::{
+    LightweightEnv, ModelDiscoverySuccess, Profile, ProfileKind, ProfileManager, Provider,
+    ProviderKey, discover_models, fetch_models, test_anthropic_message,
+};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 const ACCENT: Color = Color::Rgb(255, 149, 0);
@@ -35,12 +44,32 @@ enum Mode {
     AddFullName,
     AddFullAlias,
     Message(String, bool),
-    /// Lightweight creation: token input
-    LiteToken,
-    /// Lightweight creation: URL input
-    LiteUrl,
+    /// Lightweight creation: choose provider
+    LiteProviderSelect,
+    /// Lightweight creation: choose provider key
+    LiteKeySelect {
+        provider_id: String,
+    },
     /// Fetching models spinner
     LiteFetching,
+    /// Anthropic provider test: choose a model, then edit prompt and send.
+    ProviderAnthropicTest {
+        provider_id: String,
+        key_id: String,
+        source: ProviderTestSource,
+        field: usize,
+    },
+    ProviderAnthropicOutcome {
+        provider_id: String,
+        key_id: String,
+        source: ProviderTestSource,
+        field: usize,
+        model: String,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        body: String,
+        is_error: bool,
+    },
     /// Lightweight profile being built / edited
     /// Steps: 0=name, 1=alias, 2=opus, 3=sonnet, 4=haiku, 5=model, 6=subagent, 7=extras
     LiteModelSelect {
@@ -58,6 +87,257 @@ enum Mode {
         profile_id: String,
         step: usize, // 0=name, 1=alias
     },
+    /// Provider list browsing
+    ProviderList,
+    /// Adding a new provider (step: 0=name, 1=url, 2=token)
+    ProviderAdd {
+        step: usize,
+    },
+    /// Smart input raw provider data, then continue provider add.
+    ProviderSmartPaste,
+    /// Editing provider (step: 0=name, 1=url, 2=keys)
+    ProviderEdit {
+        provider_id: String,
+        step: usize,
+    },
+    /// Adding a key from within provider edit
+    ProviderEditKeyInput {
+        provider_id: String,
+        step: usize,
+    },
+    /// Key list for a specific provider
+    ProviderKeyList {
+        provider_id: String,
+    },
+    /// Key picker used only for provider tests on multi-key providers
+    ProviderTestKeyList {
+        provider_id: String,
+    },
+    /// Add a key to a provider (step: 0=name, 1=token)
+    ProviderKeyAdd {
+        provider_id: String,
+        step: usize,
+    },
+    /// Edit an existing key (step: 0=name, 1=token)
+    ProviderKeyEdit {
+        provider_id: String,
+        key_id: String,
+        step: usize,
+        source: KeyEditSource,
+    },
+    /// Confirm delete provider
+    ConfirmDeleteProvider {
+        provider_id: String,
+        name: String,
+    },
+    /// Confirm delete key
+    ConfirmDeleteKey {
+        provider_id: String,
+        key_id: String,
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Page {
+    ProfileManager,
+    ProviderManager,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum KeyEditSource {
+    ProviderKeyList,
+    ProviderEdit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProviderTestSource {
+    Page,
+    KeyList,
+    TestKeyList,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ProviderTestKeySelection {
+    NoKeys,
+    Single(ProviderKey),
+    Multiple,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ModelFetchState {
+    Loaded,
+    Empty,
+    Unavailable(String),
+}
+
+/// Emacs-style text editing on a String buffer with cursor position.
+/// Returns true if the key was consumed.
+fn emacs_edit(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    buf: &mut String,
+    pos: &mut usize,
+    accept_char: bool,
+) -> bool {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    // Clamp cursor to a UTF-8 character boundary.
+    *pos = nearest_prev_char_boundary(buf, *pos);
+    if *pos > buf.len() {
+        *pos = buf.len();
+    }
+    match code {
+        KeyCode::Char('a') if ctrl => {
+            *pos = 0;
+            true
+        }
+        KeyCode::Char('e') if ctrl => {
+            *pos = buf.len();
+            true
+        }
+        KeyCode::Char('b') if ctrl => {
+            *pos = prev_char_boundary(buf, *pos);
+            true
+        }
+        KeyCode::Char('f') if ctrl => {
+            *pos = next_char_boundary(buf, *pos);
+            true
+        }
+        KeyCode::Char('d') if ctrl => {
+            if *pos < buf.len() {
+                let next = next_char_boundary(buf, *pos);
+                if next > *pos {
+                    buf.drain(*pos..next);
+                }
+            }
+            true
+        }
+        KeyCode::Char('k') if ctrl => {
+            buf.truncate(*pos);
+            true
+        }
+        KeyCode::Char('u') if ctrl => {
+            if *pos > 0 {
+                buf.drain(..*pos);
+                *pos = 0;
+            }
+            true
+        }
+        KeyCode::Char('w') if ctrl => {
+            let mut new_pos = None;
+            for (idx, ch) in buf[..*pos].char_indices().rev() {
+                if !(ch.is_alphanumeric() || ch == '_' || ch == '-') {
+                    new_pos = Some(idx + ch.len_utf8());
+                    break;
+                }
+            }
+            if let Some(new_pos) = new_pos {
+                if new_pos < *pos {
+                    buf.drain(new_pos..*pos);
+                    *pos = new_pos;
+                }
+            } else if *pos > 0 {
+                buf.drain(..*pos);
+                *pos = 0;
+            }
+            true
+        }
+        KeyCode::Backspace => {
+            let prev = prev_char_boundary(buf, *pos);
+            if prev < *pos {
+                buf.drain(prev..*pos);
+                *pos = prev;
+            }
+            true
+        }
+        KeyCode::Char('h') if ctrl => {
+            let prev = prev_char_boundary(buf, *pos);
+            if prev < *pos {
+                buf.drain(prev..*pos);
+                *pos = prev;
+            }
+            true
+        }
+        KeyCode::Char('\u{8}') | KeyCode::Char('\u{7f}') => {
+            let prev = prev_char_boundary(buf, *pos);
+            if prev < *pos {
+                buf.drain(prev..*pos);
+                *pos = prev;
+            }
+            true
+        }
+        KeyCode::Left => {
+            *pos = prev_char_boundary(buf, *pos);
+            true
+        }
+        KeyCode::Right => {
+            *pos = next_char_boundary(buf, *pos);
+            true
+        }
+        KeyCode::Home => {
+            *pos = 0;
+            true
+        }
+        KeyCode::End => {
+            *pos = buf.len();
+            true
+        }
+        KeyCode::Delete => {
+            if *pos < buf.len() {
+                let next = next_char_boundary(buf, *pos);
+                if next > *pos {
+                    buf.drain(*pos..next);
+                }
+            }
+            true
+        }
+        KeyCode::Char(c) if accept_char => {
+            buf.insert(*pos, c);
+            *pos = next_char_boundary(buf, *pos);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    let mut pos = nearest_prev_char_boundary(s, pos);
+    if pos == 0 {
+        return 0;
+    }
+    pos -= 1;
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+fn nearest_prev_char_boundary(s: &str, pos: usize) -> usize {
+    let mut pos = pos.min(s.len());
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    let pos = pos.min(s.len());
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut next = pos + 1;
+    while next < s.len() && !s.is_char_boundary(next) {
+        next += 1;
+    }
+    next
+}
+
+fn provider_edit_cursor_pos(step: usize, name: &str, url: &str) -> usize {
+    match step {
+        0 => name.len(),
+        1 => url.len(),
+        _ => 0,
+    }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -67,7 +347,9 @@ pub struct App {
     list_state: ListState,
     list_scroll: ScrollbarState,
     mode: Mode,
+    page: Page,
     input_buffer: String,
+    cursor_pos: usize,
     search_query: String,
     filtered_indices: Vec<usize>,
     /// Per-slot [1m] suffix flags (opus, sonnet, haiku, model, subagent)
@@ -77,6 +359,7 @@ pub struct App {
     lite_step: usize,
     /// Fetched models
     lite_models: Vec<String>,
+    lite_model_fetch_state: ModelFetchState,
     /// Model list pagination offset
     lite_model_page: usize,
     /// Profile id being edited (for LiteEdit)
@@ -86,6 +369,27 @@ pub struct App {
     lite_alias: String,
     lite_token: String,
     lite_url: String,
+    lite_provider_id: Option<String>,
+    lite_key_id: Option<String>,
+    lite_provider_keys: Vec<ProviderKey>,
+    provider_list_state: ListState,
+    provider_list_scroll: ScrollbarState,
+    provider_name_buf: String,
+    provider_url_buf: String,
+    provider_key_buf: String,
+    provider_key_name_buf: String,
+    provider_add_existing_id: Option<String>,
+    provider_smart_paste_buf: String,
+    provider_smart_paste_error: Option<String>,
+    provider_test_prompt_buf: String,
+    provider_test_model_buf: String,
+    provider_test_models: Vec<String>,
+    provider_test_model_fetch_state: ModelFetchState,
+    provider_test_model_selected: usize,
+    message_return_mode: Option<Mode>,
+    providers_cache: Vec<Provider>,
+    provider_keys_cache: Vec<ProviderKey>,
+    provider_key_selected: usize,
     lite_mod_opus: String,
     lite_mod_sonnet: String,
     lite_mod_haiku: String,
@@ -116,17 +420,41 @@ impl App {
             list_state,
             list_scroll: ScrollbarState::default(),
             mode,
+            page: Page::ProfileManager,
             input_buffer,
+            cursor_pos: 0,
             search_query: String::new(),
             filtered_indices,
             lite_1m: [false; 5],
             lite_step: 0,
             lite_models: Vec::new(),
+            lite_model_fetch_state: ModelFetchState::Loaded,
             lite_model_page: 0,
             lite_name: String::new(),
             lite_alias: String::new(),
             lite_token: String::new(),
             lite_url: "https://api.anthropic.com".to_string(),
+            lite_provider_id: None,
+            lite_key_id: None,
+            lite_provider_keys: Vec::new(),
+            provider_list_state: ListState::default(),
+            provider_list_scroll: ScrollbarState::default(),
+            provider_name_buf: String::new(),
+            provider_url_buf: String::new(),
+            provider_key_buf: String::new(),
+            provider_key_name_buf: String::new(),
+            provider_add_existing_id: None,
+            provider_smart_paste_buf: String::new(),
+            provider_smart_paste_error: None,
+            provider_test_prompt_buf: "Hello".to_string(),
+            provider_test_model_buf: String::new(),
+            provider_test_models: Vec::new(),
+            provider_test_model_fetch_state: ModelFetchState::Loaded,
+            provider_test_model_selected: 0,
+            message_return_mode: None,
+            providers_cache: Vec::new(),
+            provider_keys_cache: Vec::new(),
+            provider_key_selected: 0,
             lite_edit_id: String::new(),
             lite_mod_opus: String::new(),
             lite_mod_sonnet: String::new(),
@@ -150,7 +478,10 @@ impl App {
             let idx = self.list_state.selected().unwrap_or(0);
             self.list_state
                 .select(Some(idx.min(self.filtered_indices.len() - 1)));
-            self.list_scroll = self.list_scroll.content_length(self.filtered_indices.len()).position(idx);
+            self.list_scroll = self
+                .list_scroll
+                .content_length(self.filtered_indices.len())
+                .position(idx);
         }
         Ok(())
     }
@@ -166,7 +497,10 @@ impl App {
                 .enumerate()
                 .filter(|(_, p)| {
                     p.name.to_lowercase().contains(&q)
-                        || p.alias.as_deref().map(|a| a.to_lowercase().contains(&q)).unwrap_or(false)
+                        || p.alias
+                            .as_deref()
+                            .map(|a| a.to_lowercase().contains(&q))
+                            .unwrap_or(false)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -178,7 +512,10 @@ impl App {
             let sel = self.list_state.selected().unwrap_or(0);
             self.list_state
                 .select(Some(sel.min(self.filtered_indices.len() - 1)));
-            self.list_scroll = self.list_scroll.content_length(self.filtered_indices.len()).position(sel.min(self.filtered_indices.len() - 1));
+            self.list_scroll = self
+                .list_scroll
+                .content_length(self.filtered_indices.len())
+                .position(sel.min(self.filtered_indices.len() - 1));
         }
     }
 
@@ -246,6 +583,107 @@ impl App {
         }
     }
 
+    fn reset_lite_builder(&mut self) {
+        self.lite_token.clear();
+        self.lite_url = "https://api.anthropic.com".to_string();
+        self.lite_provider_id = None;
+        self.lite_key_id = None;
+        self.lite_provider_keys.clear();
+        self.provider_keys_cache.clear();
+        self.provider_key_selected = 0;
+        self.lite_name.clear();
+        self.lite_alias.clear();
+        self.lite_step = 0;
+        self.lite_models.clear();
+        self.lite_model_fetch_state = ModelFetchState::Loaded;
+        self.lite_model_page = 0;
+        self.lite_1m = [false; 5];
+        self.lite_extras.clear();
+        self.lite_launch_args = "--dangerously-skip-permissions".to_string();
+        self.lite_mod_opus.clear();
+        self.lite_mod_sonnet.clear();
+        self.lite_mod_haiku.clear();
+        self.lite_mod_model.clear();
+        self.lite_mod_subagent.clear();
+        self.input_buffer.clear();
+        self.cursor_pos = 0;
+    }
+
+    fn set_lite_models_from_result(&mut self, fetched: Result<Vec<String>>) {
+        match fetched {
+            Ok(models) => {
+                self.lite_models = models
+                    .into_iter()
+                    .map(|model| trim_model_context_suffix(&model).to_string())
+                    .collect();
+                self.lite_models.sort();
+                self.lite_models.dedup();
+                self.lite_model_fetch_state = model_fetch_state_for_models(&self.lite_models);
+            }
+            Err(e) => {
+                self.lite_models.clear();
+                self.lite_model_fetch_state =
+                    ModelFetchState::Unavailable(model_fetch_unavailable_message(&e.to_string()));
+            }
+        }
+    }
+
+    fn set_provider_test_models_from_result(
+        &mut self,
+        fetched: std::result::Result<ModelDiscoverySuccess, String>,
+    ) {
+        match fetched {
+            Ok(discovery) => {
+                self.provider_test_models = discovery
+                    .models
+                    .into_iter()
+                    .map(|model| trim_model_context_suffix(&model).to_string())
+                    .collect();
+                self.provider_test_models.sort();
+                self.provider_test_models.dedup();
+                self.provider_test_model_fetch_state =
+                    model_fetch_state_for_models(&self.provider_test_models);
+            }
+            Err(e) => {
+                self.provider_test_models.clear();
+                self.provider_test_model_fetch_state =
+                    ModelFetchState::Unavailable(model_fetch_unavailable_message(&e.to_string()));
+            }
+        }
+    }
+
+    fn start_lite_profile_creation(&mut self) -> Result<()> {
+        self.reset_lite_builder();
+        self.providers_cache = self.manager.list_providers()?;
+        self.provider_list_state = ListState::default();
+        self.provider_list_scroll = ScrollbarState::default();
+
+        if self.providers_cache.is_empty() {
+            self.mode = Mode::Message(
+                "No providers found. Add one in Provider Manager first.".to_string(),
+                true,
+            );
+            return Ok(());
+        }
+
+        self.provider_list_state.select(Some(0));
+        self.mode = Mode::LiteProviderSelect;
+        Ok(())
+    }
+
+    fn open_lite_model_builder(&mut self) {
+        self.mode = Mode::LiteFetching;
+        self.set_lite_models_from_result(fetch_models(&self.lite_url, &self.lite_token));
+        self.lite_step = 0;
+        self.lite_model_page = 0;
+        self.mode = Mode::LiteModelSelect {
+            profile_name: String::new(),
+            token: self.lite_token.clone(),
+            base_url: self.lite_url.clone(),
+            models: self.lite_models.clone(),
+        };
+    }
+
     // ── Run ───────────────────────────────────────────────────────────────────
 
     pub fn run(mut self) -> Result<()> {
@@ -260,62 +698,139 @@ impl App {
         loop {
             terminal.draw(|f| self.render(f))?;
 
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match &self.mode.clone() {
-                    Mode::FirstRun => {
-                        if self.handle_first_run_key(key.code, key.modifiers)? {
-                            return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    // Shift+Tab: switch page (only in Normal/Search/ProviderList)
+                    if (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+                        || key.code == KeyCode::BackTab
+                    {
+                        match (&self.mode, self.page) {
+                            (Mode::Normal | Mode::Search, _) | (Mode::ProviderList, _) => {
+                                self.page = match self.page {
+                                    Page::ProfileManager => {
+                                        self.providers_cache =
+                                            self.manager.list_providers().unwrap_or_default();
+                                        self.provider_list_state = ListState::default();
+                                        if !self.providers_cache.is_empty() {
+                                            self.provider_list_state.select(Some(0));
+                                        }
+                                        Page::ProviderManager
+                                    }
+                                    Page::ProviderManager => {
+                                        self.refresh()?;
+                                        Page::ProfileManager
+                                    }
+                                };
+                                self.mode = Mode::Normal;
+                                continue;
+                            }
+                            _ => {}
                         }
                     }
-                    Mode::Normal => {
-                        if self.handle_normal_key(key.code, key.modifiers)? {
-                            return Ok(());
+
+                    match &self.mode.clone() {
+                        Mode::FirstRun => {
+                            if self.handle_first_run_key(key.code, key.modifiers)? {
+                                return Ok(());
+                            }
                         }
-                    }
-                    Mode::Search => {
-                        if self.handle_search_key(key.code, key.modifiers)? {
-                            return Ok(());
+                        Mode::Normal => {
+                            if self.handle_normal_key(key.code, key.modifiers)? {
+                                return Ok(());
+                            }
                         }
-                    }
-                    Mode::Help => {
-                        self.mode = Mode::Normal;
-                    }
-                    Mode::ConfirmDelete => {
-                        self.handle_confirm_delete(key.code)?;
-                    }
-                    Mode::AddFullName => {
-                        self.handle_add_full_name(key.code)?;
-                    }
-                    Mode::AddFullAlias => {
-                        self.handle_add_full_alias(key.code)?;
-                    }
-                    Mode::LiteToken => {
-                        self.handle_lite_token(key.code, key.modifiers)?;
-                    }
-                    Mode::LiteUrl => {
-                        self.handle_lite_url(key.code, key.modifiers)?;
-                    }
-                    Mode::LiteFetching => {
-                        if key.code == KeyCode::Esc {
+                        Mode::Search => {
+                            if self.handle_search_key(key.code, key.modifiers)? {
+                                return Ok(());
+                            }
+                        }
+                        Mode::Help => {
                             self.mode = Mode::Normal;
                         }
-                    }
-                    Mode::LiteModelSelect { .. } => {
-                        self.handle_lite_model_select(key.code, key.modifiers)?;
-                    }
-                    Mode::LiteEdit { .. } => {
-                        self.handle_lite_model_select(key.code, key.modifiers)?;
-                    }
-                    Mode::EditProfile { .. } => {
-                        self.handle_edit_profile(key.code)?;
-                    }
-                    Mode::Message(_, _) => {
-                        self.mode = Mode::Normal;
+                        Mode::ConfirmDelete => {
+                            self.handle_confirm_delete(key.code)?;
+                        }
+                        Mode::AddFullName => {
+                            self.handle_add_full_name(key.code, key.modifiers)?;
+                        }
+                        Mode::AddFullAlias => {
+                            self.handle_add_full_alias(key.code, key.modifiers)?;
+                        }
+                        Mode::LiteProviderSelect => {
+                            self.handle_lite_provider_select(key.code, key.modifiers)?;
+                        }
+                        Mode::LiteKeySelect { .. } => {
+                            self.handle_lite_key_select(key.code, key.modifiers)?;
+                        }
+                        Mode::LiteFetching => {
+                            if key.code == KeyCode::Esc {
+                                self.mode = Mode::Normal;
+                            }
+                        }
+                        Mode::LiteModelSelect { .. } => {
+                            self.handle_lite_model_select(key.code, key.modifiers)?;
+                        }
+                        Mode::LiteEdit { .. } => {
+                            self.handle_lite_model_select(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderAnthropicTest { .. } => {
+                            self.handle_provider_anthropic_test(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderAnthropicOutcome { .. } => {
+                            self.handle_provider_anthropic_outcome(key.code)?;
+                        }
+                        Mode::EditProfile { .. } => {
+                            self.handle_edit_profile(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderList => {
+                            self.handle_provider_list(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderAdd { .. } => {
+                            self.handle_provider_add(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderSmartPaste => {
+                            self.handle_provider_smart_paste(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderEdit { .. } => {
+                            self.handle_provider_edit(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderEditKeyInput { .. } => {
+                            self.handle_provider_edit_key_input(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderKeyList { .. } => {
+                            self.handle_provider_key_list(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderTestKeyList { .. } => {
+                            self.handle_provider_test_key_list(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderKeyAdd { .. } => {
+                            self.handle_provider_key_add(key.code, key.modifiers)?;
+                        }
+                        Mode::ProviderKeyEdit { .. } => {
+                            self.handle_provider_key_edit(key.code, key.modifiers)?;
+                        }
+                        Mode::ConfirmDeleteProvider { .. } => {
+                            self.handle_confirm_delete_provider(key.code)?;
+                        }
+                        Mode::ConfirmDeleteKey { .. } => {
+                            self.handle_confirm_delete_key(key.code)?;
+                        }
+                        Mode::Message(_, _) => {
+                            self.mode = self.message_return_mode.take().unwrap_or(Mode::Normal);
+                        }
                     }
                 }
+                Event::Paste(text) => {
+                    if matches!(self.mode, Mode::ProviderSmartPaste) {
+                        self.provider_smart_paste_buf.push_str(&text);
+                        self.cursor_pos = self.provider_smart_paste_buf.len();
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -334,12 +849,25 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
+        // Global keys (work on both pages)
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
+            _ => {}
+        }
 
+        match self.page {
+            Page::ProfileManager => self.handle_profile_page_key(code, modifiers),
+            Page::ProviderManager => self.handle_provider_page_normal_key(code, modifiers),
+        }
+    }
+
+    fn handle_profile_page_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
+        match code {
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => self.move_up(),
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => self.move_down(),
 
             KeyCode::Char('/') => {
                 self.search_query.clear();
@@ -355,7 +883,10 @@ impl App {
                 // Shift+Enter: launch WITHOUT stored launch_args
                 if let Some(p) = self.selected_profile() {
                     ratatui::restore();
-                    println!("Launching Claude with profile '{}' (without extra args)...", p.name);
+                    println!(
+                        "Launching Claude with profile '{}' (without extra args)...",
+                        p.name
+                    );
                     self.manager.launch_claude(&p.id, &[], false)?;
                 }
             }
@@ -364,29 +895,16 @@ impl App {
                 if let Some(p) = self.selected_profile() {
                     let name = p.name.clone();
                     ratatui::restore();
-                    println!("Launching Claude with profile '{}' (with extra args)…", name);
+                    println!(
+                        "Launching Claude with profile '{}' (with extra args)…",
+                        name
+                    );
                     self.manager.launch_claude(&p.id, &[], true)?;
                 }
             }
 
             KeyCode::Char('t') => {
-                self.lite_token.clear();
-                self.lite_url = "https://api.anthropic.com".to_string();
-                self.lite_name.clear();
-                self.lite_alias.clear();
-                self.lite_step = 0;
-                self.lite_models.clear();
-                self.lite_model_page = 0;
-                self.lite_1m = [false; 5];
-                self.lite_extras.clear();
-                self.lite_launch_args = "--dangerously-skip-permissions".to_string();
-                self.lite_mod_opus.clear();
-                self.lite_mod_sonnet.clear();
-                self.lite_mod_haiku.clear();
-                self.lite_mod_model.clear();
-                self.lite_mod_subagent.clear();
-                self.mode = Mode::LiteToken;
-                self.input_buffer.clear();
+                self.start_lite_profile_creation()?;
             }
 
             KeyCode::Char('a') => {
@@ -394,10 +912,8 @@ impl App {
                 self.input_buffer.clear();
             }
 
-            KeyCode::Char('d') | KeyCode::Delete => {
-                if self.selected_profile().is_some() {
-                    self.mode = Mode::ConfirmDelete;
-                }
+            KeyCode::Char('d') | KeyCode::Delete if self.selected_profile().is_some() => {
+                self.mode = Mode::ConfirmDelete;
             }
 
             KeyCode::Char('e') => {
@@ -409,36 +925,79 @@ impl App {
                 if profile.kind == ProfileKind::Lightweight {
                     // Lightweight: full edit with models + extras
                     if let Some(ref env) = profile.env {
-                        self.lite_token = env.auth_token.clone().unwrap_or_default();
-                        self.lite_url = env.base_url.clone().unwrap_or_else(|| "https://api.anthropic.com".to_string());
-                        self.lite_mod_opus = env.default_opus_model.clone().unwrap_or_default();
-                        self.lite_mod_sonnet = env.default_sonnet_model.clone().unwrap_or_default();
-                        self.lite_mod_haiku = env.default_haiku_model.clone().unwrap_or_default();
-                        self.lite_mod_model = env.model.clone().unwrap_or_default();
-                        self.lite_mod_subagent = env.subagent_model.clone().unwrap_or_default();
-                        let ends_1m: [&str; 5] = [&self.lite_mod_opus, &self.lite_mod_sonnet, &self.lite_mod_haiku, &self.lite_mod_model, &self.lite_mod_subagent];
-                        for i in 0..5 { self.lite_1m[i] = ends_1m[i].ends_with("[1m]"); }
+                        let (resolved_token, resolved_url) = self
+                            .manager
+                            .resolve_credentials(&profile)
+                            .unwrap_or_else(|_| {
+                                (
+                                    env.auth_token.clone(),
+                                    env.base_url
+                                        .clone()
+                                        .or_else(|| Some("https://api.anthropic.com".to_string())),
+                                )
+                            });
+                        self.lite_token = resolved_token.unwrap_or_default();
+                        self.lite_url =
+                            resolved_url.unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                        self.lite_provider_id = profile.provider_id.clone();
+                        self.lite_key_id = profile.key_id.clone();
+                        self.lite_mod_opus = strip_model_1m_suffix(
+                            env.default_opus_model.as_deref().unwrap_or_default(),
+                        )
+                        .to_string();
+                        self.lite_mod_sonnet = strip_model_1m_suffix(
+                            env.default_sonnet_model.as_deref().unwrap_or_default(),
+                        )
+                        .to_string();
+                        self.lite_mod_haiku = strip_model_1m_suffix(
+                            env.default_haiku_model.as_deref().unwrap_or_default(),
+                        )
+                        .to_string();
+                        self.lite_mod_model =
+                            strip_model_1m_suffix(env.model.as_deref().unwrap_or_default())
+                                .to_string();
+                        self.lite_mod_subagent = strip_model_1m_suffix(
+                            env.subagent_model.as_deref().unwrap_or_default(),
+                        )
+                        .to_string();
+                        let ends_1m: [&str; 5] = [
+                            env.default_opus_model.as_deref().unwrap_or_default(),
+                            env.default_sonnet_model.as_deref().unwrap_or_default(),
+                            env.default_haiku_model.as_deref().unwrap_or_default(),
+                            env.model.as_deref().unwrap_or_default(),
+                            env.subagent_model.as_deref().unwrap_or_default(),
+                        ];
+                        for (i, value) in ends_1m.iter().enumerate() {
+                            self.lite_1m[i] = model_has_1m_suffix(value);
+                        }
                         self.lite_name = profile.name.clone();
                         self.lite_alias = profile.alias.clone().unwrap_or_default();
                         self.lite_edit_id = profile.id.clone();
                         self.lite_step = 0;
                         self.lite_extras = env.extras.clone();
-                        self.lite_launch_args = profile.launch_args
-                            .map(|v| v.join(" "))
-                            .unwrap_or_default();
+                        self.lite_launch_args =
+                            profile.launch_args.map(|v| v.join(" ")).unwrap_or_default();
+                        self.providers_cache = self.manager.list_providers().unwrap_or_default();
+                        self.lite_provider_keys = if let Some(ref pid) = self.lite_provider_id {
+                            self.providers_cache
+                                .iter()
+                                .find(|p| p.id == *pid)
+                                .map(|prov| {
+                                    let mut ks: Vec<_> = prov.keys.values().cloned().collect();
+                                    ks.sort_by(|a, b| a.name.cmp(&b.name));
+                                    ks
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         let token = self.lite_token.clone();
                         let base_url = self.lite_url.clone();
                         self.mode = Mode::LiteFetching;
-                        match fetch_models(&base_url, &token) {
-                            Ok(models) => {
-                                self.lite_models = models;
-                                self.mode = Mode::LiteEdit { profile_id: profile.id.clone() };
-                            }
-                            Err(_) => {
-                                self.lite_models = Vec::new();
-                                self.mode = Mode::LiteEdit { profile_id: profile.id.clone() };
-                            }
-                        }
+                        self.set_lite_models_from_result(fetch_models(&base_url, &token));
+                        self.mode = Mode::LiteEdit {
+                            profile_id: profile.id.clone(),
+                        };
                     } else {
                         self.mode = Mode::Message("No env config found.".into(), true);
                     }
@@ -446,9 +1005,12 @@ impl App {
                     // Full profile: edit name/alias + launch args
                     self.lite_name = profile.name.clone();
                     self.lite_alias = profile.alias.clone().unwrap_or_default();
-                    self.lite_launch_args = profile.launch_args
-                        .map(|v| v.join(" "))
-                        .unwrap_or_default();
+                    self.lite_launch_args =
+                        profile.launch_args.map(|v| v.join(" ")).unwrap_or_default();
+                    self.lite_provider_id = None;
+                    self.lite_key_id = None;
+                    self.lite_provider_keys.clear();
+                    self.cursor_pos = self.lite_name.len();
                     self.mode = Mode::EditProfile {
                         profile_id: profile.id.clone(),
                         step: 0,
@@ -457,9 +1019,11 @@ impl App {
             }
 
             KeyCode::Char('m') => {
-                if let Some(p) = self.selected_profile() {
-                    if p.kind == ProfileKind::Lightweight {
-                        for i in 0..5 { self.lite_1m[i] = !self.lite_1m[i]; }
+                if let Some(p) = self.selected_profile()
+                    && p.kind == ProfileKind::Lightweight
+                {
+                    for i in 0..5 {
+                        self.lite_1m[i] = !self.lite_1m[i];
                     }
                 }
             }
@@ -472,11 +1036,107 @@ impl App {
                         Ok(_) => {
                             self.refresh()?;
                             self.select_by_id(&id);
-                            self.mode = Mode::Message(format!("Profile '{}' refreshed.", name), false);
+                            self.mode =
+                                Mode::Message(format!("Profile '{}' refreshed.", name), false);
                         }
                         Err(e) => self.mode = Mode::Message(e.to_string(), true),
                     }
                 }
+            }
+
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_provider_page_normal_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<bool> {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => self.move_provider_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_provider_down(),
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_provider_up()
+            }
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_provider_down()
+            }
+
+            KeyCode::Enter => {
+                if let Some(p) = self
+                    .providers_cache
+                    .get(self.provider_list_state.selected().unwrap_or(0))
+                {
+                    self.provider_keys_cache = self.manager.list_keys(&p.id).unwrap_or_default();
+                    self.provider_key_selected = 0;
+                    self.mode = Mode::ProviderKeyList {
+                        provider_id: p.id.clone(),
+                    };
+                }
+            }
+
+            KeyCode::Char('a') => {
+                self.provider_name_buf.clear();
+                self.provider_url_buf.clear();
+                self.provider_key_buf.clear();
+                self.provider_key_name_buf = "Default".to_string();
+                self.provider_add_existing_id = None;
+                self.provider_smart_paste_buf.clear();
+                self.provider_smart_paste_error = None;
+                self.cursor_pos = 0;
+                self.mode = Mode::ProviderAdd { step: 0 };
+            }
+
+            KeyCode::Char('y') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_provider_smart_input()?;
+            }
+
+            KeyCode::Char('t') => {
+                self.start_selected_provider_test()?;
+            }
+
+            KeyCode::Char('e') => {
+                if let Some(p) = self
+                    .providers_cache
+                    .get(self.provider_list_state.selected().unwrap_or(0))
+                    .cloned()
+                {
+                    self.provider_name_buf = p.name.clone();
+                    self.provider_url_buf = p.base_url.clone();
+                    self.cursor_pos = p.name.len();
+                    self.provider_keys_cache = self.manager.list_keys(&p.id).unwrap_or_default();
+                    self.provider_key_selected = 0;
+                    self.mode = Mode::ProviderEdit {
+                        provider_id: p.id.clone(),
+                        step: 0,
+                    };
+                }
+            }
+
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(p) = self
+                    .providers_cache
+                    .get(self.provider_list_state.selected().unwrap_or(0))
+                {
+                    let pid = p.id.clone();
+                    let name = p.name.clone();
+                    self.mode = Mode::ConfirmDeleteProvider {
+                        provider_id: pid,
+                        name,
+                    };
+                }
+            }
+
+            KeyCode::Char('/') => {
+                self.search_query.clear();
+                self.apply_filter();
+                self.mode = Mode::Search;
+            }
+
+            KeyCode::Char('?') => {
+                self.mode = Mode::Help;
             }
 
             _ => {}
@@ -491,15 +1151,12 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.search_query.clear();
+                self.cursor_pos = 0;
                 self.apply_filter();
                 self.mode = Mode::Normal;
             }
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
-            }
-            KeyCode::Backspace => {
-                self.search_query.pop();
-                self.apply_filter();
             }
             KeyCode::Up | KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_up();
@@ -509,11 +1166,17 @@ impl App {
             }
             KeyCode::Up => self.move_up(),
             KeyCode::Down => self.move_down(),
-            KeyCode::Char(c) => {
-                self.search_query.push(c);
-                self.apply_filter();
+            _ => {
+                if emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.search_query,
+                    &mut self.cursor_pos,
+                    true,
+                ) {
+                    self.apply_filter();
+                }
             }
-            _ => {}
         }
         Ok(false)
     }
@@ -528,7 +1191,8 @@ impl App {
                         Ok(_) => {
                             self.sync_shims();
                             self.refresh()?;
-                            self.mode = Mode::Message(format!("Profile '{}' removed.", name), false);
+                            self.mode =
+                                Mode::Message(format!("Profile '{}' removed.", name), false);
                         }
                         Err(e) => self.mode = Mode::Message(e.to_string(), true),
                     }
@@ -539,7 +1203,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_add_full_name(&mut self, code: KeyCode) -> Result<()> {
+    fn handle_add_full_name(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         match code {
             KeyCode::Enter => {
                 let name = self.input_buffer.trim().to_string();
@@ -552,22 +1216,28 @@ impl App {
                 self.mode = Mode::AddFullAlias;
             }
             KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Backspace => {
-                self.input_buffer.pop();
+            _ => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.input_buffer,
+                    &mut self.cursor_pos,
+                    true,
+                );
             }
-            KeyCode::Char(c) => {
-                self.input_buffer.push(c);
-            }
-            _ => {}
         }
         Ok(())
     }
 
-    fn handle_add_full_alias(&mut self, code: KeyCode) -> Result<()> {
+    fn handle_add_full_alias(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         match code {
             KeyCode::Enter => {
                 let alias = self.input_buffer.trim().to_string();
-                let alias_opt = if alias.is_empty() { None } else { Some(alias.as_str()) };
+                let alias_opt = if alias.is_empty() {
+                    None
+                } else {
+                    Some(alias.as_str())
+                };
                 let name = self.lite_name.clone();
                 match self.manager.add_profile(&name, alias_opt) {
                     Ok(p) => {
@@ -580,13 +1250,27 @@ impl App {
                 }
             }
             KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Backspace => {
-                self.input_buffer.pop();
+            _ => {
+                if let KeyCode::Char(c) = code {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        emacs_edit(
+                            code,
+                            modifiers,
+                            &mut self.input_buffer,
+                            &mut self.cursor_pos,
+                            true,
+                        );
+                    }
+                } else {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.input_buffer,
+                        &mut self.cursor_pos,
+                        false,
+                    );
+                }
             }
-            KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' => {
-                self.input_buffer.push(c);
-            }
-            _ => {}
         }
         Ok(())
     }
@@ -610,145 +1294,254 @@ impl App {
 
     // ── Edit Profile (name / alias / launch args) ──────────────────────────────
 
-    fn handle_edit_profile(&mut self, code: KeyCode) -> Result<()> {
+    fn handle_edit_profile(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        // 3 steps: 0=name, 1=alias, 2=launch_args
+        let total_steps: usize = 3;
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => {
-                let new_name = self.lite_name.trim().to_string();
-                if new_name.is_empty() {
-                    self.mode = Mode::Message("Profile name cannot be empty.".into(), true);
-                    return Ok(());
-                }
-                let new_alias = self.lite_alias.trim().to_string();
-                let alias_opt = if new_alias.is_empty() { None } else { Some(new_alias.as_str()) };
-                let id = match &self.mode {
-                    Mode::EditProfile { profile_id, .. } => profile_id.clone(),
+                let step = match &self.mode {
+                    Mode::EditProfile { step, .. } => *step,
                     _ => return Ok(()),
                 };
-                // Save launch args
-                let launch: Option<Vec<String>> = {
-                    let s = self.lite_launch_args.trim();
-                    if s.is_empty() { None } else {
-                        Some(s.split_whitespace().map(String::from).collect())
+                if step < total_steps - 1 {
+                    let next_step = step + 1;
+                    self.cursor_pos = match next_step {
+                        0 => self.lite_name.len(),
+                        1 => self.lite_alias.len(),
+                        _ => self.lite_launch_args.len(),
+                    };
+                    self.mode = match &self.mode {
+                        Mode::EditProfile { profile_id, .. } => Mode::EditProfile {
+                            profile_id: profile_id.clone(),
+                            step: next_step,
+                        },
+                        _ => return Ok(()),
+                    };
+                } else {
+                    // Save on Enter at last step
+                    let new_name = self.lite_name.trim().to_string();
+                    if new_name.is_empty() {
+                        self.mode = Mode::Message("Profile name cannot be empty.".into(), true);
+                        return Ok(());
                     }
+                    let new_alias = self.lite_alias.trim().to_string();
+                    let alias_opt = if new_alias.is_empty() {
+                        None
+                    } else {
+                        Some(new_alias.as_str())
+                    };
+                    let id = match &self.mode {
+                        Mode::EditProfile { profile_id, .. } => profile_id.clone(),
+                        _ => return Ok(()),
+                    };
+                    let launch: Option<Vec<String>> = {
+                        let s = self.lite_launch_args.trim();
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.split_whitespace().map(String::from).collect())
+                        }
+                    };
+                    match self.manager.rename_profile(&id, &new_name, alias_opt) {
+                        Ok(p) => {
+                            let _ = self.manager.set_launch_args(&p.id, launch);
+                            self.sync_shims();
+                            self.refresh()?;
+                            self.select_by_id(&p.id);
+                            self.mode =
+                                Mode::Message(format!("Profile '{}' updated.", p.name), false);
+                        }
+                        Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                    }
+                }
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                let next_step = match &self.mode {
+                    Mode::EditProfile { step, .. } => (step + 1) % total_steps,
+                    _ => return Ok(()),
                 };
-                match self.manager.rename_profile(&id, &new_name, alias_opt) {
-                    Ok(p) => {
-                        // Update launch_args
-                        let _ = self.manager.set_launch_args(&p.id, launch);
-                        self.sync_shims();
-                        self.refresh()?;
-                        self.select_by_id(&p.id);
-                        self.mode = Mode::Message(format!("Profile '{}' updated.", p.name), false);
-                    }
-                    Err(e) => self.mode = Mode::Message(e.to_string(), true),
-                }
-            }
-            KeyCode::Backspace => {
-                match self.mode {
-                    Mode::EditProfile { step: 0, .. } => { self.lite_name.pop(); }
-                    Mode::EditProfile { step: 1, .. } => { self.lite_alias.pop(); }
-                    Mode::EditProfile { step: 2, .. } => { self.lite_launch_args.pop(); }
-                    _ => {}
-                }
-            }
-            KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
-                // Cycle: 0=name → 1=alias → 2=launch_args → 0
+                self.cursor_pos = match next_step {
+                    0 => self.lite_name.len(),
+                    1 => self.lite_alias.len(),
+                    _ => self.lite_launch_args.len(),
+                };
                 self.mode = match &self.mode {
                     Mode::EditProfile { profile_id, step } => Mode::EditProfile {
                         profile_id: profile_id.clone(),
-                        step: (step + 1) % 3,
+                        step: (step + 1) % total_steps,
                     },
                     _ => return Ok(()),
                 };
             }
-            KeyCode::Char(c) => {
-                match &self.mode {
-                    Mode::EditProfile { step: 0, .. } => { self.lite_name.push(c); }
-                    Mode::EditProfile { step: 1, .. } => {
-                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                            self.lite_alias.push(c);
+            KeyCode::Up | KeyCode::BackTab => {
+                // Backward cycle
+                let step = match &self.mode {
+                    Mode::EditProfile { step, .. } => *step,
+                    _ => 0,
+                };
+                let next_step = (step + total_steps - 1) % total_steps;
+                self.cursor_pos = match next_step {
+                    0 => self.lite_name.len(),
+                    1 => self.lite_alias.len(),
+                    _ => self.lite_launch_args.len(),
+                };
+                self.mode = match &self.mode {
+                    Mode::EditProfile { profile_id, .. } => Mode::EditProfile {
+                        profile_id: profile_id.clone(),
+                        step: next_step,
+                    },
+                    _ => return Ok(()),
+                };
+            }
+            KeyCode::Backspace => {
+                let step = match &self.mode {
+                    Mode::EditProfile { step, .. } => *step,
+                    _ => 0,
+                };
+                let buf = match step {
+                    0 => &mut self.lite_name,
+                    1 => &mut self.lite_alias,
+                    _ => &mut self.lite_launch_args,
+                };
+                emacs_edit(code, modifiers, buf, &mut self.cursor_pos, false);
+            }
+            // Typing
+            _ => {
+                let step = match &self.mode {
+                    Mode::EditProfile { step, .. } => *step,
+                    _ => 0,
+                };
+                match step {
+                    0 => {
+                        emacs_edit(
+                            code,
+                            modifiers,
+                            &mut self.lite_name,
+                            &mut self.cursor_pos,
+                            true,
+                        );
+                    }
+                    1 => {
+                        if let KeyCode::Char(c) = code {
+                            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                                emacs_edit(
+                                    code,
+                                    modifiers,
+                                    &mut self.lite_alias,
+                                    &mut self.cursor_pos,
+                                    true,
+                                );
+                            }
+                        } else {
+                            emacs_edit(
+                                code,
+                                modifiers,
+                                &mut self.lite_alias,
+                                &mut self.cursor_pos,
+                                false,
+                            );
                         }
                     }
-                    Mode::EditProfile { step: 2, .. } => { self.lite_launch_args.push(c); }
+                    2 => {
+                        emacs_edit(
+                            code,
+                            modifiers,
+                            &mut self.lite_launch_args,
+                            &mut self.cursor_pos,
+                            true,
+                        );
+                    }
                     _ => {}
                 }
             }
-            _ => {}
         }
         Ok(())
     }
 
     // ── Lightweight profile key handlers ─────────────────────────────────────
 
-    fn handle_lite_token(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    fn handle_lite_provider_select(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
+
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => self.move_provider_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_provider_down(),
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_provider_up()
+            }
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_provider_down()
+            }
             KeyCode::Enter => {
-                let token = self.input_buffer.trim().to_string();
-                if token.is_empty() {
+                let provider = self
+                    .provider_list_state
+                    .selected()
+                    .and_then(|i| self.providers_cache.get(i))
+                    .cloned();
+                let Some(provider) = provider else {
+                    return Ok(());
+                };
+
+                self.provider_keys_cache = self.manager.list_keys(&provider.id)?;
+                if self.provider_keys_cache.is_empty() {
+                    self.mode = Mode::Message(
+                        format!(
+                            "Provider '{}' has no keys. Add a key in Provider Manager first.",
+                            provider.name
+                        ),
+                        true,
+                    );
                     return Ok(());
                 }
-                self.lite_token = token;
-                self.input_buffer.clear();
-                self.mode = Mode::LiteUrl;
-            }
-            KeyCode::Backspace => {
-                self.input_buffer.pop();
-            }
-            KeyCode::Char(c) => {
-                self.input_buffer.push(c);
+
+                self.lite_provider_id = Some(provider.id.clone());
+                self.lite_url = provider.base_url;
+                self.lite_provider_keys = self.provider_keys_cache.clone();
+                self.provider_key_selected = 0;
+                if let Some(key) = self.provider_keys_cache.first() {
+                    self.lite_key_id = Some(key.id.clone());
+                    self.lite_token = key.api_key.clone();
+                }
+                self.mode = Mode::LiteKeySelect {
+                    provider_id: provider.id,
+                };
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn handle_lite_url(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    fn handle_lite_key_select(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
+
         match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Esc => self.mode = Mode::LiteProviderSelect,
+            KeyCode::Up | KeyCode::Char('k') => self.move_provider_key_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_provider_key_down(),
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_provider_key_up()
+            }
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_provider_key_down()
+            }
             KeyCode::Enter => {
-                let url = self.input_buffer.trim().to_string();
-                self.lite_url = if url.is_empty() {
-                    "https://api.anthropic.com".to_string()
-                } else {
-                    url
+                let Some(key) = self.selected_provider_key().cloned() else {
+                    return Ok(());
                 };
-                self.input_buffer.clear();
-                self.mode = Mode::LiteFetching;
-                match fetch_models(&self.lite_url, &self.lite_token) {
-                    Ok(models) => {
-                        self.lite_models = models;
-                        self.lite_step = 0;
-                        self.mode = Mode::LiteModelSelect {
-                            profile_name: String::new(),
-                            token: self.lite_token.clone(),
-                            base_url: self.lite_url.clone(),
-                            models: self.lite_models.clone(),
-                        };
-                    }
-                    Err(_) => {
-                        self.lite_models = Vec::new();
-                        self.mode = Mode::LiteModelSelect {
-                            profile_name: String::new(),
-                            token: self.lite_token.clone(),
-                            base_url: self.lite_url.clone(),
-                            models: Vec::new(),
-                        };
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                self.input_buffer.pop();
-            }
-            KeyCode::Char(c) => {
-                self.input_buffer.push(c);
+                self.lite_key_id = Some(key.id.clone());
+                self.lite_token = key.api_key;
+                self.lite_provider_keys = self.provider_keys_cache.clone();
+                self.open_lite_model_builder();
             }
             _ => {}
         }
@@ -761,8 +1554,8 @@ impl App {
         }
         let models_per_page: usize = 8;
         let is_edit = matches!(self.mode, Mode::LiteEdit { .. });
-        // 9 steps: 0=name, 1=alias, 2-6=models, 7=extras, 8=launch_args
-        let total_steps: usize = 9;
+        // 11 steps: 0=name, 1=alias, 2-6=models, 7=extras, 8=launch_args, 9=provider, 10=key
+        let total_steps: usize = 11;
 
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
@@ -770,12 +1563,40 @@ impl App {
             // Slot navigation
             KeyCode::Down | KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.lite_step = (self.lite_step + 1) % total_steps;
+                self.cursor_pos = match self.lite_step {
+                    0 => self.lite_name.len(),
+                    1 => self.lite_alias.len(),
+                    2 => self.lite_mod_opus.len(),
+                    3 => self.lite_mod_sonnet.len(),
+                    4 => self.lite_mod_haiku.len(),
+                    5 => self.lite_mod_model.len(),
+                    6 => self.lite_mod_subagent.len(),
+                    7 => self.input_buffer.len(),
+                    8 => self.lite_launch_args.len(),
+                    _ => 0,
+                };
             }
             KeyCode::Up | KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.lite_step = if self.lite_step == 0 { total_steps - 1 } else { self.lite_step - 1 };
+                self.lite_step = if self.lite_step == 0 {
+                    total_steps - 1
+                } else {
+                    self.lite_step - 1
+                };
+                self.cursor_pos = match self.lite_step {
+                    0 => self.lite_name.len(),
+                    1 => self.lite_alias.len(),
+                    2 => self.lite_mod_opus.len(),
+                    3 => self.lite_mod_sonnet.len(),
+                    4 => self.lite_mod_haiku.len(),
+                    5 => self.lite_mod_model.len(),
+                    6 => self.lite_mod_subagent.len(),
+                    7 => self.input_buffer.len(),
+                    8 => self.lite_launch_args.len(),
+                    _ => 0,
+                };
             }
             KeyCode::Tab => {
-                // Tab = completion on model slots, extras, and launch_args.
+                // Tab = completion on model slots, extras, launch_args, and provider/key.
                 // On name/alias steps it advances to the next field.
                 if self.lite_step >= 2 && self.lite_step <= 6 && !self.lite_models.is_empty() {
                     // Model slots: cycle through fetched model IDs
@@ -783,10 +1604,10 @@ impl App {
                     if let Some(pos) = self.lite_models.iter().position(|m| m == &current) {
                         let next = (pos + 1) % self.lite_models.len();
                         self.set_slot_value(self.lite_models[next].clone());
-                    } else if !current.is_empty() {
-                        if let Some(m) = self.lite_models.iter().find(|m| m.contains(&current)) {
-                            self.set_slot_value(m.clone());
-                        }
+                    } else if !current.is_empty()
+                        && let Some(m) = self.lite_models.iter().find(|m| m.contains(&current))
+                    {
+                        self.set_slot_value(m.clone());
                     }
                 } else if self.lite_step == 7 {
                     // Extras: cycle through known Claude Code env var names
@@ -795,67 +1616,137 @@ impl App {
                     if let Some(pos) = vars.iter().position(|v| v == &prefix) {
                         let next = (pos + 1) % vars.len();
                         self.input_buffer = format!("{}=", vars[next]);
-                    } else if !prefix.is_empty() {
-                        if let Some(v) = vars.iter().find(|v| v.starts_with(prefix)) {
-                            self.input_buffer = format!("{}=", v);
-                        }
+                    } else if !prefix.is_empty()
+                        && let Some(v) = vars.iter().find(|v| v.starts_with(prefix))
+                    {
+                        self.input_buffer = format!("{}=", v);
                     }
                 } else if self.lite_step == 8 {
                     // Launch args: cycle through known CLI flags (replace the last word)
                     let flags = all_flag_names();
                     if !flags.is_empty() {
-                        let last_word = self.lite_launch_args.split_whitespace().last().unwrap_or("");
+                        let last_word = self
+                            .lite_launch_args
+                            .split_whitespace()
+                            .last()
+                            .unwrap_or("");
                         if let Some(pos) = flags.iter().position(|f| f == &last_word) {
                             let next = (pos + 1) % flags.len();
-                            self.lite_launch_args = replace_last_word(&self.lite_launch_args, flags[next]);
-                        } else if !last_word.is_empty() {
-                            if let Some(f) = flags.iter().find(|f| f.starts_with(last_word)) {
-                                self.lite_launch_args = replace_last_word(&self.lite_launch_args, f);
-                            }
+                            self.lite_launch_args =
+                                replace_last_word(&self.lite_launch_args, flags[next]);
+                        } else if !last_word.is_empty()
+                            && let Some(f) = flags.iter().find(|f| f.starts_with(last_word))
+                        {
+                            self.lite_launch_args = replace_last_word(&self.lite_launch_args, f);
                         }
+                    }
+                } else if self.lite_step == 9 {
+                    // Provider: cycle through available providers
+                    if !self.providers_cache.is_empty() {
+                        let current = self.lite_provider_id.clone().unwrap_or_default();
+                        let pos = self
+                            .providers_cache
+                            .iter()
+                            .position(|p| p.id == current)
+                            .map(|p| (p + 1) % self.providers_cache.len())
+                            .unwrap_or(0);
+                        let prov = &self.providers_cache[pos];
+                        self.lite_provider_id = Some(prov.id.clone());
+                        self.lite_provider_keys = {
+                            let mut ks: Vec<_> = prov.keys.values().cloned().collect();
+                            ks.sort_by(|a, b| a.name.cmp(&b.name));
+                            ks
+                        };
+                        self.lite_key_id = self.lite_provider_keys.first().map(|k| k.id.clone());
+                        self.lite_token = self
+                            .lite_provider_keys
+                            .first()
+                            .map(|k| k.api_key.clone())
+                            .unwrap_or_default();
+                        self.lite_url = prov.base_url.clone();
+                    }
+                } else if self.lite_step == 10 {
+                    // Key: cycle through provider keys
+                    if !self.lite_provider_keys.is_empty() {
+                        let current = self.lite_key_id.as_deref().unwrap_or("");
+                        let pos = self
+                            .lite_provider_keys
+                            .iter()
+                            .position(|k| k.id == current)
+                            .map(|p| (p + 1) % self.lite_provider_keys.len())
+                            .unwrap_or(0);
+                        self.lite_key_id = Some(self.lite_provider_keys[pos].id.clone());
+                        self.lite_token = self.lite_provider_keys[pos].api_key.clone();
                     }
                 } else {
                     self.lite_step = (self.lite_step + 1) % total_steps;
+                    self.cursor_pos = match self.lite_step {
+                        0 => self.lite_name.len(),
+                        1 => self.lite_alias.len(),
+                        2 => self.lite_mod_opus.len(),
+                        3 => self.lite_mod_sonnet.len(),
+                        4 => self.lite_mod_haiku.len(),
+                        5 => self.lite_mod_model.len(),
+                        6 => self.lite_mod_subagent.len(),
+                        7 => self.input_buffer.len(),
+                        8 => self.lite_launch_args.len(),
+                        _ => 0,
+                    };
                 }
             }
 
             // [1m] toggle (steps 2-6 are model slots)
-            KeyCode::Char('m') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.lite_step >= 2 && self.lite_step <= 6 {
-                    let idx = self.lite_step - 2;
-                    self.lite_1m[idx] = !self.lite_1m[idx];
-                }
+            KeyCode::Char('m')
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && self.lite_step >= 2
+                    && self.lite_step <= 6 =>
+            {
+                let idx = self.lite_step - 2;
+                self.lite_1m[idx] = !self.lite_1m[idx];
+                let normalized =
+                    apply_model_1m_flag(&self.current_slot_value(), self.lite_1m[idx]).to_string();
+                self.set_slot_value(normalized);
             }
 
             // Alt+p/n: cycle through model candidates (steps 2-6)
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::ALT) => {
-                if self.lite_step >= 2 && self.lite_step <= 6 && !self.lite_models.is_empty() {
-                    let old = self.lite_step;
-                    let current = self.current_slot_value();
-                    if let Some(pos) = self.lite_models.iter().position(|m| m == &current) {
-                        let prev = if pos == 0 { self.lite_models.len() - 1 } else { pos - 1 };
-                        self.lite_step = old;
-                        self.set_slot_value(self.lite_models[prev].clone());
-                    } else if !current.is_empty() {
-                        if let Some(m) = self.lite_models.iter().find(|m| m.contains(&current)) {
-                            self.set_slot_value(m.clone());
-                        }
-                    }
+            KeyCode::Char('p')
+                if modifiers.contains(KeyModifiers::ALT)
+                    && self.lite_step >= 2
+                    && self.lite_step <= 6
+                    && !self.lite_models.is_empty() =>
+            {
+                let old = self.lite_step;
+                let current = self.current_slot_value();
+                if let Some(pos) = self.lite_models.iter().position(|m| m == &current) {
+                    let prev = if pos == 0 {
+                        self.lite_models.len() - 1
+                    } else {
+                        pos - 1
+                    };
+                    self.lite_step = old;
+                    self.set_slot_value(self.lite_models[prev].clone());
+                } else if !current.is_empty()
+                    && let Some(m) = self.lite_models.iter().find(|m| m.contains(&current))
+                {
+                    self.set_slot_value(m.clone());
                 }
             }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::ALT) => {
-                if self.lite_step >= 2 && self.lite_step <= 6 && !self.lite_models.is_empty() {
-                    let old = self.lite_step;
-                    let current = self.current_slot_value();
-                    if let Some(pos) = self.lite_models.iter().position(|m| m == &current) {
-                        let next = (pos + 1) % self.lite_models.len();
-                        self.lite_step = old;
-                        self.set_slot_value(self.lite_models[next].clone());
-                    } else if !current.is_empty() {
-                        if let Some(m) = self.lite_models.iter().find(|m| m.contains(&current)) {
-                            self.set_slot_value(m.clone());
-                        }
-                    }
+            KeyCode::Char('n')
+                if modifiers.contains(KeyModifiers::ALT)
+                    && self.lite_step >= 2
+                    && self.lite_step <= 6
+                    && !self.lite_models.is_empty() =>
+            {
+                let old = self.lite_step;
+                let current = self.current_slot_value();
+                if let Some(pos) = self.lite_models.iter().position(|m| m == &current) {
+                    let next = (pos + 1) % self.lite_models.len();
+                    self.lite_step = old;
+                    self.set_slot_value(self.lite_models[next].clone());
+                } else if !current.is_empty()
+                    && let Some(m) = self.lite_models.iter().find(|m| m.contains(&current))
+                {
+                    self.set_slot_value(m.clone());
                 }
             }
 
@@ -888,18 +1779,17 @@ impl App {
                     return Ok(());
                 }
                 let alias = self.lite_alias.trim().to_string();
-                let alias_opt = if alias.is_empty() { None } else { Some(alias.as_str()) };
+                let alias_opt = if alias.is_empty() {
+                    None
+                } else {
+                    Some(alias.as_str())
+                };
 
                 let apply = |s: &str, idx: usize| -> Option<String> {
                     if s.is_empty() {
                         None
                     } else {
-                        let v = s.to_string();
-                        if self.lite_1m[idx] && !v.ends_with("[1m]") {
-                            Some(format!("{}[1m]", v))
-                        } else {
-                            Some(v)
-                        }
+                        Some(apply_model_1m_flag(s, self.lite_1m[idx]).to_string())
                     }
                 };
                 let env = LightweightEnv {
@@ -917,22 +1807,67 @@ impl App {
                     let id = self.lite_edit_id.clone();
                     match self.manager.update_lightweight(&id, &name, alias_opt, env) {
                         Ok(p) => {
-                            let _ = self.manager.set_launch_args(&p.id, launch_args_from_str(&self.lite_launch_args));
+                            let _ = self.manager.set_launch_args(
+                                &p.id,
+                                launch_args_from_str(&self.lite_launch_args),
+                            );
+                            if let Some(ref pid) = self.lite_provider_id {
+                                if let Some(ref kid) = self.lite_key_id {
+                                    if let Err(e) = self.manager.set_provider(&p.id, pid, kid) {
+                                        self.mode = Mode::Message(e.to_string(), true);
+                                        return Ok(());
+                                    }
+                                } else {
+                                    self.mode =
+                                        Mode::Message("Select a provider key first.".into(), true);
+                                    return Ok(());
+                                }
+                            } else {
+                                if let Err(e) = self.manager.unset_provider(&p.id) {
+                                    self.mode = Mode::Message(e.to_string(), true);
+                                    return Ok(());
+                                }
+                            }
                             self.sync_shims();
                             self.refresh()?;
                             self.select_by_id(&p.id);
-                            self.mode = Mode::Message(format!("Profile '{}' updated.", p.name), false);
+                            self.mode =
+                                Mode::Message(format!("Profile '{}' updated.", p.name), false);
                         }
                         Err(e) => self.mode = Mode::Message(e.to_string(), true),
                     }
                 } else {
-                    match self.manager.create_lightweight_profile(&name, alias_opt, env) {
+                    match self
+                        .manager
+                        .create_lightweight_profile(&name, alias_opt, env)
+                    {
                         Ok(p) => {
-                            let _ = self.manager.set_launch_args(&p.id, launch_args_from_str(&self.lite_launch_args));
+                            let _ = self.manager.set_launch_args(
+                                &p.id,
+                                launch_args_from_str(&self.lite_launch_args),
+                            );
+                            if let Some(ref pid) = self.lite_provider_id {
+                                if let Some(ref kid) = self.lite_key_id {
+                                    if let Err(e) = self.manager.set_provider(&p.id, pid, kid) {
+                                        self.mode = Mode::Message(e.to_string(), true);
+                                        return Ok(());
+                                    }
+                                } else {
+                                    self.mode =
+                                        Mode::Message("Select a provider key first.".into(), true);
+                                    return Ok(());
+                                }
+                            } else {
+                                if let Err(e) = self.manager.unset_provider(&p.id) {
+                                    self.mode = Mode::Message(e.to_string(), true);
+                                    return Ok(());
+                                }
+                            }
                             self.sync_shims();
                             self.refresh()?;
                             self.select_by_id(&p.id);
-                            self.mode = Mode::Message(format!("Profile '{}' created.", p.name), false);
+                            self.mode =
+                                Mode::Message(format!("Profile '{}' created.", p.name), false);
                         }
                         Err(e) => self.mode = Mode::Message(e.to_string(), true),
                     }
@@ -940,46 +1875,197 @@ impl App {
             }
 
             // Backspace
-            KeyCode::Backspace => {
-                match self.lite_step {
-                    0 => { self.lite_name.pop(); }
-                    1 => { self.lite_alias.pop(); }
-                    2 => { self.lite_mod_opus.pop(); }
-                    3 => { self.lite_mod_sonnet.pop(); }
-                    4 => { self.lite_mod_haiku.pop(); }
-                    5 => { self.lite_mod_model.pop(); }
-                    6 => { self.lite_mod_subagent.pop(); }
-                    7 => {
-                        if !self.input_buffer.is_empty() {
-                            self.input_buffer.pop();
-                        } else if !self.lite_extras.is_empty() {
-                            self.lite_extras.pop();
-                        }
-                    }
-                    8 => { self.lite_launch_args.pop(); }
-                    _ => {}
+            KeyCode::Backspace => match self.lite_step {
+                0 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_name,
+                        &mut self.cursor_pos,
+                        true,
+                    );
                 }
-            }
+                1 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_alias,
+                        &mut self.cursor_pos,
+                        false,
+                    );
+                }
+                2 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_opus,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                3 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_sonnet,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                4 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_haiku,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                5 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_model,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                6 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_subagent,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                7 => {
+                    if !self.input_buffer.is_empty() {
+                        emacs_edit(
+                            code,
+                            modifiers,
+                            &mut self.input_buffer,
+                            &mut self.cursor_pos,
+                            true,
+                        );
+                    } else if !self.lite_extras.is_empty() {
+                        self.lite_extras.pop();
+                    }
+                }
+                8 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_launch_args,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                9 => {
+                    self.lite_provider_id = None;
+                    self.lite_key_id = None;
+                    self.lite_provider_keys.clear();
+                }
+                _ => {}
+            },
 
             // Typing
-            KeyCode::Char(c) => {
-                match self.lite_step {
-                    0 => { self.lite_name.push(c); }
-                    1 => {
-                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                            self.lite_alias.push(c);
-                        }
-                    }
-                    2 => { self.lite_mod_opus.push(c); }
-                    3 => { self.lite_mod_sonnet.push(c); }
-                    4 => { self.lite_mod_haiku.push(c); }
-                    5 => { self.lite_mod_model.push(c); }
-                    6 => { self.lite_mod_subagent.push(c); }
-                    7 => { self.input_buffer.push(c); }
-                    8 => { self.lite_launch_args.push(c); }
-                    _ => {}
+            _ if self.lite_step <= 8 => match self.lite_step {
+                0 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_name,
+                        &mut self.cursor_pos,
+                        true,
+                    );
                 }
-            }
+                1 => {
+                    if let KeyCode::Char(c) = code {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                            emacs_edit(
+                                code,
+                                modifiers,
+                                &mut self.lite_alias,
+                                &mut self.cursor_pos,
+                                true,
+                            );
+                        }
+                    } else {
+                        emacs_edit(
+                            code,
+                            modifiers,
+                            &mut self.lite_alias,
+                            &mut self.cursor_pos,
+                            false,
+                        );
+                    }
+                }
+                2 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_opus,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                3 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_sonnet,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                4 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_haiku,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                5 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_model,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                6 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_mod_subagent,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                7 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.input_buffer,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                8 => {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.lite_launch_args,
+                        &mut self.cursor_pos,
+                        true,
+                    );
+                }
+                _ => {}
+            },
             _ => {}
         }
         Ok(())
@@ -1014,8 +2100,16 @@ impl App {
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(layout[1]);
 
-        self.render_profile_list(f, cols[0]);
-        self.render_detail_panel(f, cols[1]);
+        match self.page {
+            Page::ProfileManager => {
+                self.render_profile_list(f, cols[0]);
+                self.render_detail_panel(f, cols[1]);
+            }
+            Page::ProviderManager => {
+                self.render_provider_list_page(f, cols[0]);
+                self.render_provider_detail_page(f, cols[1]);
+            }
+        }
         self.render_footer(f, layout[2]);
 
         // Overlays
@@ -1025,13 +2119,30 @@ impl App {
             Mode::AddFullName => self.render_add_name_popup(f),
             Mode::AddFullAlias => self.render_add_alias_popup(f),
             Mode::EditProfile { step, .. } => self.render_edit_profile_popup(f, *step),
-            Mode::LiteToken => self.render_lite_token_popup(f),
-            Mode::LiteUrl => self.render_lite_url_popup(f),
+            Mode::LiteProviderSelect => self.render_lite_provider_select_popup(f),
+            Mode::LiteKeySelect { .. } => self.render_lite_key_select_popup(f),
             Mode::LiteFetching => self.render_lite_fetching_popup(f),
+            Mode::ProviderAnthropicTest { .. } => self.render_provider_anthropic_test_popup(f),
+            Mode::ProviderAnthropicOutcome { .. } => {
+                self.render_provider_anthropic_outcome_popup(f)
+            }
             Mode::LiteModelSelect { .. } | Mode::LiteEdit { .. } => {
                 self.render_lite_model_select_popup(f)
             }
             Mode::Message(msg, is_err) => self.render_message(f, msg, *is_err),
+            Mode::ProviderList => self.render_provider_list_popup(f),
+            Mode::ProviderAdd { step } => self.render_provider_add_popup(f, *step),
+            Mode::ProviderSmartPaste => self.render_provider_smart_paste_popup(f),
+            Mode::ProviderEdit { .. } => self.render_provider_edit_popup(f),
+            Mode::ProviderEditKeyInput { step, .. } => {
+                self.render_provider_edit_key_input_popup(f, *step)
+            }
+            Mode::ProviderKeyList { .. } => self.render_provider_key_list_popup(f),
+            Mode::ProviderTestKeyList { .. } => self.render_provider_test_key_list_popup(f),
+            Mode::ProviderKeyAdd { step, .. } => self.render_provider_key_add_popup(f, *step),
+            Mode::ProviderKeyEdit { step, .. } => self.render_provider_key_edit_popup(f, *step),
+            Mode::ConfirmDeleteProvider { .. } => self.render_confirm_delete_provider_popup(f),
+            Mode::ConfirmDeleteKey { .. } => self.render_confirm_delete_key_popup(f),
             _ => {}
         }
     }
@@ -1041,7 +2152,11 @@ impl App {
     fn render_first_run(&self, f: &mut Frame, area: Rect) {
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ])
             .split(area);
 
         let header_block = Block::default()
@@ -1071,7 +2186,7 @@ impl App {
 
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  Welcome! Press 't' for lightweight (env vars) or 'a' for full (directory) profile.",
+                "  Welcome! Press 't' for lightweight (provider/key) or 'a' for full (directory) profile.",
                 Style::default().fg(DIM),
             )))
             .wrap(Wrap { trim: false }),
@@ -1109,16 +2224,33 @@ impl App {
             Paragraph::new(Line::from(vec![
                 Span::styled(" ◆ ", Style::default().fg(ACCENT).bold()),
                 Span::styled("claude-switch", Style::default().fg(TEXT).bold()),
-                Span::styled("  profile manager", Style::default().fg(DIM)),
+                Span::styled(
+                    match self.page {
+                        Page::ProfileManager => "  profile manager",
+                        Page::ProviderManager => "  provider manager",
+                    },
+                    Style::default().fg(DIM),
+                ),
             ]))
             .block(block),
             area,
         );
 
-        let count = self.filtered_indices.len();
-        let total = self.profiles.len();
+        let (count, total) = match self.page {
+            Page::ProfileManager => (self.filtered_indices.len(), self.profiles.len()),
+            Page::ProviderManager => (self.providers_cache.len(), self.providers_cache.len()),
+        };
+        let item_name = match self.page {
+            Page::ProfileManager => "profile",
+            Page::ProviderManager => "provider",
+        };
         let label = if count == total {
-            format!(" {} profile{} ", total, if total == 1 { "" } else { "s" })
+            format!(
+                " {} {}{} ",
+                total,
+                item_name,
+                if total == 1 { "" } else { "s" }
+            )
         } else {
             format!(" {}/{} ", count, total)
         };
@@ -1140,7 +2272,10 @@ impl App {
         let title_line: Line = if self.mode == Mode::Search {
             Line::from(vec![
                 Span::styled(" /", Style::default().fg(SEARCH_HL).bold()),
-                Span::styled(self.search_query.clone(), Style::default().fg(SEARCH_HL).bold()),
+                Span::styled(
+                    self.search_query.clone(),
+                    Style::default().fg(SEARCH_HL).bold(),
+                ),
                 Span::styled("█ ", Style::default().fg(SEARCH_HL)),
             ])
         } else if !self.search_query.is_empty() {
@@ -1149,7 +2284,10 @@ impl App {
                 Span::styled(self.search_query.clone(), Style::default().fg(SEARCH_HL)),
             ])
         } else {
-            Line::from(Span::styled(" Profiles ", Style::default().fg(ACCENT).bold()))
+            Line::from(Span::styled(
+                " Profiles ",
+                Style::default().fg(ACCENT).bold(),
+            ))
         };
 
         let block = Block::default()
@@ -1221,7 +2359,10 @@ impl App {
 
     fn render_detail_panel(&self, f: &mut Frame, area: Rect) {
         let block = Block::default()
-            .title(Line::from(Span::styled(" Details ", Style::default().fg(ACCENT).bold())))
+            .title(Line::from(Span::styled(
+                " Details ",
+                Style::default().fg(ACCENT).bold(),
+            )))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(BORDER))
@@ -1297,7 +2438,10 @@ impl App {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("  Config dir   ", Style::default().fg(DIM)),
-                Span::styled(profile_dir.display().to_string(), Style::default().fg(MUTED)),
+                Span::styled(
+                    profile_dir.display().to_string(),
+                    Style::default().fg(MUTED),
+                ),
             ]));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -1305,16 +2449,57 @@ impl App {
                 Style::default().fg(BORDER),
             )));
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  Launch command", Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(
+                "  Launch command",
+                Style::default().fg(DIM),
+            )));
             lines.push(Line::from(Span::styled(
                 if cfg!(target_os = "windows") {
-                    format!("  $env:CLAUDE_CONFIG_DIR='{}'; claude", profile_dir.display())
+                    format!(
+                        "  $env:CLAUDE_CONFIG_DIR='{}'; claude",
+                        profile_dir.display()
+                    )
                 } else {
                     format!("  CLAUDE_CONFIG_DIR='{}' claude", profile_dir.display())
                 },
                 Style::default().fg(Color::Rgb(140, 200, 140)),
             )));
         } else if let Some(ref env) = profile.env {
+            // Show provider info if referenced
+            if let Some(ref pid) = profile.provider_id
+                && let Ok(provider) = self.manager.get_provider(pid)
+            {
+                let prov_label = format!("{} ({})", provider.name, provider.id);
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  ─── Provider ─────────────────────────────",
+                    Style::default().fg(BORDER),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("  Provider     ", Style::default().fg(DIM)),
+                    Span::styled(prov_label, Style::default().fg(ACCENT)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("  Base URL     ", Style::default().fg(DIM)),
+                    Span::styled(
+                        provider.base_url,
+                        Style::default().fg(Color::Rgb(140, 200, 140)),
+                    ),
+                ]));
+                // Show key info
+                if let Some(ref kid) = profile.key_id
+                    && let Some(k) = provider.keys.get(kid)
+                {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Key          ", Style::default().fg(DIM)),
+                        Span::styled(
+                            format!("{} ({})", k.name, k.id),
+                            Style::default().fg(ACCENT),
+                        ),
+                    ]));
+                }
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  ─── Env Vars ───────────────────────────",
@@ -1327,11 +2512,36 @@ impl App {
                     Span::styled(u, Style::default().fg(Color::Rgb(140, 200, 140))),
                 ]));
             }
-            if let Some(ref m) = env.default_opus_model { lines.push(Line::from(vec![Span::styled("  Opus model   ", Style::default().fg(DIM)), Span::styled(m, Style::default().fg(TEXT))])); }
-            if let Some(ref m) = env.default_sonnet_model { lines.push(Line::from(vec![Span::styled("  Sonnet model ", Style::default().fg(DIM)), Span::styled(m, Style::default().fg(TEXT))])); }
-            if let Some(ref m) = env.default_haiku_model { lines.push(Line::from(vec![Span::styled("  Haiku model  ", Style::default().fg(DIM)), Span::styled(m, Style::default().fg(TEXT))])); }
-            if let Some(ref m) = env.model { lines.push(Line::from(vec![Span::styled("  Model        ", Style::default().fg(DIM)), Span::styled(m, Style::default().fg(TEXT))])); }
-            if let Some(ref m) = env.subagent_model { lines.push(Line::from(vec![Span::styled("  Subagent     ", Style::default().fg(DIM)), Span::styled(m, Style::default().fg(TEXT))])); }
+            if let Some(ref m) = env.default_opus_model {
+                lines.push(Line::from(vec![
+                    Span::styled("  Opus model   ", Style::default().fg(DIM)),
+                    Span::styled(m, Style::default().fg(TEXT)),
+                ]));
+            }
+            if let Some(ref m) = env.default_sonnet_model {
+                lines.push(Line::from(vec![
+                    Span::styled("  Sonnet model ", Style::default().fg(DIM)),
+                    Span::styled(m, Style::default().fg(TEXT)),
+                ]));
+            }
+            if let Some(ref m) = env.default_haiku_model {
+                lines.push(Line::from(vec![
+                    Span::styled("  Haiku model  ", Style::default().fg(DIM)),
+                    Span::styled(m, Style::default().fg(TEXT)),
+                ]));
+            }
+            if let Some(ref m) = env.model {
+                lines.push(Line::from(vec![
+                    Span::styled("  Model        ", Style::default().fg(DIM)),
+                    Span::styled(m, Style::default().fg(TEXT)),
+                ]));
+            }
+            if let Some(ref m) = env.subagent_model {
+                lines.push(Line::from(vec![
+                    Span::styled("  Subagent     ", Style::default().fg(DIM)),
+                    Span::styled(m, Style::default().fg(TEXT)),
+                ]));
+            }
 
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -1339,19 +2549,176 @@ impl App {
                 Style::default().fg(BORDER),
             )));
             lines.push(Line::from(""));
-            let any_mark = if self.lite_1m.iter().any(|&x| x) { "[x]" } else { "[ ]" };
+            let any_mark = if self.lite_1m.iter().any(|&x| x) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", any_mark), Style::default().fg(ACCENT).bold()),
-                Span::styled("Press 'm' to toggle [1m] on/off for all slots", Style::default().fg(TEXT)),
+                Span::styled(
+                    format!("  {} ", any_mark),
+                    Style::default().fg(ACCENT).bold(),
+                ),
+                Span::styled(
+                    "Press 'm' to toggle [1m] on/off for all slots",
+                    Style::default().fg(TEXT),
+                ),
             ]));
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  Launch", Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(
+                "  Launch",
+                Style::default().fg(DIM),
+            )));
         }
 
-        f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            inner,
-        );
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    // ── Provider page widgets ──────────────────────────────────────────────────
+
+    fn render_provider_list_page(&mut self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Providers ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL));
+
+        if self.providers_cache.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  No providers yet. Press 'a' to add.",
+                    Style::default().fg(DIM),
+                )))
+                .block(block),
+                area,
+            );
+            return;
+        }
+
+        let items: Vec<ListItem> = self
+            .providers_cache
+            .iter()
+            .map(|p| {
+                let url_short = display_ellipsize(&p.base_url, 35);
+                let key_count = format!("keys:{}", p.keys.len());
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(" ", Style::default()),
+                        Span::styled(display_pad(&p.name, 24), Style::default().fg(TEXT).bold()),
+                        Span::styled(format!("  {:<8}", key_count), Style::default().fg(DIM)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  id: ", Style::default().fg(MUTED)),
+                        Span::styled(
+                            display_pad(&display_ellipsize(&p.id, 12), 12),
+                            Style::default().fg(MUTED),
+                        ),
+                        Span::styled("  ", Style::default()),
+                        Span::styled(url_short, Style::default().fg(DIM)),
+                    ]),
+                ])
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(35, 35, 45))
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+
+        f.render_stateful_widget(list, area, &mut self.provider_list_state);
+
+        let count = self.providers_cache.len();
+        if count > 1 {
+            let sel = self.provider_list_state.selected().unwrap_or(0);
+            let scrollbar = Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(ACCENT))
+                .track_style(Style::default().fg(BORDER));
+            let mut sb = ScrollbarState::new(count).position(sel);
+            f.render_stateful_widget(scrollbar, area, &mut sb);
+        }
+    }
+
+    fn render_provider_detail_page(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Provider Detail ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL));
+
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let idx = match self.provider_list_state.selected() {
+            Some(i) if i < self.providers_cache.len() => i,
+            _ => {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "  No provider selected.",
+                        Style::default().fg(DIM),
+                    ))),
+                    inner,
+                );
+                return;
+            }
+        };
+
+        let p = &self.providers_cache[idx];
+        let mut lines: Vec<Line> = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Name         ", Style::default().fg(DIM)),
+                Span::styled(p.name.clone(), Style::default().fg(ACCENT).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("  ID           ", Style::default().fg(DIM)),
+                Span::styled(&p.id[..p.id.len().min(12)], Style::default().fg(MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Base URL     ", Style::default().fg(DIM)),
+                Span::styled(p.base_url.clone(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Keys         ", Style::default().fg(DIM)),
+                Span::styled(format!("{}", p.keys.len()), Style::default().fg(TEXT)),
+            ]),
+            Line::from(""),
+        ];
+
+        // List keys
+        let mut keys: Vec<&crate::profile::ProviderKey> = p.keys.values().collect();
+        keys.sort_by(|a, b| a.name.cmp(&b.name));
+        for k in keys.iter().take(10) {
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(display_pad(&k.name, 20), Style::default().fg(TEXT)),
+                Span::styled("  ", Style::default()),
+                Span::styled(mask_api_key(&k.api_key), Style::default().fg(MUTED)),
+            ]));
+        }
+        if keys.len() > 10 {
+            lines.push(Line::from(Span::styled(
+                format!("    ... and {} more", keys.len() - 10),
+                Style::default().fg(DIM),
+            )));
+        }
+
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -1362,26 +2729,58 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let keys: Vec<(&str, &str)> = if self.mode == Mode::Search {
+            vec![("↑/↓", "navigate"), ("enter", "confirm"), ("esc", "clear")]
+        } else if matches!(self.mode, Mode::ProviderAnthropicOutcome { .. }) {
+            vec![("any key", "back"), ("q", "quit")]
+        } else if matches!(self.mode, Mode::ProviderAnthropicTest { .. }) {
             vec![
-                ("↑/↓", "navigate"),
-                ("enter", "confirm"),
-                ("esc", "clear"),
-            ]
-        } else {
-            vec![
-                ("↑↓/jk", "nav"),
-                ("enter", "launch"),
-                ("Shift+Enter", "w/o args"),
-                ("/", "search"),
-                ("t", "lite"),
-                ("a", "add"),
-                ("e", "edit"),
-                ("m", "[1m]"),
-                ("r", "refresh"),
-                ("d", "delete"),
-                ("?", "help"),
+                ("Ctrl+N/P", "field"),
+                ("Tab", "complete"),
+                ("PgUp/PgDn", "page"),
+                ("enter", "send"),
+                ("esc", "back"),
                 ("q", "quit"),
             ]
+        } else if let Mode::ProviderKeyList { .. } = &self.mode {
+            vec![
+                ("↑↓/jk", "nav"),
+                ("a", "add key"),
+                ("e", "edit key"),
+                ("d", "delete key"),
+                ("t", "test"),
+                ("esc", "back"),
+            ]
+        } else {
+            match self.page {
+                Page::ProfileManager => vec![
+                    ("↑↓/jk", "nav"),
+                    ("enter", "launch"),
+                    ("Shift+Enter", "w/o args"),
+                    ("/", "search"),
+                    ("t", "lite"),
+                    ("a", "add"),
+                    ("e", "edit"),
+                    ("m", "[1m]"),
+                    ("r", "refresh"),
+                    ("d", "delete"),
+                    ("?", "help"),
+                    ("Shift+Tab", "providers"),
+                    ("q", "quit"),
+                ],
+                Page::ProviderManager => vec![
+                    ("↑↓/jk", "nav"),
+                    ("enter", "keys"),
+                    ("a", "add"),
+                    ("t", "test"),
+                    ("Ctrl+Y", "smart input"),
+                    ("e", "edit"),
+                    ("d", "delete"),
+                    ("/", "search"),
+                    ("?", "help"),
+                    ("Shift+Tab", "profiles"),
+                    ("q", "quit"),
+                ],
+            }
         };
 
         let spans: Vec<Span> = keys
@@ -1395,10 +2794,7 @@ impl App {
             })
             .collect();
 
-        f.render_widget(
-            Paragraph::new(Line::from(spans)).block(block),
-            area,
-        );
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
     // ── Overlay popups ────────────────────────────────────────────────────────
@@ -1408,7 +2804,10 @@ impl App {
         f.render_widget(Clear, area);
 
         let block = Block::default()
-            .title(Line::from(Span::styled(" Help — Keybindings ", Style::default().fg(ACCENT).bold())))
+            .title(Line::from(Span::styled(
+                " Help — Keybindings ",
+                Style::default().fg(ACCENT).bold(),
+            )))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
@@ -1419,10 +2818,16 @@ impl App {
             ("Enter", "Launch with stored flags (default)"),
             ("Shift+Enter", "Launch without stored flags"),
             ("/", "Search profiles by name or alias"),
-            ("t", "Add lightweight (env-var based) profile"),
+            ("t", "Add lightweight profile from provider/key"),
+            ("Ctrl+Y", "Smart input provider from clipboard"),
+            (
+                "Provider: t",
+                "Discover models from compatible endpoints; manual entry still works on failure",
+            ),
             ("a", "Add full (directory-isolated) profile"),
             ("e", "Edit profile (name/alias, or models for lite)"),
             ("m", "Toggle [1m] suffix (lightweight profiles)"),
+            ("Shift+Tab", "Switch profile/provider manager"),
             ("r", "Refresh — re-copy ~/.claude into selected"),
             ("d / Del", "Delete selected profile"),
             ("?", "Toggle this help dialog"),
@@ -1433,7 +2838,10 @@ impl App {
 
         for (key, desc) in &help_entries {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<14}", key), Style::default().fg(ACCENT).bold()),
+                Span::styled(
+                    format!("  {}", display_pad(key, 14)),
+                    Style::default().fg(ACCENT).bold(),
+                ),
                 Span::styled(*desc, Style::default().fg(TEXT)),
             ]));
         }
@@ -1466,7 +2874,10 @@ impl App {
         f.render_widget(Clear, area);
 
         let block = Block::default()
-            .title(Line::from(Span::styled(" Confirm Delete ", Style::default().fg(DANGER).bold())))
+            .title(Line::from(Span::styled(
+                " Confirm Delete ",
+                Style::default().fg(DANGER).bold(),
+            )))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(DANGER))
@@ -1547,7 +2958,11 @@ impl App {
                 Line::from(vec![
                     Span::styled("  Alias: ", Style::default().fg(DIM)),
                     Span::styled(
-                        if self.input_buffer.is_empty() { "(none)".to_string() } else { format!("{}█", self.input_buffer) },
+                        if self.input_buffer.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            format!("{}█", self.input_buffer)
+                        },
                         Style::default().fg(TEXT).bold(),
                     ),
                 ]),
@@ -1576,40 +2991,56 @@ impl App {
             .border_style(Style::default().fg(ACCENT))
             .style(Style::default().bg(PANEL));
 
-        let name_prefix = if step == 0 { "▶ " } else { "  " };
-        let alias_prefix = if step == 1 { "▶ " } else { "  " };
-        let args_prefix = if step == 2 { "▶ " } else { "  " };
+        macro_rules! field {
+            ($step:expr, $label:expr, $display:expr, $color:expr) => {{
+                let prefix = if step == $step { "▶ " } else { "  " };
+                let cursor = if step == $step { "█" } else { "" };
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(ACCENT).bold()),
+                    Span::styled($label, Style::default().fg(DIM)),
+                    Span::styled(format!("{}{}", $display, cursor), $color),
+                ])
+            }};
+        }
 
-        let name_cursor = if step == 0 { "█" } else { "" };
-        let alias_cursor = if step == 1 { "█" } else { "" };
-        let args_cursor = if step == 2 { "█" } else { "" };
-
-        let alias_display = if self.lite_alias.is_empty() && step != 1 { "(none)" } else { &self.lite_alias };
-        let args_display = if self.lite_launch_args.is_empty() && step != 2 { "(none)" } else { &self.lite_launch_args };
+        let name_disp = self.lite_name.to_string();
+        let alias_disp = if self.lite_alias.is_empty() && step != 1 {
+            "(none)".to_string()
+        } else {
+            self.lite_alias.clone()
+        };
+        let args_disp = if self.lite_launch_args.is_empty() && step != 2 {
+            "(none)".to_string()
+        } else {
+            self.lite_launch_args.clone()
+        };
 
         f.render_widget(
             Paragraph::new(Text::from(vec![
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled(name_prefix, Style::default().fg(ACCENT).bold()),
-                    Span::styled("Name:  ", Style::default().fg(DIM)),
-                    Span::styled(format!("{}{}", self.lite_name, name_cursor), Style::default().fg(TEXT).bold()),
-                ]),
+                field!(
+                    0,
+                    "Name:     ",
+                    &name_disp,
+                    Style::default().fg(TEXT).bold()
+                ),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled(alias_prefix, Style::default().fg(ACCENT).bold()),
-                    Span::styled("Alias: ", Style::default().fg(DIM)),
-                    Span::styled(format!("{}{}", alias_display, alias_cursor), Style::default().fg(Color::Rgb(140, 200, 140))),
-                ]),
+                field!(
+                    1,
+                    "Alias:    ",
+                    &alias_disp,
+                    Style::default().fg(Color::Rgb(140, 200, 140))
+                ),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled(args_prefix, Style::default().fg(ACCENT).bold()),
-                    Span::styled("Flags: ", Style::default().fg(DIM)),
-                    Span::styled(format!("{}{}", args_display, args_cursor), Style::default().fg(Color::Rgb(200, 160, 100))),
-                ]),
+                field!(
+                    2,
+                    "Flags:    ",
+                    &args_disp,
+                    Style::default().fg(Color::Rgb(200, 160, 100))
+                ),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  ↑/↓ to switch fields, Enter to save, Esc to cancel",
+                    "  ↑/↓/Tab to switch  Enter to save  Esc to cancel",
                     Style::default().fg(DIM),
                 )),
             ]))
@@ -1620,53 +3051,190 @@ impl App {
 
     // ── Lightweight profile popups ────────────────────────────────────────────
 
-    fn render_lite_token_popup(&self, f: &mut Frame) {
-        let area = centered_rect(60, 8, f.area());
+    fn render_lite_provider_select_popup(&mut self, f: &mut Frame) {
+        let area = centered_rect(78, 17, f.area());
         f.render_widget(Clear, area);
         let block = Block::default()
-            .title(Line::from(Span::styled(" Lightweight Profile — Token ", Style::default().fg(ACCENT).bold())))
+            .title(Line::from(Span::styled(
+                " Lightweight Profile — Provider ",
+                Style::default().fg(ACCENT).bold(),
+            )))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
             .style(Style::default().bg(PANEL));
-        let display = if self.input_buffer.is_empty() { "█".to_string() } else { format!("{}█", self.input_buffer) };
+
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if self.providers_cache.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  No providers yet. Add one in Provider Manager first.",
+                    Style::default().fg(DIM),
+                ))),
+                inner,
+            );
+            return;
+        }
+
+        let list_height = inner.height.saturating_sub(2);
+        let list_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: list_height,
+        };
+        let hint_area = Rect {
+            x: inner.x,
+            y: inner.y + list_height,
+            width: inner.width,
+            height: inner.height.saturating_sub(list_height),
+        };
+
+        let items: Vec<ListItem> = self
+            .providers_cache
+            .iter()
+            .map(|p| {
+                let key_count = format!("keys:{}", p.keys.len());
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {}", display_pad(&p.name, 22)),
+                        Style::default().fg(TEXT).bold(),
+                    ),
+                    Span::styled(
+                        format!(" {} ", display_pad(&key_count, 8)),
+                        Style::default().fg(DIM),
+                    ),
+                    Span::styled(
+                        display_ellipsize(&p.base_url, 36),
+                        Style::default().fg(MUTED),
+                    ),
+                ]))
+            })
+            .collect();
+
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(35, 35, 45))
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶");
+        f.render_stateful_widget(list, list_area, &mut self.provider_list_state);
+
+        let count = self.providers_cache.len();
+        if count > 1 {
+            let selected = self.provider_list_state.selected().unwrap_or(0);
+            let scrollbar = Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(ACCENT))
+                .track_style(Style::default().fg(BORDER));
+            let mut sb = ScrollbarState::new(count).position(selected);
+            f.render_stateful_widget(scrollbar, list_area, &mut sb);
+        }
+
         f.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::from(""),
-                Line::from(vec![Span::styled("  Token: ", Style::default().fg(DIM)), Span::styled(display, Style::default().fg(TEXT).bold())]),
-                Line::from(""),
-                Line::from(Span::styled("  Enter your ANTHROPIC_AUTH_TOKEN value.", Style::default().fg(DIM))),
-            ])).block(block),
-            area,
+            Paragraph::new(Line::from(vec![
+                Span::styled("  Enter", Style::default().fg(ACCENT).bold()),
+                Span::styled(" select provider  ", Style::default().fg(DIM)),
+                Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+                Span::styled(" cancel", Style::default().fg(DIM)),
+            ])),
+            hint_area,
         );
     }
 
-    fn render_lite_url_popup(&self, f: &mut Frame) {
-        let area = centered_rect(60, 9, f.area());
+    fn render_lite_key_select_popup(&self, f: &mut Frame) {
+        let key_count = self.provider_keys_cache.len().min(8);
+        let height = 8 + key_count as u16;
+        let area = centered_rect(70, height, f.area());
         f.render_widget(Clear, area);
+
+        let provider_name = self
+            .lite_provider_id
+            .as_ref()
+            .and_then(|pid| self.providers_cache.iter().find(|p| p.id == *pid))
+            .map(|p| p.name.as_str())
+            .unwrap_or("Provider");
         let block = Block::default()
-            .title(Line::from(Span::styled(" Lightweight Profile — Base URL ", Style::default().fg(ACCENT).bold())))
+            .title(Line::from(Span::styled(
+                format!(" Lightweight Profile — Key: {} ", provider_name),
+                Style::default().fg(ACCENT).bold(),
+            )))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
             .style(Style::default().bg(PANEL));
-        let val = if self.input_buffer.is_empty() { "https://api.anthropic.com".to_string() } else { format!("{}█", self.input_buffer) };
-        f.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::from(""),
-                Line::from(vec![Span::styled("  URL: ", Style::default().fg(DIM)), Span::styled(val, Style::default().fg(TEXT).bold())]),
-                Line::from(""),
-                Line::from(Span::styled("  Enter ANTHROPIC_BASE_URL (or Enter for default).", Style::default().fg(DIM))),
-            ])).block(block),
-            area,
-        );
+
+        let mut lines = vec![Line::from("")];
+        if self.provider_keys_cache.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  This provider has no keys.",
+                Style::default().fg(DIM),
+            )));
+        } else {
+            let visible = 8usize;
+            let selected = self
+                .provider_key_selected
+                .min(self.provider_keys_cache.len().saturating_sub(1));
+            let start = selected.saturating_sub(visible.saturating_sub(1));
+            for (i, key) in self
+                .provider_keys_cache
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+            {
+                let is_selected = i == selected;
+                let style = if is_selected {
+                    Style::default().fg(ACCENT).bold()
+                } else {
+                    Style::default().fg(TEXT)
+                };
+                let prefix = if is_selected { "▶" } else { " " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", prefix), style),
+                    Span::styled(display_pad(&key.name, 22), style),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(mask_api_key(&key.api_key), Style::default().fg(DIM)),
+                ]));
+            }
+            if self.provider_keys_cache.len() > visible {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  showing {}-{} of {}",
+                        start + 1,
+                        (start + visible).min(self.provider_keys_cache.len()),
+                        self.provider_keys_cache.len()
+                    ),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  Enter", Style::default().fg(ACCENT).bold()),
+            Span::styled(" continue  ", Style::default().fg(DIM)),
+            Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+            Span::styled(" back to providers", Style::default().fg(DIM)),
+        ]));
+
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     fn render_lite_fetching_popup(&self, f: &mut Frame) {
         let area = centered_rect(50, 6, f.area());
         f.render_widget(Clear, area);
         let block = Block::default()
-            .title(Line::from(Span::styled(" Fetching Models ", Style::default().fg(ACCENT).bold())))
+            .title(Line::from(Span::styled(
+                " Fetching Models ",
+                Style::default().fg(ACCENT).bold(),
+            )))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
@@ -1674,20 +3242,34 @@ impl App {
         f.render_widget(
             Paragraph::new(Text::from(vec![
                 Line::from(""),
-                Line::from(Span::styled("  Connecting to /v1/models...", Style::default().fg(TEXT))),
-                Line::from(Span::styled("  Press Esc to skip", Style::default().fg(DIM))),
-            ])).block(block),
+                Line::from(Span::styled(
+                    "  Connecting to /v1/models...",
+                    Style::default().fg(TEXT),
+                )),
+                Line::from(Span::styled(
+                    "  Press Esc to skip",
+                    Style::default().fg(DIM),
+                )),
+            ]))
+            .block(block),
             area,
         );
     }
 
     fn render_lite_model_select_popup(&self, f: &mut Frame) {
-        let area = centered_rect(90, 37, f.area());
+        let area = centered_rect(90, 41, f.area());
         f.render_widget(Clear, area);
         let is_edit = matches!(self.mode, Mode::LiteEdit { .. });
-        let title = if is_edit { " Edit Profile — Model Selection " } else { " Lite Profile — Model Selection " };
+        let title = if is_edit {
+            " Edit Profile — Model Selection "
+        } else {
+            " Lite Profile — Model Selection "
+        };
         let block = Block::default()
-            .title(Line::from(Span::styled(title, Style::default().fg(ACCENT).bold())))
+            .title(Line::from(Span::styled(
+                title,
+                Style::default().fg(ACCENT).bold(),
+            )))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
@@ -1701,35 +3283,77 @@ impl App {
         if !self.lite_models.is_empty() {
             let page_start = self.lite_model_page.min(total.saturating_sub(1));
             let page_end = (page_start + models_per_page).min(total);
-            let current_page = if models_per_page > 0 { page_start / models_per_page + 1 } else { 1 };
-            let total_pages = (total + models_per_page - 1) / models_per_page;
+            let current_page = page_start / models_per_page + 1;
+            let total_pages = total.div_ceil(models_per_page);
             let page_info = if total > models_per_page {
-                format!("  Models ({}-{} of {}, page {}/{}):", page_start + 1, page_end, total, current_page, total_pages)
+                format!(
+                    "  Models ({}-{} of {}, page {}/{}):",
+                    page_start + 1,
+                    page_end,
+                    total,
+                    current_page,
+                    total_pages
+                )
             } else {
                 "  Available models:".to_string()
             };
-            lines.push(Line::from(Span::styled(page_info, Style::default().fg(DIM))));
-            let page_models: Vec<&str> = self.lite_models.iter().skip(page_start).take(models_per_page).map(|s| s.as_str()).collect();
+            lines.push(Line::from(Span::styled(
+                page_info,
+                Style::default().fg(DIM),
+            )));
+            let page_models: Vec<&str> = self
+                .lite_models
+                .iter()
+                .skip(page_start)
+                .take(models_per_page)
+                .map(|s| s.as_str())
+                .collect();
             for (i, m) in page_models.iter().enumerate() {
                 let idx = page_start + i + 1;
-                lines.push(Line::from(Span::styled(format!("{:>4}. {}", idx, m), Style::default().fg(Color::Rgb(140, 200, 140)))));
+                lines.push(Line::from(Span::styled(
+                    format!("{:>4}. {}", idx, m),
+                    Style::default().fg(Color::Rgb(140, 200, 140)),
+                )));
             }
             if total > models_per_page {
-                lines.push(Line::from(Span::styled("     PgUp/PgDn scroll", Style::default().fg(Color::Rgb(80, 120, 80)))));
+                lines.push(Line::from(Span::styled(
+                    "     PgUp/PgDn scroll",
+                    Style::default().fg(Color::Rgb(80, 120, 80)),
+                )));
                 // Visual page indicator bar
                 let bar_width = 30usize;
-                let filled = (current_page as f64 / total_pages as f64 * bar_width as f64).round().max(1.0).min(bar_width as f64) as usize;
-                let bar = format!("     [{}{}]", "█".repeat(filled), "░".repeat(bar_width - filled));
+                let filled = (current_page as f64 / total_pages as f64 * bar_width as f64)
+                    .round()
+                    .max(1.0)
+                    .min(bar_width as f64) as usize;
+                let bar = format!(
+                    "     [{}{}]",
+                    "█".repeat(filled),
+                    "░".repeat(bar_width - filled)
+                );
                 lines.push(Line::from(Span::styled(bar, Style::default().fg(ACCENT))));
             }
         } else {
-            lines.push(Line::from(Span::styled("  No models (type manually or use Alt+p/Alt+n to cycle)", Style::default().fg(DIM))));
+            let msg = match &self.lite_model_fetch_state {
+                ModelFetchState::Loaded | ModelFetchState::Empty => {
+                    "  No models (type manually or use Alt+p/Alt+n to cycle)".to_string()
+                }
+                ModelFetchState::Unavailable(reason) => format!("  {}", reason),
+            };
+            lines.push(Line::from(Span::styled(msg, Style::default().fg(DIM))));
         }
-        lines.push(Line::from(Span::styled("  ───────────────────────────────────────────────────────────────────", Style::default().fg(BORDER))));
+        lines.push(Line::from(Span::styled(
+            "  ───────────────────────────────────────────────────────────────────",
+            Style::default().fg(BORDER),
+        )));
 
         // Step 0: Profile name (any characters)
         let nf = if self.lite_step == 0 { "▶ " } else { "  " };
-        let nd = if self.lite_step == 0 { format!("{}█", self.lite_name) } else { self.lite_name.clone() };
+        let nd = if self.lite_step == 0 {
+            format!("{}█", self.lite_name)
+        } else {
+            self.lite_name.clone()
+        };
         lines.push(Line::from(vec![
             Span::styled(nf, Style::default().fg(ACCENT).bold()),
             Span::styled("Name      ", Style::default().fg(DIM)),
@@ -1738,8 +3362,16 @@ impl App {
 
         // Step 1: Alias (alphanumeric only)
         let af = if self.lite_step == 1 { "▶ " } else { "  " };
-        let ad = if self.lite_step == 1 { format!("{}█", self.lite_alias) } else { self.lite_alias.clone() };
-        let ad_display = if ad.is_empty() && self.lite_step != 1 { "(none)".to_string() } else { ad };
+        let ad = if self.lite_step == 1 {
+            format!("{}█", self.lite_alias)
+        } else {
+            self.lite_alias.clone()
+        };
+        let ad_display = if ad.is_empty() && self.lite_step != 1 {
+            "(none)".to_string()
+        } else {
+            ad
+        };
         lines.push(Line::from(vec![
             Span::styled(af, Style::default().fg(ACCENT).bold()),
             Span::styled("Alias     ", Style::default().fg(DIM)),
@@ -1748,10 +3380,18 @@ impl App {
 
         // Model slots (steps 2-6)
         let slots = [
-            ("Opus", 0, 2), ("Sonnet", 1, 3), ("Haiku", 2, 4), ("Model", 3, 5), ("Subagent", 4, 6)
+            ("Opus", 0, 2),
+            ("Sonnet", 1, 3),
+            ("Haiku", 2, 4),
+            ("Model", 3, 5),
+            ("Subagent", 4, 6),
         ];
         for (label, idx1m, step) in slots.iter() {
-            let prefix = if *step == self.lite_step { "▶ " } else { "  " };
+            let prefix = if *step == self.lite_step {
+                "▶ "
+            } else {
+                "  "
+            };
             let cursor = if *step == self.lite_step { "█" } else { "" };
             let val = match *step {
                 2 => &self.lite_mod_opus,
@@ -1765,39 +3405,67 @@ impl App {
             let ck = if self.lite_1m[*idx1m] { "1m✓" } else { "1m " };
             let hint = if !val.is_empty() && !self.lite_models.is_empty() {
                 if let Some(m) = self.lite_models.iter().find(|m| m.contains(val.as_str())) {
-                    if m != val { format!(" ↩{}", m) } else { String::new() }
-                } else { String::new() }
-            } else { String::new() };
+                    if m != val {
+                        format!(" ↩{}", m)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
 
             lines.push(Line::from(vec![
                 Span::styled(prefix, Style::default().fg(ACCENT).bold()),
-                Span::styled(format!("{:<10}", label), Style::default().fg(DIM)),
-                Span::styled(format!("{:<36}", display), Style::default().fg(TEXT).bold()),
+                Span::styled(display_pad(label, 10), Style::default().fg(DIM)),
+                Span::styled(display_pad(&display, 36), Style::default().fg(TEXT).bold()),
                 Span::styled(ck, Style::default().fg(ACCENT).bold()),
                 Span::styled(hint, Style::default().fg(Color::Rgb(100, 130, 100))),
             ]));
         }
 
         // Extras section (step 7)
-        lines.push(Line::from(Span::styled("  ───────────────────────────────────────────────────────────────────", Style::default().fg(BORDER))));
+        lines.push(Line::from(Span::styled(
+            "  ───────────────────────────────────────────────────────────────────",
+            Style::default().fg(BORDER),
+        )));
         let extras_focus = self.lite_step == 7;
         let ex_prefix = if extras_focus { "▶" } else { " " };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", ex_prefix), Style::default().fg(ACCENT).bold()),
+            Span::styled(
+                format!(" {} ", ex_prefix),
+                Style::default().fg(ACCENT).bold(),
+            ),
             Span::styled("Extras", Style::default().fg(DIM)),
-            Span::styled(" (enter KEY=VALUE per line)", Style::default().fg(Color::Rgb(120, 120, 130))),
+            Span::styled(
+                " (enter KEY=VALUE per line)",
+                Style::default().fg(Color::Rgb(120, 120, 130)),
+            ),
         ]));
         // Show a curated subset of commonly used env vars as hints
         let hint_vars = [
-            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY",
-            "ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            "ANTHROPIC_BETAS", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-            "API_TIMEOUT_MS", "MAX_THINKING_TOKENS", "CLAUDE_CONFIG_DIR",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_BETAS",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "API_TIMEOUT_MS",
+            "MAX_THINKING_TOKENS",
+            "CLAUDE_CONFIG_DIR",
         ];
         let total_known = crate::env_vars::all_var_names().len();
         lines.push(Line::from(Span::styled(
-            format!("  Known env vars ({} total; see https://code.claude.com/docs/en/env-vars):", total_known),
+            format!(
+                "  Known env vars ({} total; see https://code.claude.com/docs/en/env-vars):",
+                total_known
+            ),
             Style::default().fg(Color::Rgb(80, 100, 110)),
         )));
         lines.push(Line::from(Span::styled(
@@ -1806,32 +3474,117 @@ impl App {
         )));
 
         for extra in &self.lite_extras {
-            lines.push(Line::from(Span::styled(format!("  {}", extra), Style::default().fg(Color::Rgb(160, 200, 160)))));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", extra),
+                Style::default().fg(Color::Rgb(160, 200, 160)),
+            )));
         }
         if extras_focus {
-            let buf = if self.input_buffer.is_empty() { "█".to_string() } else { format!("{}█", self.input_buffer) };
+            let buf = if self.input_buffer.is_empty() {
+                "█".to_string()
+            } else {
+                format!("{}█", self.input_buffer)
+            };
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(buf, Style::default().fg(TEXT).bold()),
             ]));
-            lines.push(Line::from(Span::styled("  Enter to add, Backspace to remove last entry", Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(
+                "  Enter to add, Backspace to remove last entry",
+                Style::default().fg(DIM),
+            )));
         }
 
         // Launch args (step 8)
-        lines.push(Line::from(Span::styled("  ───────────────────────────────────────────────────────────────────", Style::default().fg(BORDER))));
+        lines.push(Line::from(Span::styled(
+            "  ───────────────────────────────────────────────────────────────────",
+            Style::default().fg(BORDER),
+        )));
         let la_focus = self.lite_step == 8;
         let la_prefix = if la_focus { "▶ " } else { "  " };
-        let la_val = if self.lite_launch_args.is_empty() && !la_focus { "(none)" } else { &self.lite_launch_args };
+        let la_val = if self.lite_launch_args.is_empty() && !la_focus {
+            "(none)"
+        } else {
+            &self.lite_launch_args
+        };
         let la_cursor = if la_focus { "█" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(la_prefix, Style::default().fg(ACCENT).bold()),
             Span::styled("L. args  ", Style::default().fg(DIM)),
-            Span::styled(format!("{}{}", la_val, la_cursor), Style::default().fg(Color::Rgb(200, 160, 100))),
+            Span::styled(
+                format!("{}{}", la_val, la_cursor),
+                Style::default().fg(Color::Rgb(200, 160, 100)),
+            ),
         ]));
         lines.push(Line::from(Span::styled(
             "  CLI flags to pass to claude on launch (space-separated, e.g. --dangerously-skip-permissions)",
             Style::default().fg(DIM),
         )));
+
+        // Provider (step 9)
+        lines.push(Line::from(Span::styled(
+            "  ───────────────────────────────────────────────────────────────────",
+            Style::default().fg(BORDER),
+        )));
+        let prov_focus = self.lite_step == 9;
+        let prov_prefix = if prov_focus { "▶ " } else { "  " };
+        let prov_name = self
+            .lite_provider_id
+            .as_ref()
+            .and_then(|pid| self.providers_cache.iter().find(|p| p.id == *pid))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "(none — Tab to cycle)".to_string());
+        lines.push(Line::from(vec![
+            Span::styled(prov_prefix, Style::default().fg(ACCENT).bold()),
+            Span::styled("Provider  ", Style::default().fg(DIM)),
+            Span::styled(
+                prov_name,
+                Style::default().fg(Color::Rgb(200, 160, 100)).bold(),
+            ),
+        ]));
+        if prov_focus {
+            lines.push(Line::from(Span::styled(
+                "  Tab=cycle provider  Backspace=clear  ↑↓/Cp/Cn=previous field",
+                Style::default().fg(DIM),
+            )));
+        }
+
+        // Key (step 10)
+        let key_focus = self.lite_step == 10;
+        let key_prefix = if key_focus { "▶ " } else { "  " };
+        let key_name = self
+            .lite_key_id
+            .as_ref()
+            .and_then(|kid| self.lite_provider_keys.iter().find(|k| k.id == *kid))
+            .map(|k| k.name.clone())
+            .unwrap_or_else(|| {
+                if self.lite_provider_id.is_none() {
+                    "(select provider first)".to_string()
+                } else {
+                    "(none — Tab to cycle)".to_string()
+                }
+            });
+        let key_color = if self.lite_provider_id.is_some() {
+            Color::Rgb(160, 180, 210)
+        } else {
+            DIM
+        };
+        lines.push(Line::from(vec![
+            Span::styled(key_prefix, Style::default().fg(ACCENT).bold()),
+            Span::styled("Key       ", Style::default().fg(DIM)),
+            Span::styled(key_name, Style::default().fg(key_color)),
+        ]));
+        if key_focus && self.lite_provider_id.is_some() {
+            lines.push(Line::from(Span::styled(
+                "  Tab=cycle key  ↑↓/Cp/Cn=previous field",
+                Style::default().fg(DIM),
+            )));
+        } else if key_focus {
+            lines.push(Line::from(Span::styled(
+                "  Select a provider first (step 9), then Tab here to cycle keys",
+                Style::default().fg(DIM),
+            )));
+        }
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -1857,7 +3610,10 @@ impl App {
         let title = if is_err { " Error " } else { " Done " };
 
         let block = Block::default()
-            .title(Line::from(Span::styled(title, Style::default().fg(color).bold())))
+            .title(Line::from(Span::styled(
+                title,
+                Style::default().fg(color).bold(),
+            )))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(color))
@@ -1866,12 +3622,2098 @@ impl App {
         f.render_widget(
             Paragraph::new(Text::from(vec![
                 Line::from(""),
-                Line::from(Span::styled(format!("  {}", msg), Style::default().fg(TEXT))),
+                Line::from(Span::styled(
+                    format!("  {}", msg),
+                    Style::default().fg(TEXT),
+                )),
                 Line::from(""),
-                Line::from(Span::styled("  Press any key to continue", Style::default().fg(DIM))),
+                Line::from(Span::styled(
+                    "  Press any key to continue",
+                    Style::default().fg(DIM),
+                )),
             ]))
             .block(block)
             .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    // ── Provider management ──────────────────────────────────────────────────
+
+    fn handle_provider_list(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        match code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => self.move_provider_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_provider_down(),
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_provider_up()
+            }
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_provider_down()
+            }
+            KeyCode::Enter => {
+                let pid = self
+                    .provider_list_state
+                    .selected()
+                    .and_then(|i| self.providers_cache.get(i))
+                    .map(|p| p.id.clone());
+                if let Some(pid) = pid {
+                    self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                    self.provider_key_selected = 0;
+                    self.mode = Mode::ProviderKeyList { provider_id: pid };
+                }
+            }
+            KeyCode::Char('a') => {
+                self.provider_name_buf.clear();
+                self.provider_url_buf.clear();
+                self.provider_key_buf.clear();
+                self.provider_key_name_buf = "Default".to_string();
+                self.provider_add_existing_id = None;
+                self.provider_smart_paste_buf.clear();
+                self.provider_smart_paste_error = None;
+                self.mode = Mode::ProviderAdd { step: 0 };
+            }
+            KeyCode::Char('e') => {
+                let data = self
+                    .provider_list_state
+                    .selected()
+                    .and_then(|i| self.providers_cache.get(i))
+                    .map(|p| (p.id.clone(), p.name.clone(), p.base_url.clone()));
+                if let Some((pid, name, url)) = data {
+                    let name_len = name.len();
+                    self.provider_name_buf = name;
+                    self.provider_url_buf = url;
+                    self.cursor_pos = name_len;
+                    self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                    self.provider_key_selected = 0;
+                    self.mode = Mode::ProviderEdit {
+                        provider_id: pid,
+                        step: 0,
+                    };
+                }
+            }
+            KeyCode::Char('d') => {
+                let data = self
+                    .provider_list_state
+                    .selected()
+                    .and_then(|i| self.providers_cache.get(i))
+                    .map(|p| (p.id.clone(), p.name.clone()));
+                if let Some((pid, name)) = data {
+                    self.mode = Mode::ConfirmDeleteProvider {
+                        provider_id: pid,
+                        name,
+                    };
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_provider_add(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        match code {
+            KeyCode::Esc => {
+                if self.page == Page::ProviderManager {
+                    self.mode = Mode::Normal;
+                } else {
+                    self.mode = Mode::ProviderList;
+                }
+            }
+            KeyCode::Enter => {
+                let step = match &self.mode {
+                    Mode::ProviderAdd { step } => *step,
+                    _ => 0,
+                };
+                let total_steps = if self.provider_add_existing_id.is_some() {
+                    1
+                } else {
+                    4
+                };
+                if step + 1 == total_steps {
+                    let name = self.provider_name_buf.trim().to_string();
+                    let url = self.provider_url_buf.trim().to_string();
+                    let key_name = self.provider_key_name_buf.trim().to_string();
+                    let key = self.provider_key_buf.trim().to_string();
+                    if (self.provider_add_existing_id.is_none() && name.is_empty())
+                        || (self.provider_add_existing_id.is_none() && url.is_empty())
+                        || key_name.is_empty()
+                        || key.is_empty()
+                    {
+                        return Ok(());
+                    }
+
+                    let result = if let Some(provider_id) = self.provider_add_existing_id.clone() {
+                        self.manager
+                            .add_key(&provider_id, &key_name, &key)
+                            .map(|_| ())
+                    } else {
+                        self.manager
+                            .add_provider_with_key_name(&name, &url, &key_name, &key)
+                            .map(|_| ())
+                    };
+
+                    match result {
+                        Ok(_) => {
+                            self.sync_shims();
+                            self.providers_cache =
+                                self.manager.list_providers().unwrap_or_default();
+                            if self.page == Page::ProviderManager {
+                                self.mode = Mode::Normal;
+                            } else {
+                                self.mode = Mode::ProviderList;
+                            }
+                        }
+                        Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                    }
+                } else {
+                    self.mode = Mode::ProviderAdd { step: step + 1 };
+                }
+            }
+            _ => {
+                let step = match &self.mode {
+                    Mode::ProviderAdd { step } => *step,
+                    _ => 0,
+                };
+                let buf = match step {
+                    0 if self.provider_add_existing_id.is_some() => &mut self.provider_key_name_buf,
+                    0 => &mut self.provider_name_buf,
+                    1 => &mut self.provider_url_buf,
+                    2 => &mut self.provider_key_name_buf,
+                    _ => &mut self.provider_key_buf,
+                };
+                emacs_edit(code, modifiers, buf, &mut self.cursor_pos, true);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_provider_smart_paste(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.reset_provider_smart_input();
+            self.mode = if self.page == Page::ProviderManager {
+                Mode::Normal
+            } else {
+                Mode::ProviderList
+            };
+            return Ok(());
+        }
+
+        match code {
+            KeyCode::Esc => {
+                self.reset_provider_smart_input();
+                self.mode = if self.page == Page::ProviderManager {
+                    Mode::Normal
+                } else {
+                    Mode::ProviderList
+                };
+            }
+            KeyCode::Enter => {
+                let raw = self.provider_smart_paste_buf.trim();
+                if raw.is_empty() {
+                    return Ok(());
+                }
+                match parse_provider_smart_paste(raw) {
+                    Ok(parsed) => self.apply_provider_smart_paste(parsed)?,
+                    Err(e) => {
+                        self.provider_smart_paste_error = Some(e.to_string());
+                        self.cursor_pos = self.provider_smart_paste_buf.len();
+                    }
+                }
+            }
+            _ => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.provider_smart_paste_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_provider_smart_input(&mut self) {
+        self.provider_add_existing_id = None;
+        self.provider_name_buf.clear();
+        self.provider_url_buf.clear();
+        self.provider_key_name_buf.clear();
+        self.provider_key_buf.clear();
+        self.provider_smart_paste_buf.clear();
+        self.provider_smart_paste_error = None;
+        self.input_buffer.clear();
+        self.cursor_pos = 0;
+    }
+
+    fn start_provider_smart_input(&mut self) -> Result<()> {
+        self.reset_provider_smart_input();
+        self.providers_cache = self.manager.list_providers().unwrap_or_default();
+        match Clipboard::new().and_then(|mut clip| clip.get_text()) {
+            Ok(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    self.mode = Mode::ProviderSmartPaste;
+                    return Ok(());
+                }
+                match parse_provider_smart_paste(trimmed) {
+                    Ok(parsed) => self.apply_provider_smart_paste(parsed),
+                    Err(e) => {
+                        self.provider_smart_paste_buf = text;
+                        self.provider_smart_paste_error = Some(e.to_string());
+                        self.cursor_pos = self.provider_smart_paste_buf.len();
+                        self.mode = Mode::ProviderSmartPaste;
+                        Ok(())
+                    }
+                }
+            }
+            Err(e) => {
+                self.provider_smart_paste_error = Some(format!(
+                    "Could not read clipboard: {}. Paste provider data manually and press Enter.",
+                    e
+                ));
+                self.mode = Mode::ProviderSmartPaste;
+                Ok(())
+            }
+        }
+    }
+
+    fn show_message(&mut self, msg: String, is_err: bool, return_mode: Option<Mode>) {
+        self.message_return_mode = return_mode;
+        self.mode = Mode::Message(msg, is_err);
+    }
+
+    fn start_selected_provider_test(&mut self) -> Result<()> {
+        let provider = self
+            .provider_list_state
+            .selected()
+            .and_then(|i| self.providers_cache.get(i))
+            .cloned();
+        let Some(provider) = provider else {
+            self.show_message("Select a provider first.".into(), true, None);
+            return Ok(());
+        };
+
+        self.provider_keys_cache = self.manager.list_keys(&provider.id).unwrap_or_default();
+        match provider_test_key_selection(&self.provider_keys_cache) {
+            ProviderTestKeySelection::NoKeys => {
+                self.show_message(
+                    format!("Provider '{}' has no keys to test.", provider.name),
+                    true,
+                    None,
+                );
+            }
+            ProviderTestKeySelection::Single(key) => {
+                self.start_provider_test_popup(&provider, &key, ProviderTestSource::Page)?;
+            }
+            ProviderTestKeySelection::Multiple => {
+                self.provider_key_selected = 0;
+                self.mode = Mode::ProviderTestKeyList {
+                    provider_id: provider.id,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn start_provider_key_test(&mut self) -> Result<()> {
+        let (provider_id, source) = match &self.mode {
+            Mode::ProviderKeyList { provider_id } => {
+                (provider_id.clone(), ProviderTestSource::KeyList)
+            }
+            Mode::ProviderTestKeyList { provider_id } => {
+                (provider_id.clone(), ProviderTestSource::TestKeyList)
+            }
+            _ => return Ok(()),
+        };
+        let provider = self.manager.get_provider(&provider_id)?;
+        let Some(key) = self.selected_provider_key().cloned() else {
+            self.show_message("Select a provider key first.".into(), true, None);
+            return Ok(());
+        };
+        self.start_provider_test_popup(&provider, &key, source)
+    }
+
+    fn start_provider_test_popup(
+        &mut self,
+        provider: &Provider,
+        key: &ProviderKey,
+        source: ProviderTestSource,
+    ) -> Result<()> {
+        let fetched_models = discover_models(&provider.base_url, &key.api_key).map_err(|failure| {
+            format!(
+                "Provider '{}' key '{}' could not discover models: {}",
+                provider.name, key.name, failure.message
+            )
+        });
+        self.set_provider_test_models_from_result(fetched_models);
+        self.provider_test_model_selected = 0;
+        self.provider_test_model_buf = self
+            .provider_test_models
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        self.provider_test_prompt_buf = "Hello".to_string();
+        self.cursor_pos = self.provider_test_model_buf.len();
+        self.mode = Mode::ProviderAnthropicTest {
+            provider_id: provider.id.clone(),
+            key_id: key.id.clone(),
+            source,
+            field: 0,
+        };
+        Ok(())
+    }
+
+    fn apply_provider_smart_paste(&mut self, parsed: SmartProviderPaste) -> Result<()> {
+        let provider_name = if parsed.name.trim().is_empty() {
+            inferred_provider_name(&parsed.base_url)
+        } else {
+            parsed.name
+        };
+        let key_name = if parsed.key_name.trim().is_empty() {
+            "Default".to_string()
+        } else {
+            parsed.key_name
+        };
+
+        if let Some(existing) = self
+            .providers_cache
+            .iter()
+            .find(|p| p.base_url == parsed.base_url)
+            .cloned()
+        {
+            if existing
+                .keys
+                .values()
+                .any(|key| key.api_key == parsed.api_key)
+            {
+                self.reset_provider_smart_input();
+                self.mode = Mode::Message(
+                    format!(
+                        "Provider '{}' already has this key. Nothing added.",
+                        existing.name
+                    ),
+                    true,
+                );
+                return Ok(());
+            }
+
+            self.provider_add_existing_id = Some(existing.id);
+            self.provider_name_buf = existing.name;
+            self.provider_url_buf = existing.base_url;
+            self.provider_key_name_buf = key_name;
+            self.provider_key_buf = parsed.api_key;
+            self.cursor_pos = self.provider_key_name_buf.len();
+            self.mode = Mode::ProviderAdd { step: 0 };
+            return Ok(());
+        }
+
+        self.reset_provider_smart_input();
+        self.provider_add_existing_id = None;
+        self.provider_name_buf = provider_name;
+        self.provider_url_buf = parsed.base_url;
+        self.provider_key_name_buf = key_name;
+        self.provider_key_buf = parsed.api_key;
+        self.cursor_pos = self.provider_name_buf.len();
+        self.mode = Mode::ProviderAdd { step: 0 };
+        Ok(())
+    }
+
+    fn handle_provider_anthropic_test(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        let (provider_id, key_id, source, field) = match &self.mode {
+            Mode::ProviderAnthropicTest {
+                provider_id,
+                key_id,
+                source,
+                field,
+            } => (provider_id.clone(), key_id.clone(), *source, *field),
+            _ => return Ok(()),
+        };
+
+        match code {
+            KeyCode::Char('q') => {
+                self.mode = provider_test_return_mode(source, &provider_id).unwrap_or(Mode::Normal);
+            }
+            KeyCode::Esc => {
+                self.mode = provider_test_return_mode(source, &provider_id).unwrap_or(Mode::Normal);
+            }
+            KeyCode::Enter => {
+                let provider = self.manager.get_provider(&provider_id)?;
+                let key = provider
+                    .keys
+                    .get(&key_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("Key '{}' not found.", key_id))?;
+                let model = self.provider_test_model_buf.trim().to_string();
+                let prompt = self.provider_test_prompt_buf.trim().to_string();
+                if model.is_empty() || prompt.is_empty() {
+                    return Ok(());
+                }
+                match test_anthropic_message(&provider.base_url, &key.api_key, &model, &prompt) {
+                    Ok(result) => {
+                        self.mode = Mode::ProviderAnthropicOutcome {
+                            provider_id,
+                            key_id,
+                            source,
+                            field,
+                            model,
+                            input_tokens: result.input_tokens,
+                            output_tokens: result.output_tokens,
+                            body: result.text.trim().to_string(),
+                            is_error: false,
+                        };
+                    }
+                    Err(e) => {
+                        self.mode = Mode::ProviderAnthropicOutcome {
+                            provider_id,
+                            key_id,
+                            source,
+                            field,
+                            model,
+                            input_tokens: None,
+                            output_tokens: None,
+                            body: e.to_string(),
+                            is_error: true,
+                        };
+                    }
+                }
+            }
+            KeyCode::PageUp => {
+                if !self.provider_test_models.is_empty() {
+                    self.provider_test_model_selected =
+                        self.provider_test_model_selected.saturating_sub(5);
+                    self.provider_test_model_buf =
+                        self.provider_test_models[self.provider_test_model_selected].clone();
+                    if field == 0 {
+                        self.cursor_pos = self.provider_test_model_buf.len();
+                    }
+                }
+            }
+            KeyCode::PageDown => {
+                if !self.provider_test_models.is_empty() {
+                    let last = self.provider_test_models.len().saturating_sub(1);
+                    self.provider_test_model_selected =
+                        (self.provider_test_model_selected + 5).min(last);
+                    self.provider_test_model_buf =
+                        self.provider_test_models[self.provider_test_model_selected].clone();
+                    if field == 0 {
+                        self.cursor_pos = self.provider_test_model_buf.len();
+                    }
+                }
+            }
+            KeyCode::Tab if field == 0 => {
+                if let Some(completed) = complete_provider_test_model(
+                    &self.provider_test_models,
+                    &self.provider_test_model_buf,
+                ) {
+                    self.provider_test_model_buf = completed;
+                    self.cursor_pos = self.provider_test_model_buf.len();
+                }
+            }
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let next_field = (field + 1) % 2;
+                self.cursor_pos = if next_field == 0 {
+                    self.provider_test_model_buf.len()
+                } else {
+                    self.provider_test_prompt_buf.len()
+                };
+                self.mode = Mode::ProviderAnthropicTest {
+                    provider_id,
+                    key_id,
+                    source,
+                    field: next_field,
+                };
+            }
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let next_field = (field + 1) % 2;
+                self.cursor_pos = if next_field == 0 {
+                    self.provider_test_model_buf.len()
+                } else {
+                    self.provider_test_prompt_buf.len()
+                };
+                self.mode = Mode::ProviderAnthropicTest {
+                    provider_id,
+                    key_id,
+                    source,
+                    field: next_field,
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') if field == 0 => {
+                if !self.provider_test_models.is_empty() {
+                    if self.provider_test_model_selected == 0 {
+                        self.provider_test_model_selected = self.provider_test_models.len() - 1;
+                    } else {
+                        self.provider_test_model_selected -= 1;
+                    }
+                    self.provider_test_model_buf =
+                        self.provider_test_models[self.provider_test_model_selected].clone();
+                    self.cursor_pos = self.provider_test_model_buf.len();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') if field == 0 => {
+                if !self.provider_test_models.is_empty() {
+                    self.provider_test_model_selected =
+                        (self.provider_test_model_selected + 1) % self.provider_test_models.len();
+                    self.provider_test_model_buf =
+                        self.provider_test_models[self.provider_test_model_selected].clone();
+                    self.cursor_pos = self.provider_test_model_buf.len();
+                }
+            }
+            _ => {
+                let buf = if field == 0 {
+                    &mut self.provider_test_model_buf
+                } else {
+                    &mut self.provider_test_prompt_buf
+                };
+                emacs_edit(code, modifiers, buf, &mut self.cursor_pos, true);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_provider_anthropic_outcome(&mut self, code: KeyCode) -> Result<()> {
+        let (provider_id, key_id, source, field) = match &self.mode {
+            Mode::ProviderAnthropicOutcome {
+                provider_id,
+                key_id,
+                source,
+                field,
+                ..
+            } => (provider_id.clone(), key_id.clone(), *source, *field),
+            _ => return Ok(()),
+        };
+
+        self.mode = provider_test_outcome_next_mode(code, &provider_id, &key_id, source, field);
+        if matches!(self.mode, Mode::ProviderAnthropicTest { field: 0, .. }) {
+            self.cursor_pos = self.provider_test_model_buf.len();
+        } else if matches!(self.mode, Mode::ProviderAnthropicTest { field: 1, .. }) {
+            self.cursor_pos = self.provider_test_prompt_buf.len();
+        }
+        Ok(())
+    }
+
+    fn handle_provider_edit(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        let (pid, step) = match &self.mode {
+            Mode::ProviderEdit { provider_id, step } => (provider_id.clone(), *step),
+            _ => return Ok(()),
+        };
+        let total_steps: usize = 3; // 0=name, 1=url, 2=keys
+
+        if step < 2
+            && !matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab)
+            && emacs_edit(
+                code,
+                modifiers,
+                if step == 0 {
+                    &mut self.provider_name_buf
+                } else {
+                    &mut self.provider_url_buf
+                },
+                &mut self.cursor_pos,
+                true,
+            )
+        {
+            return Ok(());
+        }
+
+        match code {
+            KeyCode::Esc => {
+                let name = self.provider_name_buf.trim().to_string();
+                if !name.is_empty() {
+                    let _ = self
+                        .manager
+                        .update_provider(&pid, &name, self.provider_url_buf.trim());
+                }
+                self.sync_shims();
+                self.providers_cache = self.manager.list_providers().unwrap_or_default();
+                if self.page == Page::ProviderManager {
+                    self.mode = Mode::Normal;
+                } else {
+                    self.mode = Mode::ProviderList;
+                }
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                if step == 2 {
+                    let name = self.provider_name_buf.trim().to_string();
+                    if !name.is_empty() {
+                        let _ =
+                            self.manager
+                                .update_provider(&pid, &name, self.provider_url_buf.trim());
+                    }
+                    self.sync_shims();
+                    self.providers_cache = self.manager.list_providers().unwrap_or_default();
+                    if self.page == Page::ProviderManager {
+                        self.mode = Mode::Normal;
+                    } else {
+                        self.mode = Mode::ProviderList;
+                    }
+                } else {
+                    let next_step = (step + 1) % total_steps;
+                    self.cursor_pos = provider_edit_cursor_pos(
+                        next_step,
+                        &self.provider_name_buf,
+                        &self.provider_url_buf,
+                    );
+                    self.mode = Mode::ProviderEdit {
+                        provider_id: pid,
+                        step: next_step,
+                    };
+                }
+            }
+            KeyCode::Char('a') if step == 2 => {
+                // Add key from within edit
+                self.provider_key_name_buf.clear();
+                self.provider_key_buf.clear();
+                self.cursor_pos = 0;
+                self.mode = Mode::ProviderEditKeyInput {
+                    provider_id: pid,
+                    step: 0,
+                };
+            }
+            KeyCode::Char('d') if step == 2 => {
+                // Delete selected key
+                if let Some(k) = self.selected_provider_key() {
+                    let _ = self.manager.remove_key(&pid, &k.id);
+                    self.sync_shims();
+                    self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                    if self.provider_key_selected >= self.provider_keys_cache.len() {
+                        self.provider_key_selected = self.provider_key_selected.saturating_sub(1);
+                    }
+                }
+            }
+            KeyCode::Char('e') if step == 2 => {
+                // Edit selected key
+                if let Some(k) = self.selected_provider_key().cloned() {
+                    self.provider_key_name_buf = k.name.clone();
+                    self.provider_key_buf = k.api_key.clone();
+                    self.cursor_pos = k.name.len();
+                    self.mode = Mode::ProviderKeyEdit {
+                        provider_id: pid,
+                        key_id: k.id,
+                        step: 0,
+                        source: KeyEditSource::ProviderEdit,
+                    };
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') if step == 2 && self.provider_key_selected > 0 => {
+                self.provider_key_selected -= 1;
+            }
+            KeyCode::Char('p')
+                if step == 2
+                    && modifiers.contains(KeyModifiers::CONTROL)
+                    && self.provider_key_selected > 0 =>
+            {
+                self.provider_key_selected -= 1;
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if step == 2 && self.provider_key_selected + 1 < self.provider_keys_cache.len() =>
+            {
+                self.provider_key_selected += 1;
+            }
+            KeyCode::Char('n')
+                if step == 2
+                    && modifiers.contains(KeyModifiers::CONTROL)
+                    && self.provider_key_selected + 1 < self.provider_keys_cache.len() =>
+            {
+                self.provider_key_selected += 1;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_provider_edit_key_input(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        let pid = match &self.mode {
+            Mode::ProviderEditKeyInput { provider_id, .. } => provider_id.clone(),
+            _ => return Ok(()),
+        };
+        match code {
+            KeyCode::Esc => {
+                self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                self.provider_key_selected = 0;
+                self.cursor_pos =
+                    provider_edit_cursor_pos(2, &self.provider_name_buf, &self.provider_url_buf);
+                self.mode = Mode::ProviderEdit {
+                    provider_id: pid,
+                    step: 2,
+                };
+            }
+            KeyCode::Enter => {
+                let step = match &self.mode {
+                    Mode::ProviderEditKeyInput { step, .. } => *step,
+                    _ => 0,
+                };
+                if step == 1 {
+                    let name = self.provider_key_name_buf.trim().to_string();
+                    let key = self.provider_key_buf.trim().to_string();
+                    if name.is_empty() || key.is_empty() {
+                        return Ok(());
+                    }
+                    let _ = self.manager.add_key(&pid, &name, &key);
+                    self.sync_shims();
+                    self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                    self.provider_key_selected = self.provider_keys_cache.len().saturating_sub(1);
+                    self.cursor_pos = provider_edit_cursor_pos(
+                        2,
+                        &self.provider_name_buf,
+                        &self.provider_url_buf,
+                    );
+                    self.mode = Mode::ProviderEdit {
+                        provider_id: pid,
+                        step: 2,
+                    };
+                } else {
+                    self.mode = Mode::ProviderEditKeyInput {
+                        provider_id: pid,
+                        step: step + 1,
+                    };
+                }
+            }
+            _ => {
+                let step = match &self.mode {
+                    Mode::ProviderEditKeyInput { step, .. } => *step,
+                    _ => 0,
+                };
+                let buf = match step {
+                    0 => &mut self.provider_key_name_buf,
+                    _ => &mut self.provider_key_buf,
+                };
+                emacs_edit(code, modifiers, buf, &mut self.cursor_pos, true);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_provider_key_list(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        match code {
+            KeyCode::Esc => {
+                self.providers_cache = self.manager.list_providers().unwrap_or_default();
+                if self.page == Page::ProviderManager {
+                    self.mode = Mode::Normal;
+                } else {
+                    self.mode = Mode::ProviderList;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.provider_key_selected > 0 {
+                    self.provider_key_selected -= 1;
+                } else if !self.provider_keys_cache.is_empty() {
+                    self.provider_key_selected = self.provider_keys_cache.len() - 1;
+                }
+            }
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.provider_key_selected > 0 {
+                    self.provider_key_selected -= 1;
+                } else if !self.provider_keys_cache.is_empty() {
+                    self.provider_key_selected = self.provider_keys_cache.len() - 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
+                    self.provider_key_selected += 1;
+                } else {
+                    self.provider_key_selected = 0;
+                }
+            }
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
+                    self.provider_key_selected += 1;
+                } else {
+                    self.provider_key_selected = 0;
+                }
+            }
+            KeyCode::Char('a') => {
+                self.provider_key_name_buf.clear();
+                self.provider_key_buf.clear();
+                self.cursor_pos = 0;
+                let pid = match &self.mode {
+                    Mode::ProviderKeyList { provider_id } => provider_id.clone(),
+                    _ => return Ok(()),
+                };
+                self.mode = Mode::ProviderKeyAdd {
+                    provider_id: pid,
+                    step: 0,
+                };
+            }
+            KeyCode::Char('e') => {
+                let kid = self
+                    .selected_provider_key()
+                    .map(|k| (k.id.clone(), k.name.clone(), k.api_key.clone()));
+                if let Some((kid_val, name, key)) = kid {
+                    let pid = match &self.mode {
+                        Mode::ProviderKeyList { provider_id } => provider_id.clone(),
+                        _ => return Ok(()),
+                    };
+                    let name_len = name.len();
+                    self.provider_key_name_buf = name;
+                    self.provider_key_buf = key;
+                    self.cursor_pos = name_len;
+                    self.mode = Mode::ProviderKeyEdit {
+                        provider_id: pid,
+                        key_id: kid_val,
+                        step: 0,
+                        source: KeyEditSource::ProviderKeyList,
+                    };
+                }
+            }
+            KeyCode::Char('d') => {
+                let kid = self
+                    .selected_provider_key()
+                    .map(|k| (k.id.clone(), k.name.clone()));
+                if let Some((kid_val, name)) = kid {
+                    let pid = match &self.mode {
+                        Mode::ProviderKeyList { provider_id } => provider_id.clone(),
+                        _ => return Ok(()),
+                    };
+                    self.mode = Mode::ConfirmDeleteKey {
+                        provider_id: pid,
+                        key_id: kid_val,
+                        name,
+                    };
+                }
+            }
+            KeyCode::Char('t') => {
+                self.start_provider_key_test()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_provider_key_add(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        match code {
+            KeyCode::Esc => {
+                let pid = match &self.mode {
+                    Mode::ProviderKeyAdd { provider_id, .. } => provider_id.clone(),
+                    _ => return Ok(()),
+                };
+                self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                self.mode = Mode::ProviderKeyList { provider_id: pid };
+            }
+            KeyCode::Enter => {
+                let (pid, step) = match &self.mode {
+                    Mode::ProviderKeyAdd { provider_id, step } => (provider_id.clone(), *step),
+                    _ => return Ok(()),
+                };
+                if step == 1 {
+                    let name = self.provider_key_name_buf.trim().to_string();
+                    let key = self.provider_key_buf.trim().to_string();
+                    if name.is_empty() || key.is_empty() {
+                        return Ok(());
+                    }
+                    match self.manager.add_key(&pid, &name, &key) {
+                        Ok(_) => {
+                            self.sync_shims();
+                            self.provider_keys_cache =
+                                self.manager.list_keys(&pid).unwrap_or_default();
+                            self.mode = Mode::ProviderKeyList { provider_id: pid };
+                        }
+                        Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                    }
+                } else {
+                    self.mode = Mode::ProviderKeyAdd {
+                        provider_id: pid,
+                        step: step + 1,
+                    };
+                }
+            }
+            _ => {
+                let step = match &self.mode {
+                    Mode::ProviderKeyAdd { step, .. } => *step,
+                    _ => 0,
+                };
+                let buf = match step {
+                    0 => &mut self.provider_key_name_buf,
+                    _ => &mut self.provider_key_buf,
+                };
+                emacs_edit(code, modifiers, buf, &mut self.cursor_pos, true);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_provider_test_key_list(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.provider_key_selected > 0 {
+                    self.provider_key_selected -= 1;
+                } else if !self.provider_keys_cache.is_empty() {
+                    self.provider_key_selected = self.provider_keys_cache.len() - 1;
+                }
+            }
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.provider_key_selected > 0 {
+                    self.provider_key_selected -= 1;
+                } else if !self.provider_keys_cache.is_empty() {
+                    self.provider_key_selected = self.provider_keys_cache.len() - 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
+                    self.provider_key_selected += 1;
+                } else {
+                    self.provider_key_selected = 0;
+                }
+            }
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
+                    self.provider_key_selected += 1;
+                } else {
+                    self.provider_key_selected = 0;
+                }
+            }
+            KeyCode::Char('t') => {
+                let provider_id = match &self.mode {
+                    Mode::ProviderTestKeyList { provider_id } => provider_id.clone(),
+                    _ => return Ok(()),
+                };
+                let provider = self.manager.get_provider(&provider_id)?;
+                let Some(key) = self.selected_provider_key().cloned() else {
+                    self.show_message("Select a provider key first.".into(), true, None);
+                    return Ok(());
+                };
+                let return_mode =
+                    provider_test_return_mode(ProviderTestSource::TestKeyList, &provider.id);
+                match discover_models(&provider.base_url, &key.api_key) {
+                    Ok(discovery) => {
+                        let mut models: Vec<String> = discovery
+                            .models
+                            .into_iter()
+                            .map(|model| trim_model_context_suffix(&model).to_string())
+                            .collect();
+                        models.sort();
+                        models.dedup();
+                        let preview = models
+                            .iter()
+                            .take(6)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let summary = if models.is_empty() {
+                            format!(
+                                "Provider '{}' key '{}' returned no models.",
+                                provider.name, key.name
+                            )
+                        } else {
+                            format!(
+                                "Provider '{}' key '{}': {} models via {} [{}]",
+                                provider.name,
+                                key.name,
+                                models.len(),
+                                discovery.endpoint_used,
+                                preview
+                            )
+                        };
+                        self.show_message(summary, false, return_mode);
+                    }
+                    Err(failure) => {
+                        self.show_message(
+                            format!(
+                                "Provider '{}' key '{}' could not discover models: {}. The provider may still work with a manually entered model name.",
+                                provider.name, key.name, failure.message
+                            ),
+                            false,
+                            return_mode,
+                        );
+                    }
+                }
+            }
+            KeyCode::Char('T') => {
+                self.start_provider_key_test()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_provider_key_edit(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        let (pid, kid, source) = match &self.mode {
+            Mode::ProviderKeyEdit {
+                provider_id,
+                key_id,
+                source,
+                ..
+            } => (provider_id.clone(), key_id.clone(), *source),
+            _ => return Ok(()),
+        };
+        match code {
+            KeyCode::Esc => {
+                self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                match source {
+                    KeyEditSource::ProviderEdit => {
+                        self.mode = Mode::ProviderEdit {
+                            provider_id: pid,
+                            step: 2,
+                        };
+                    }
+                    KeyEditSource::ProviderKeyList => {
+                        self.mode = Mode::ProviderKeyList { provider_id: pid };
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let step = match &self.mode {
+                    Mode::ProviderKeyEdit { step, .. } => *step,
+                    _ => 0,
+                };
+                if step == 1 {
+                    let name = self.provider_key_name_buf.trim().to_string();
+                    let key = self.provider_key_buf.trim().to_string();
+                    if name.is_empty() || key.is_empty() {
+                        return Ok(());
+                    }
+                    match self.manager.update_key(&pid, &kid, &name, &key) {
+                        Ok(_) => {
+                            self.sync_shims();
+                            self.provider_keys_cache =
+                                self.manager.list_keys(&pid).unwrap_or_default();
+                            match source {
+                                KeyEditSource::ProviderEdit => {
+                                    self.mode = Mode::ProviderEdit {
+                                        provider_id: pid,
+                                        step: 2,
+                                    };
+                                }
+                                KeyEditSource::ProviderKeyList => {
+                                    self.mode = Mode::ProviderKeyList { provider_id: pid };
+                                }
+                            }
+                        }
+                        Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                    }
+                } else {
+                    self.mode = Mode::ProviderKeyEdit {
+                        provider_id: pid,
+                        key_id: kid,
+                        step: step + 1,
+                        source,
+                    };
+                }
+            }
+            _ => {
+                let step = match &self.mode {
+                    Mode::ProviderKeyEdit { step, .. } => *step,
+                    _ => 0,
+                };
+                let buf = match step {
+                    0 => &mut self.provider_key_name_buf,
+                    _ => &mut self.provider_key_buf,
+                };
+                emacs_edit(code, modifiers, buf, &mut self.cursor_pos, true);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_confirm_delete_provider(&mut self, code: KeyCode) -> Result<()> {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let pid = match &self.mode {
+                    Mode::ConfirmDeleteProvider { provider_id, .. } => provider_id.clone(),
+                    _ => return Ok(()),
+                };
+                match self.manager.remove_provider(&pid) {
+                    Ok(_) => {
+                        self.sync_shims();
+                        self.providers_cache = self.manager.list_providers().unwrap_or_default();
+                        if self.page == Page::ProviderManager {
+                            self.mode = Mode::Normal;
+                        } else {
+                            self.mode = Mode::ProviderList;
+                        }
+                    }
+                    Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                }
+            }
+            _ => {
+                if self.page == Page::ProviderManager {
+                    self.mode = Mode::Normal;
+                } else {
+                    self.mode = Mode::ProviderList;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_confirm_delete_key(&mut self, code: KeyCode) -> Result<()> {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let (pid, kid) = match &self.mode {
+                    Mode::ConfirmDeleteKey {
+                        provider_id,
+                        key_id,
+                        ..
+                    } => (provider_id.clone(), key_id.clone()),
+                    _ => return Ok(()),
+                };
+                match self.manager.remove_key(&pid, &kid) {
+                    Ok(_) => {
+                        self.sync_shims();
+                        self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                        self.mode = Mode::ProviderKeyList { provider_id: pid };
+                    }
+                    Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                }
+            }
+            _ => {
+                let pid = match &self.mode {
+                    Mode::ConfirmDeleteKey { provider_id, .. } => provider_id.clone(),
+                    _ => return Ok(()),
+                };
+                self.mode = Mode::ProviderKeyList { provider_id: pid };
+            }
+        }
+        Ok(())
+    }
+
+    // ── Provider helpers ─────────────────────────────────────────────────────
+
+    fn move_provider_up(&mut self) {
+        if self.providers_cache.is_empty() {
+            return;
+        }
+        let i = match self.provider_list_state.selected() {
+            Some(0) | None => self.providers_cache.len() - 1,
+            Some(i) => i - 1,
+        };
+        self.provider_list_state.select(Some(i));
+        self.provider_list_scroll = self.provider_list_scroll.position(i);
+    }
+
+    fn move_provider_down(&mut self) {
+        if self.providers_cache.is_empty() {
+            return;
+        }
+        let i = match self.provider_list_state.selected() {
+            Some(i) => (i + 1) % self.providers_cache.len(),
+            None => 0,
+        };
+        self.provider_list_state.select(Some(i));
+        self.provider_list_scroll = self.provider_list_scroll.position(i);
+    }
+
+    fn move_provider_key_up(&mut self) {
+        if self.provider_keys_cache.is_empty() {
+            return;
+        }
+        if self.provider_key_selected > 0 {
+            self.provider_key_selected -= 1;
+        } else {
+            self.provider_key_selected = self.provider_keys_cache.len() - 1;
+        }
+    }
+
+    fn move_provider_key_down(&mut self) {
+        if self.provider_keys_cache.is_empty() {
+            return;
+        }
+        if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
+            self.provider_key_selected += 1;
+        } else {
+            self.provider_key_selected = 0;
+        }
+    }
+
+    fn selected_provider_key(&self) -> Option<&ProviderKey> {
+        self.provider_keys_cache
+            .get(self.provider_key_selected)
+            .or_else(|| self.provider_keys_cache.first())
+    }
+
+    // ── Provider renderers ───────────────────────────────────────────────────
+
+    fn render_provider_list_popup(&mut self, f: &mut Frame) {
+        let area = centered_rect(70, 16, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Providers ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(block.clone(), area);
+
+        if self.providers_cache.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  No providers yet.",
+                    Style::default().fg(DIM),
+                )))
+                .block(block),
+                area,
+            );
+            return;
+        }
+
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, p) in self.providers_cache.iter().enumerate() {
+            let selected = self.provider_list_state.selected() == Some(i);
+            let style = if selected {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(TEXT)
+            };
+            let prefix = if selected { "▶" } else { " " };
+            let id_short = display_ellipsize(&p.id, 12);
+            let url_short = display_ellipsize(&p.base_url, 35);
+            let key_count = format!("keys:{}", p.keys.len());
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", prefix), style),
+                Span::styled(
+                    format!("{} ", display_pad(&id_short, 12)),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(format!("{} ", display_pad(&p.name, 18)), style),
+                Span::styled(
+                    format!("{} ", display_pad(&key_count, 8)),
+                    Style::default().fg(DIM),
+                ),
+                Span::styled(url_short, Style::default().fg(DIM)),
+            ]));
+        }
+
+        let scrollbar =
+            Scrollbar::new(ScrollbarOrientation::VerticalRight).style(Style::default().fg(BORDER));
+        self.provider_list_scroll = self
+            .provider_list_scroll
+            .content_length(self.providers_cache.len());
+        f.render_stateful_widget(scrollbar, block.inner(area), &mut self.provider_list_scroll);
+
+        f.render_widget(Paragraph::new(Text::from(lines)), block.inner(area));
+    }
+
+    fn render_provider_add_popup(&self, f: &mut Frame, step: usize) {
+        let existing = self.provider_add_existing_id.is_some();
+        let area = centered_rect(64, if existing { 10 } else { 12 }, f.area());
+        f.render_widget(Clear, area);
+        let title = if existing {
+            " Add Key To Existing Provider "
+        } else {
+            " Add Provider "
+        };
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                title,
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        let fields: Vec<(&str, &String, bool)> = if existing {
+            vec![
+                ("Provider", &self.provider_name_buf, false),
+                ("Base URL", &self.provider_url_buf, false),
+                ("Key name", &self.provider_key_name_buf, true),
+                ("API Key", &self.provider_key_buf, false),
+            ]
+        } else {
+            vec![
+                ("Name", &self.provider_name_buf, true),
+                ("Base URL", &self.provider_url_buf, true),
+                ("Key name", &self.provider_key_name_buf, true),
+                ("API Key", &self.provider_key_buf, true),
+            ]
+        };
+        let mut lines = vec![Line::from("")];
+        let mut editable_index = 0usize;
+        for (label, value, editable) in fields {
+            let active = editable && step == editable_index;
+            let prefix = if active { "▶ " } else { "  " };
+            let cursor = if active { "█" } else { "" };
+            let val = if value.is_empty() && !active {
+                "(empty)"
+            } else {
+                value
+            };
+            let style = if active {
+                Style::default().fg(TEXT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}{}: {}", prefix, display_pad(label, 9), val),
+                    style,
+                ),
+                Span::styled(cursor, Style::default().fg(ACCENT)),
+            ]));
+            if editable {
+                editable_index += 1;
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  Enter", Style::default().fg(ACCENT).bold()),
+            Span::styled(" next/save  ", Style::default().fg(DIM)),
+            Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+            Span::styled(" cancel", Style::default().fg(DIM)),
+        ]));
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn render_provider_smart_paste_popup(&self, f: &mut Frame) {
+        let area = centered_rect(76, 12, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Smart Input Provider ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        let display = if self.provider_smart_paste_buf.is_empty() {
+            "█".to_string()
+        } else {
+            format!("{}█", self.provider_smart_paste_buf)
+        };
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Ctrl+Y reads clipboard; paste JSON or cherrystudio://providers/api-keys below:",
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {}", display),
+                Style::default().fg(TEXT).bold(),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Enter", Style::default().fg(ACCENT).bold()),
+                Span::styled(" parse  ", Style::default().fg(DIM)),
+                Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+                Span::styled(" back", Style::default().fg(DIM)),
+            ]),
+        ];
+        if let Some(err) = &self.provider_smart_paste_error {
+            lines.insert(
+                4,
+                Line::from(Span::styled(
+                    format!("  {}", err),
+                    Style::default().fg(DANGER),
+                )),
+            );
+        }
+
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_provider_edit_popup(&mut self, f: &mut Frame) {
+        let (_pid, step) = match &self.mode {
+            Mode::ProviderEdit { provider_id, step } => (provider_id.clone(), *step),
+            _ => return,
+        };
+
+        let key_count = if step == 2 {
+            self.provider_keys_cache.len().min(6)
+        } else {
+            0
+        };
+        let height = if step == 2 {
+            12u16 + key_count as u16
+        } else {
+            10
+        };
+        let area = centered_rect(60, height, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Edit Provider ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        let nf = if step == 0 { "▶ " } else { "  " };
+        let nc = if step == 0 { "█" } else { "" };
+        let nv = if self.provider_name_buf.is_empty() && step != 0 {
+            "(empty)"
+        } else {
+            &self.provider_name_buf
+        };
+        let ns = if step == 0 {
+            Style::default().fg(TEXT).bold()
+        } else {
+            Style::default().fg(MUTED)
+        };
+
+        let uf = if step == 1 { "▶ " } else { "  " };
+        let uc = if step == 1 { "█" } else { "" };
+        let uv = if self.provider_url_buf.is_empty() && step != 1 {
+            "(empty)"
+        } else {
+            &self.provider_url_buf
+        };
+        let us = if step == 1 {
+            Style::default().fg(TEXT).bold()
+        } else {
+            Style::default().fg(MUTED)
+        };
+
+        let kf = if step == 2 { "▶ " } else { "  " };
+        let ks = if step == 2 {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            Style::default().fg(MUTED)
+        };
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                format!("  {}Name:  {}{}", nf, nv, nc),
+                ns,
+            )]),
+            Line::from(vec![Span::styled(
+                format!("  {}URL:   {}{}", uf, uv, uc),
+                us,
+            )]),
+            Line::from(vec![Span::styled(
+                format!("  {}Keys: {} keys", kf, self.provider_keys_cache.len()),
+                ks,
+            )]),
+            Line::from(""),
+        ];
+
+        if step == 2 {
+            if self.provider_keys_cache.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  (no keys — press 'a' to add)",
+                    Style::default().fg(DIM),
+                )));
+            } else {
+                for (i, k) in self.provider_keys_cache.iter().take(6).enumerate() {
+                    let selected = i == self.provider_key_selected;
+                    let style = if selected {
+                        Style::default().fg(ACCENT).bold()
+                    } else {
+                        Style::default().fg(TEXT)
+                    };
+                    let prefix = if selected { "▶" } else { " " };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {} ", prefix), style),
+                        Span::styled(format!("{} ", display_pad(&k.name, 20)), style),
+                        Span::styled(mask_api_key(&k.api_key), Style::default().fg(DIM)),
+                    ]));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  a=add  d=delete  ↑↓=nav  Tab=next  Esc=save",
+                Style::default().fg(DIM),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  Tab/Enter to switch, Backspace to edit, Esc to save",
+                Style::default().fg(DIM),
+            )));
+        }
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn render_provider_key_list_popup(&mut self, f: &mut Frame) {
+        let area = centered_rect(60, 14, f.area());
+        f.render_widget(Clear, area);
+        let pid = match &self.mode {
+            Mode::ProviderKeyList { provider_id } => provider_id.clone(),
+            _ => return,
+        };
+        let prov_name = self
+            .manager
+            .get_provider(&pid)
+            .map(|p| p.name)
+            .unwrap_or_default();
+
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                format!(" Keys — {} ", prov_name),
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(block.clone(), area);
+
+        if self.provider_keys_cache.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  No keys yet. Press 'a' to add.",
+                    Style::default().fg(DIM),
+                )))
+                .block(block),
+                area,
+            );
+            return;
+        }
+
+        let sel = self.provider_key_selected;
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, k) in self.provider_keys_cache.iter().enumerate() {
+            let selected = i == sel;
+            let style = if selected {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(TEXT)
+            };
+            let prefix = if selected { "▶" } else { " " };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", prefix), style),
+                Span::styled(format!("{} ", display_pad(&k.name, 20)), style),
+                Span::styled(mask_api_key(&k.api_key), Style::default().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  a=add  e=edit  d=delete  t=models  T=anthropic  Esc=back",
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(Paragraph::new(Text::from(lines)), block.inner(area));
+    }
+
+    fn render_provider_test_key_list_popup(&mut self, f: &mut Frame) {
+        let area = centered_rect(62, 14, f.area());
+        f.render_widget(Clear, area);
+        let pid = match &self.mode {
+            Mode::ProviderTestKeyList { provider_id } => provider_id.clone(),
+            _ => return,
+        };
+        let prov_name = self
+            .manager
+            .get_provider(&pid)
+            .map(|p| p.name)
+            .unwrap_or_default();
+
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                format!(" Test Key — {} ", prov_name),
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(block.clone(), area);
+
+        if self.provider_keys_cache.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  This provider has no keys.",
+                    Style::default().fg(DIM),
+                )))
+                .block(block),
+                area,
+            );
+            return;
+        }
+
+        let sel = self.provider_key_selected;
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "  Select a key for provider testing.",
+            Style::default().fg(DIM),
+        )));
+        lines.push(Line::from(""));
+        for (i, k) in self.provider_keys_cache.iter().enumerate() {
+            let selected = i == sel;
+            let style = if selected {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(TEXT)
+            };
+            let prefix = if selected { "▶" } else { " " };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", prefix), style),
+                Span::styled(format!("{} ", display_pad(&k.name, 20)), style),
+                Span::styled(mask_api_key(&k.api_key), Style::default().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  t=models  T=anthropic  Esc=back",
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(Paragraph::new(Text::from(lines)), block.inner(area));
+    }
+
+    fn render_provider_key_add_popup(&self, f: &mut Frame, step: usize) {
+        let area = centered_rect(60, 9, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Add Key ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        let labels = ["Name", "API Key"];
+        let values = [&self.provider_key_name_buf, &self.provider_key_buf];
+        let mut lines = vec![Line::from("")];
+        for i in 0..2 {
+            let active = step == i;
+            let prefix = if active { "▶ " } else { "  " };
+            let cursor = if active { "█" } else { "" };
+            let val = if values[i].is_empty() && !active {
+                "(empty)"
+            } else {
+                values[i]
+            };
+            let style = if active {
+                Style::default().fg(TEXT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}{}: {}", prefix, labels[i], val), style),
+                Span::styled(cursor, Style::default().fg(ACCENT)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Enter to confirm, Esc to cancel",
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn render_provider_key_edit_popup(&self, f: &mut Frame, step: usize) {
+        let area = centered_rect(60, 9, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Edit Key ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        let labels = ["Name", "API Key"];
+        let values = [&self.provider_key_name_buf, &self.provider_key_buf];
+        let mut lines = vec![Line::from("")];
+        for i in 0..2 {
+            let active = step == i;
+            let prefix = if active { "▶ " } else { "  " };
+            let cursor = if active { "█" } else { "" };
+            let val = if values[i].is_empty() && !active {
+                "(empty)"
+            } else {
+                values[i]
+            };
+            let style = if active {
+                Style::default().fg(TEXT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}{}: {}", prefix, labels[i], val), style),
+                Span::styled(cursor, Style::default().fg(ACCENT)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Enter to confirm, Esc to cancel",
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn render_provider_anthropic_test_popup(&self, f: &mut Frame) {
+        let (provider_id, key_id, field) = match &self.mode {
+            Mode::ProviderAnthropicTest {
+                provider_id,
+                key_id,
+                field,
+                ..
+            } => (provider_id, key_id, *field),
+            _ => return,
+        };
+        let provider_name = self
+            .providers_cache
+            .iter()
+            .find(|provider| &provider.id == provider_id)
+            .map(|provider| provider.name.as_str())
+            .unwrap_or("Provider");
+        let key_name = self
+            .provider_keys_cache
+            .iter()
+            .find(|key| &key.id == key_id)
+            .map(|key| key.name.as_str())
+            .unwrap_or("Key");
+
+        let area = centered_rect(78, 22, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                format!(" Provider Test — {} / {} ", provider_name, key_name),
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(block.clone(), area);
+
+        let inner = block.inner(area);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(9),
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+
+        let model_active = field == 0;
+        let prompt_active = field == 1;
+        let model_value = if model_active {
+            format!("{}█", self.provider_test_model_buf)
+        } else if self.provider_test_model_buf.is_empty() {
+            "(empty)".to_string()
+        } else {
+            self.provider_test_model_buf.clone()
+        };
+        let prompt_value = if prompt_active {
+            format!("{}█", self.provider_test_prompt_buf)
+        } else if self.provider_test_prompt_buf.is_empty() {
+            "(empty)".to_string()
+        } else {
+            self.provider_test_prompt_buf.clone()
+        };
+
+        let list_block = Block::default()
+            .title(Line::from(Span::styled(
+                " Models ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(BG));
+        let mut list_lines = vec![Line::from("")];
+        let page_size = 5usize;
+        let total = self.provider_test_models.len();
+        let page_start = (self.provider_test_model_selected / page_size) * page_size;
+        let page_end = (page_start + page_size).min(total);
+        if total == 0 {
+            let msg = match &self.provider_test_model_fetch_state {
+                ModelFetchState::Loaded | ModelFetchState::Empty => {
+                    "  No models returned from provider.".to_string()
+                }
+                ModelFetchState::Unavailable(reason) => format!("  {}", reason),
+            };
+            list_lines.push(Line::from(Span::styled(msg, Style::default().fg(DIM))));
+        } else {
+            for (offset, model) in self.provider_test_models[page_start..page_end]
+                .iter()
+                .enumerate()
+            {
+                let index = page_start + offset;
+                let selected = index == self.provider_test_model_selected;
+                let prefix = if selected { "▶ " } else { "  " };
+                let style = if selected {
+                    Style::default().fg(ACCENT).bold()
+                } else {
+                    Style::default().fg(TEXT)
+                };
+                list_lines.push(Line::from(vec![Span::styled(
+                    format!("  {}{}", prefix, model),
+                    style,
+                )]));
+            }
+            let total_pages = total.div_ceil(page_size);
+            let current_page = page_start / page_size + 1;
+            list_lines.push(Line::from(""));
+            list_lines.push(Line::from(Span::styled(
+                format!(
+                    "  Page {}/{}  PgUp/PgDn to scroll",
+                    current_page, total_pages
+                ),
+                Style::default().fg(DIM),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(Text::from(list_lines))
+                .block(list_block)
+                .wrap(Wrap { trim: false }),
+            sections[0],
+        );
+
+        let model_lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}Model   ", if model_active { "▶ " } else { "  " }),
+                    Style::default()
+                        .fg(if model_active { ACCENT } else { DIM })
+                        .bold(),
+                ),
+                Span::styled(model_value, Style::default().fg(TEXT)),
+            ]),
+            Line::from(Span::styled(
+                "  Tab completes from fetched models; you can also type manually.",
+                Style::default().fg(DIM),
+            )),
+        ];
+        f.render_widget(Paragraph::new(Text::from(model_lines)), sections[2]);
+
+        let prompt_lines = vec![Line::from(vec![
+            Span::styled(
+                format!("  {}Prompt  ", if prompt_active { "▶ " } else { "  " }),
+                Style::default()
+                    .fg(if prompt_active { ACCENT } else { DIM })
+                    .bold(),
+            ),
+            Span::styled(prompt_value, Style::default().fg(TEXT)),
+        ])];
+        f.render_widget(Paragraph::new(Text::from(prompt_lines)), sections[3]);
+
+        let footer_lines = vec![
+            Line::from(Span::styled(
+                "  Ctrl+N/P switches fields. Enter sends one non-streaming /v1/messages request.",
+                Style::default().fg(DIM),
+            )),
+            Line::from(Span::styled(
+                "  Esc returns without sending. Press q to quit the test session.",
+                Style::default().fg(DIM),
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(Text::from(footer_lines)).wrap(Wrap { trim: false }),
+            sections[4],
+        );
+    }
+
+    fn render_provider_anthropic_outcome_popup(&self, f: &mut Frame) {
+        let (model, input_tokens, output_tokens, body, is_error) = match &self.mode {
+            Mode::ProviderAnthropicOutcome {
+                model,
+                input_tokens,
+                output_tokens,
+                body,
+                is_error,
+                ..
+            } => (model, *input_tokens, *output_tokens, body, *is_error),
+            _ => return,
+        };
+
+        let area = centered_rect(78, 16, f.area());
+        f.render_widget(Clear, area);
+        let accent = if is_error { DANGER } else { SUCCESS };
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                if is_error {
+                    " Anthropic Test Error "
+                } else {
+                    " Anthropic Test Result "
+                },
+                Style::default().fg(accent).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(block.clone(), area);
+
+        let inner = block.inner(area);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Length(1),
+                Constraint::Min(6),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let usage = match (input_tokens, output_tokens) {
+            (Some(input), Some(output)) => format!("input {}   output {}", input, output),
+            (Some(input), None) => format!("input {}", input),
+            (None, Some(output)) => format!("output {}", output),
+            (None, None) => "(no usage returned)".to_string(),
+        };
+
+        let meta_lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Model   ", Style::default().fg(DIM)),
+                Span::styled(model, Style::default().fg(TEXT).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("  Usage   ", Style::default().fg(DIM)),
+                Span::styled(
+                    if is_error {
+                        "(request failed)".to_string()
+                    } else {
+                        usage
+                    },
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(meta_lines), sections[0]);
+
+        let reply_block = Block::default()
+            .title(Line::from(Span::styled(
+                if is_error { " Error " } else { " Reply " },
+                Style::default()
+                    .fg(if is_error { DANGER } else { ACCENT })
+                    .bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(BG));
+        f.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(format!("  {}", body)),
+            ]))
+            .block(reply_block)
+            .wrap(Wrap { trim: false }),
+            sections[2],
+        );
+
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Any key returns to test. Press q to quit.",
+                Style::default().fg(DIM),
+            ))),
+            sections[3],
+        );
+    }
+
+    fn render_confirm_delete_provider_popup(&self, f: &mut Frame) {
+        let name = match &self.mode {
+            Mode::ConfirmDeleteProvider { name, .. } => name.clone(),
+            _ => return,
+        };
+        self.render_confirm_popup(
+            f,
+            &format!("Delete provider '{}'?", name),
+            "This cannot be undone. Press 'y' to confirm.",
+        );
+    }
+
+    fn render_provider_edit_key_input_popup(&self, f: &mut Frame, step: usize) {
+        let area = centered_rect(60, 9, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Add Key ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        let labels = ["Name", "API Key"];
+        let values = [&self.provider_key_name_buf, &self.provider_key_buf];
+        let mut lines = vec![Line::from("")];
+        for i in 0..2 {
+            let active = step == i;
+            let prefix = if active { "▶ " } else { "  " };
+            let cursor = if active { "█" } else { "" };
+            let val = if values[i].is_empty() && !active {
+                "(empty)"
+            } else {
+                values[i]
+            };
+            let style = if active {
+                Style::default().fg(TEXT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}{}: {}", prefix, labels[i], val), style),
+                Span::styled(cursor, Style::default().fg(ACCENT)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Enter to confirm, Esc to cancel",
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn render_confirm_delete_key_popup(&self, f: &mut Frame) {
+        let name = match &self.mode {
+            Mode::ConfirmDeleteKey { name, .. } => name.clone(),
+            _ => return,
+        };
+        self.render_confirm_popup(
+            f,
+            &format!("Delete key '{}'?", name),
+            "This cannot be undone. Press 'y' to confirm.",
+        );
+    }
+
+    fn render_confirm_popup(&self, f: &mut Frame, title: &str, hint: &str) {
+        let area = centered_rect(50, 7, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                format!(" {} ", title),
+                Style::default().fg(DANGER).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DANGER))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  {}", hint),
+                    Style::default().fg(TEXT),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [y] yes    [other] cancel",
+                    Style::default().fg(DIM),
+                )),
+            ]))
+            .block(block),
             area,
         );
     }
@@ -1881,7 +5723,9 @@ impl App {
 
 fn launch_args_from_str(s: &str) -> Option<Vec<String>> {
     let trimmed = s.trim();
-    if trimmed.is_empty() { None } else {
+    if trimmed.is_empty() {
+        None
+    } else {
         Some(trimmed.split_whitespace().map(String::from).collect())
     }
 }
@@ -1899,6 +5743,345 @@ fn replace_last_word(s: &str, replacement: &str) -> String {
     }
 }
 
+fn provider_test_key_selection(keys: &[ProviderKey]) -> ProviderTestKeySelection {
+    match keys {
+        [] => ProviderTestKeySelection::NoKeys,
+        [key] => ProviderTestKeySelection::Single(key.clone()),
+        _ => ProviderTestKeySelection::Multiple,
+    }
+}
+
+fn provider_test_return_mode(source: ProviderTestSource, provider_id: &str) -> Option<Mode> {
+    match source {
+        ProviderTestSource::Page => None,
+        ProviderTestSource::KeyList => Some(Mode::ProviderKeyList {
+            provider_id: provider_id.to_string(),
+        }),
+        ProviderTestSource::TestKeyList => Some(Mode::ProviderTestKeyList {
+            provider_id: provider_id.to_string(),
+        }),
+    }
+}
+
+fn provider_test_outcome_next_mode(
+    code: KeyCode,
+    provider_id: &str,
+    key_id: &str,
+    source: ProviderTestSource,
+    field: usize,
+) -> Mode {
+    if code == KeyCode::Char('q') {
+        provider_test_return_mode(source, provider_id).unwrap_or(Mode::Normal)
+    } else {
+        Mode::ProviderAnthropicTest {
+            provider_id: provider_id.to_string(),
+            key_id: key_id.to_string(),
+            source,
+            field,
+        }
+    }
+}
+
+fn model_fetch_state_for_models(models: &[String]) -> ModelFetchState {
+    if models.is_empty() {
+        ModelFetchState::Empty
+    } else {
+        ModelFetchState::Loaded
+    }
+}
+
+fn model_fetch_unavailable_message(error: &str) -> String {
+    format!(
+        "/v1/models unavailable: {}. Manual model entry still works.",
+        error
+    )
+}
+
+fn trim_model_context_suffix(model: &str) -> &str {
+    strip_model_1m_suffix(model)
+}
+
+fn complete_provider_test_model(models: &[String], current: &str) -> Option<String> {
+    let needle = current.trim();
+    if needle.is_empty() {
+        return models.first().cloned();
+    }
+
+    let needle_lower = needle.to_lowercase();
+    models
+        .iter()
+        .find(|model| model.eq_ignore_ascii_case(needle))
+        .cloned()
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| model.to_lowercase().contains(&needle_lower))
+                .cloned()
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmartProviderPaste {
+    name: String,
+    base_url: String,
+    key_name: String,
+    api_key: String,
+}
+
+fn parse_provider_smart_paste(raw: &str) -> Result<SmartProviderPaste> {
+    let input = raw.trim();
+    if input.starts_with("https://app.nextchat.dev/#/?settings=") {
+        return parse_nextchat_settings_url(input);
+    }
+    if input.starts_with("opencat://team/join?") {
+        return parse_opencat_join_url(input);
+    }
+    if input.starts_with("cherrystudio://providers/api-keys") {
+        return parse_cherrystudio_provider_url(input);
+    }
+    parse_newapi_provider_json(input)
+}
+
+fn parse_newapi_provider_json(input: &str) -> Result<SmartProviderPaste> {
+    let value: serde_json::Value = serde_json::from_str(input)?;
+    let base_url = value
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let api_key = value
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if base_url.is_empty() || api_key.is_empty() {
+        bail!("Smart paste needs JSON fields 'url' and 'key'.");
+    }
+
+    Ok(SmartProviderPaste {
+        name: inferred_provider_name(&base_url),
+        base_url,
+        key_name: "Default".to_string(),
+        api_key,
+    })
+}
+
+fn parse_cherrystudio_provider_url(input: &str) -> Result<SmartProviderPaste> {
+    let data = input
+        .split_once('?')
+        .map(|(_, query)| query)
+        .and_then(|query| {
+            query.split('&').find_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                (key == "data").then_some(value)
+            })
+        })
+        .ok_or_else(|| anyhow::anyhow!("Cherry Studio URL is missing data=."))?;
+    let decoded_param = percent_decode(data)?;
+    let decoded = URL_SAFE_NO_PAD.decode(decoded_param.as_bytes())?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded)?;
+
+    let base_url = value
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let api_key = value
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if base_url.is_empty() || api_key.is_empty() {
+        bail!("Cherry Studio data needs 'baseUrl' and 'apiKey'.");
+    }
+
+    Ok(SmartProviderPaste {
+        name: inferred_provider_name(&base_url),
+        base_url,
+        key_name: value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Default")
+            .to_string(),
+        api_key,
+    })
+}
+
+fn parse_nextchat_settings_url(input: &str) -> Result<SmartProviderPaste> {
+    let encoded = input
+        .split_once("#/?settings=")
+        .map(|(_, value)| value)
+        .ok_or_else(|| anyhow::anyhow!("NextChat URL is missing settings=."))?;
+    let decoded = percent_decode(encoded)?;
+    let value: serde_json::Value = serde_json::from_str(&decoded)?;
+    let base_url = value
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let api_key = value
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if base_url.is_empty() || api_key.is_empty() {
+        bail!("NextChat settings need 'url' and 'key'.");
+    }
+
+    Ok(SmartProviderPaste {
+        name: inferred_provider_name(&base_url),
+        base_url,
+        key_name: "Default".to_string(),
+        api_key,
+    })
+}
+
+fn parse_opencat_join_url(input: &str) -> Result<SmartProviderPaste> {
+    let query = input
+        .split_once('?')
+        .map(|(_, query)| query)
+        .ok_or_else(|| anyhow::anyhow!("OpenCat URL is missing query params."))?;
+    let mut base_url = String::new();
+    let mut api_key = String::new();
+    for part in query.split('&') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let decoded = percent_decode(value)?;
+        match key {
+            "domain" => base_url = decoded.trim().to_string(),
+            "token" => api_key = decoded.trim().to_string(),
+            _ => {}
+        }
+    }
+    if base_url.is_empty() || api_key.is_empty() {
+        bail!("OpenCat join URL needs 'domain' and 'token'.");
+    }
+
+    Ok(SmartProviderPaste {
+        name: inferred_provider_name(&base_url),
+        base_url,
+        key_name: "Default".to_string(),
+        api_key,
+    })
+}
+
+fn percent_decode(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3])?;
+                let value = u8::from_str_radix(hex, 16)?;
+                out.push(value);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Ok(String::from_utf8(out)?)
+}
+
+fn inferred_provider_name(base_url: &str) -> String {
+    base_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Provider")
+        .to_string()
+}
+
+fn model_has_1m_suffix(model: &str) -> bool {
+    model.trim_end().ends_with("[1m]")
+}
+
+fn strip_model_1m_suffix(model: &str) -> &str {
+    let trimmed = model.trim_end();
+    trimmed.strip_suffix("[1m]").unwrap_or(trimmed).trim_end()
+}
+
+fn apply_model_1m_flag(model: &str, enabled: bool) -> String {
+    let base = strip_model_1m_suffix(model).trim_end().to_string();
+    if base.is_empty() {
+        return base;
+    }
+    if enabled {
+        format!("{}[1m]", base)
+    } else {
+        base
+    }
+}
+
+fn display_ellipsize(s: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let target_width = max_width - 3;
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in s.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + char_width > target_width {
+            break;
+        }
+        out.push(ch);
+        width += char_width;
+    }
+    out.push_str("...");
+    out
+}
+
+fn display_pad(s: &str, width: usize) -> String {
+    let value = display_ellipsize(s, width);
+    let value_width = UnicodeWidthStr::width(value.as_str());
+    if value_width >= width {
+        value
+    } else {
+        format!("{}{}", value, " ".repeat(width - value_width))
+    }
+}
+
+fn mask_api_key(api_key: &str) -> String {
+    if api_key.chars().count() <= 12 {
+        return api_key.to_string();
+    }
+
+    let prefix: String = api_key.chars().take(6).collect();
+    let suffix: String = api_key
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{}...{}", prefix, suffix)
+}
+
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let w = area.width * percent_x / 100;
     Rect {
@@ -1906,5 +6089,363 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         y: area.y + (area.height.saturating_sub(height)) / 2,
         width: w,
         height: height.min(area.height),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smart_paste_parses_newapi_json() {
+        let base_url = "https://generated-provider.invalid";
+        let api_key = "sk-test-generated-key-000000000000000000000000";
+        let parsed = parse_provider_smart_paste(&format!(
+            r#"{{"_type":"newapi_channel_conn","key":"{}","url":"{}"}}"#,
+            api_key, base_url
+        ))
+        .unwrap();
+
+        assert_eq!(parsed.name, "generated-provider.invalid");
+        assert_eq!(parsed.base_url, base_url);
+        assert_eq!(parsed.api_key, api_key);
+        assert_eq!(parsed.key_name, "Default");
+    }
+
+    #[test]
+    fn smart_paste_parses_cherrystudio_url() {
+        let base_url = "https://generated-provider.invalid";
+        let api_key = "sk-test-generated-key-111111111111111111111111";
+        let data = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "id": "generated-api",
+                "baseUrl": base_url,
+                "apiKey": api_key,
+            })
+            .to_string(),
+        );
+        let parsed = parse_provider_smart_paste(&format!(
+            "cherrystudio://providers/api-keys?v=1&data={data}"
+        ))
+        .unwrap();
+
+        assert_eq!(parsed.name, "generated-provider.invalid");
+        assert_eq!(parsed.key_name, "generated-api");
+        assert_eq!(parsed.base_url, base_url);
+        assert_eq!(parsed.api_key, api_key);
+    }
+
+    #[test]
+    fn smart_paste_parses_nextchat_url() {
+        let base_url = "https://generated-provider.invalid";
+        let api_key = "sk-test-generated-key-555555555555555555555555";
+        let parsed = parse_provider_smart_paste(&format!(
+            "https://app.nextchat.dev/#/?settings={{%22key%22:%22{api_key}%22,%22url%22:%22https%3A%2F%2Fgenerated-provider.invalid%22}}"
+        ))
+        .unwrap();
+
+        assert_eq!(parsed.name, "generated-provider.invalid");
+        assert_eq!(parsed.key_name, "Default");
+        assert_eq!(parsed.base_url, base_url);
+        assert_eq!(parsed.api_key, api_key);
+    }
+
+    #[test]
+    fn smart_paste_parses_opencat_url() {
+        let base_url = "https://generated-provider.invalid";
+        let api_key = "sk-test-generated-key-666666666666666666666666";
+        let parsed = parse_provider_smart_paste(&format!(
+            "opencat://team/join?domain=https%3A%2F%2Fgenerated-provider.invalid&token={api_key}"
+        ))
+        .unwrap();
+
+        assert_eq!(parsed.name, "generated-provider.invalid");
+        assert_eq!(parsed.key_name, "Default");
+        assert_eq!(parsed.base_url, base_url);
+        assert_eq!(parsed.api_key, api_key);
+    }
+
+    #[test]
+    fn emacs_edit_handles_multiple_chinese_characters() {
+        let mut buf = String::new();
+        let mut pos = 0usize;
+
+        assert!(emacs_edit(
+            KeyCode::Char('白'),
+            KeyModifiers::empty(),
+            &mut buf,
+            &mut pos,
+            true
+        ));
+        assert_eq!(buf, "白");
+
+        assert!(emacs_edit(
+            KeyCode::Char('日'),
+            KeyModifiers::empty(),
+            &mut buf,
+            &mut pos,
+            true
+        ));
+        assert_eq!(buf, "白日");
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn emacs_edit_treats_ctrl_h_as_backspace() {
+        let mut buf = "Provider".to_string();
+        let mut pos = buf.len();
+
+        assert!(emacs_edit(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL,
+            &mut buf,
+            &mut pos,
+            true
+        ));
+
+        assert_eq!(buf, "Provide");
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn emacs_edit_treats_backspace_control_chars_as_backspace() {
+        for code in [KeyCode::Char('\u{8}'), KeyCode::Char('\u{7f}')] {
+            let mut buf = "Provider".to_string();
+            let mut pos = buf.len();
+
+            assert!(emacs_edit(
+                code,
+                KeyModifiers::empty(),
+                &mut buf,
+                &mut pos,
+                true
+            ));
+
+            assert_eq!(buf, "Provide");
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn emacs_edit_backspace_handles_utf8_in_small_add_dialog_buffers() {
+        let mut buf = "白日".to_string();
+        let mut pos = buf.len();
+
+        assert!(emacs_edit(
+            KeyCode::Backspace,
+            KeyModifiers::empty(),
+            &mut buf,
+            &mut pos,
+            true
+        ));
+
+        assert_eq!(buf, "白");
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn alias_input_still_filters_invalid_chars() {
+        let mut buf = String::new();
+        let mut pos = 0usize;
+
+        if 'x'.is_ascii_alphanumeric() || 'x' == '-' || 'x' == '_' {
+            emacs_edit(
+                KeyCode::Char('x'),
+                KeyModifiers::empty(),
+                &mut buf,
+                &mut pos,
+                true,
+            );
+        }
+        if '.'.is_ascii_alphanumeric() || '.' == '-' || '.' == '_' {
+            emacs_edit(
+                KeyCode::Char('.'),
+                KeyModifiers::empty(),
+                &mut buf,
+                &mut pos,
+                true,
+            );
+        }
+
+        assert_eq!(buf, "x");
+    }
+
+    #[test]
+    fn provider_test_key_selection_detects_empty_single_and_multiple() {
+        assert_eq!(
+            provider_test_key_selection(&[]),
+            ProviderTestKeySelection::NoKeys
+        );
+
+        let only = ProviderKey {
+            id: "key_one".into(),
+            name: "Default".into(),
+            api_key: "sk-test-generated-key-222222222222222222222222".into(),
+        };
+        assert_eq!(
+            provider_test_key_selection(std::slice::from_ref(&only)),
+            ProviderTestKeySelection::Single(only)
+        );
+
+        let many = vec![
+            ProviderKey {
+                id: "key_one".into(),
+                name: "A".into(),
+                api_key: "sk-test-generated-key-333333333333333333333333".into(),
+            },
+            ProviderKey {
+                id: "key_two".into(),
+                name: "B".into(),
+                api_key: "sk-test-generated-key-444444444444444444444444".into(),
+            },
+        ];
+        assert_eq!(
+            provider_test_key_selection(&many),
+            ProviderTestKeySelection::Multiple
+        );
+    }
+
+    #[test]
+    fn trim_model_context_suffix_removes_1m_suffix() {
+        assert_eq!(
+            trim_model_context_suffix("claude-3-7-sonnet[1m]"),
+            "claude-3-7-sonnet"
+        );
+        assert_eq!(
+            trim_model_context_suffix("claude-3-7-sonnet"),
+            "claude-3-7-sonnet"
+        );
+    }
+
+    #[test]
+    fn apply_model_1m_flag_normalizes_suffix() {
+        assert_eq!(
+            apply_model_1m_flag("claude-3-7-sonnet[1m]", false),
+            "claude-3-7-sonnet"
+        );
+        assert_eq!(
+            apply_model_1m_flag("claude-3-7-sonnet", true),
+            "claude-3-7-sonnet[1m]"
+        );
+        assert_eq!(
+            apply_model_1m_flag("claude-3-7-sonnet[1m]", true),
+            "claude-3-7-sonnet[1m]"
+        );
+    }
+
+    #[test]
+    fn complete_provider_test_model_prefers_exact_then_fuzzy_match() {
+        let models = vec![
+            "LongCat-2.0-Preview".to_string(),
+            "deepseek-ai/deepseek-v4-flash".to_string(),
+            "claude-3-7-sonnet".to_string(),
+        ];
+
+        assert_eq!(
+            complete_provider_test_model(&models, ""),
+            Some("LongCat-2.0-Preview".to_string())
+        );
+        assert_eq!(
+            complete_provider_test_model(&models, "claude-3-7-sonnet"),
+            Some("claude-3-7-sonnet".to_string())
+        );
+        assert_eq!(
+            complete_provider_test_model(&models, "deepseek-v4"),
+            Some("deepseek-ai/deepseek-v4-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_test_outcome_non_q_returns_to_same_form() {
+        assert_eq!(
+            provider_test_outcome_next_mode(
+                KeyCode::Enter,
+                "prov_generated",
+                "key_generated",
+                ProviderTestSource::KeyList,
+                1
+            ),
+            Mode::ProviderAnthropicTest {
+                provider_id: "prov_generated".into(),
+                key_id: "key_generated".into(),
+                source: ProviderTestSource::KeyList,
+                field: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_test_outcome_q_exits_to_parent_mode() {
+        assert_eq!(
+            provider_test_outcome_next_mode(
+                KeyCode::Char('q'),
+                "prov_generated",
+                "key_generated",
+                ProviderTestSource::KeyList,
+                0
+            ),
+            Mode::ProviderKeyList {
+                provider_id: "prov_generated".into(),
+            }
+        );
+        assert_eq!(
+            provider_test_outcome_next_mode(
+                KeyCode::Char('q'),
+                "prov_generated",
+                "key_generated",
+                ProviderTestSource::TestKeyList,
+                0
+            ),
+            Mode::ProviderTestKeyList {
+                provider_id: "prov_generated".into(),
+            }
+        );
+        assert_eq!(
+            provider_test_outcome_next_mode(
+                KeyCode::Char('q'),
+                "prov_generated",
+                "key_generated",
+                ProviderTestSource::Page,
+                0
+            ),
+            Mode::Normal
+        );
+    }
+
+    #[test]
+    fn model_fetch_unavailable_message_marks_manual_entry_possible() {
+        let message = model_fetch_unavailable_message("403 forbidden");
+
+        assert!(message.contains("/v1/models unavailable"));
+        assert!(message.contains("Manual model entry still works"));
+    }
+
+    #[test]
+    fn model_fetch_state_for_empty_models_is_empty() {
+        assert_eq!(model_fetch_state_for_models(&[]), ModelFetchState::Empty);
+    }
+
+    #[test]
+    fn model_fetch_state_for_non_empty_models_is_loaded() {
+        assert_eq!(
+            model_fetch_state_for_models(&["claude-3-7-sonnet".to_string()]),
+            ModelFetchState::Loaded
+        );
+    }
+
+    #[test]
+    fn provider_edit_cursor_pos_tracks_active_field() {
+        assert_eq!(
+            provider_edit_cursor_pos(0, "Provider Name", "https://example.invalid"),
+            "Provider Name".len()
+        );
+        assert_eq!(
+            provider_edit_cursor_pos(1, "Provider Name", "https://example.invalid"),
+            "https://example.invalid".len()
+        );
+        assert_eq!(
+            provider_edit_cursor_pos(2, "Provider Name", "https://example.invalid"),
+            0
+        );
     }
 }

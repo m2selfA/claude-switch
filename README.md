@@ -51,8 +51,12 @@ cswitch add --full work
 # Create a lightweight profile (env-var based, interactive prompts)
 cswitch add my-api-key --alias mykey
 
-# Launch with a profile (with stored launch args)
-cswitch use -e work
+# Launch with a profile (stored launch args are enabled by default)
+cswitch use work
+
+# Or create a provider-backed lightweight profile and link a key
+cswitch provider add openrouter --url https://openrouter.ai/api --key sk-...
+cswitch provider link mykey --provider prov_12345678 --key key_12345678
 
 # Or open the interactive TUI
 cswitch
@@ -66,11 +70,22 @@ cswitch
 | `cswitch add <name>` | Add a lightweight profile (env vars, interactive prompts) |
 | `cswitch add --full <name>` | Add a full profile (copies ~/.claude) |
 | `cswitch add --alias <a> <name>` | Add with a short CLI-friendly alias |
-| `cswitch use [-e] <name> [-- <claude-args>]` | Launch Claude Code with a profile; `-e` enables stored launch args |
+| `cswitch use <name> [-- <claude-args>]` | Launch Claude Code with a profile; stored launch args are enabled by default |
+| `cswitch use --no-extras <name>` | Launch without the profile's stored launch args |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
-| `cswitch aliases` | Generate shell aliases / sync self-contained wrappers |
+| `cswitch aliases [--remote <host>] [--verbose]` | Generate local shell aliases, or sync remote shims via ssh/scp/sftp when `--remote` is supplied |
+| `cswitch provider list` | List shared API providers |
+| `cswitch provider add <name> --url <url> --key <key>` | Add a shared provider with an initial key |
+| `cswitch provider keys <provider-id>` | List keys for a provider |
+| `cswitch provider add-key <provider-id> --name <name> --key <key>` | Add another key to a provider |
+| `cswitch provider edit <provider-id> [--name <name>] [--url <url>]` | Edit a provider's name or base URL |
+| `cswitch provider edit-key <provider-id> <key-id> [--name <name>] [--key <key>]` | Edit a provider key's name or token |
+| `cswitch provider remove <provider-id>` | Remove a provider |
+| `cswitch provider remove-key <provider-id> <key-id>` | Remove a key from a provider |
+| `cswitch provider link <profile> --provider <provider-id> --key <key-id>` | Link a lightweight profile to a provider key |
+| `cswitch provider unlink <profile>` | Remove provider/key association from a profile |
 | `cswitch --help` | Full CLI help |
 
 ## Interactive TUI
@@ -82,14 +97,17 @@ Run `cswitch` with no arguments to open the TUI.
 | Key | Action |
 |---|---|
 | `↑/↓` or `j/k` | Navigate profiles |
-| `Enter` | Launch Claude with selected profile |
-| `Shift+Enter` | Launch with stored launch args |
+| `Enter` | Launch Claude with selected profile and stored launch args |
+| `Shift+Enter` | Launch without stored launch args |
 | `/` | Search profiles by name or alias |
-| `t` | Add lightweight profile (env vars) |
+| `t` | Add lightweight profile from provider/key |
+| `Ctrl+Y` | Smart input provider/key from clipboard in Provider Manager |
+| `Provider Manager: t` | Discover models from provider-aware candidate endpoints; failure does not prove the provider is unusable, and manual model names may still work |
 | `a` | Add full profile (directory isolation) |
 | `e` | Edit profile (name/alias/flags, or full model editor for lite) |
 | `m` | Toggle [1m] suffix on model slots |
 | `Tab` | Complete: cycle model IDs / env vars / CLI flags |
+| `Shift+Tab` | Switch between profile and provider managers |
 | `r` | Refresh — re-copy ~/.claude into selected |
 | `d` | Delete selected profile |
 | `?` | Help overlay |
@@ -117,9 +135,21 @@ claude-work       # launch with the "work" profile
 claude-personal   # launch with the "personal" profile
 ```
 
-On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs self-contained `.cmd` files into `~/.local/bin` (`%USERPROFILE%\.local\bin`). Each `.cmd` is fully stand-alone (no dependency on `cswitch`) and supports `-e`/`--extra` for stored launch args. The files are maintained automatically — added, updated, and cleaned up when profiles change.
+On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs self-contained `.cmd` files into `~/.local/bin` (`%USERPROFILE%\.local\bin`). Each `.cmd` is fully stand-alone (no dependency on `cswitch`) and supports `--no-extras` to skip stored launch args. The files are maintained automatically — added, updated, and cleaned up when profiles change.
 
-On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs self-contained bash scripts there instead of printing aliases. Each script is executable, stand-alone, supports `-e`/`--extra`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
+On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs self-contained bash scripts there instead of printing aliases. Each script is executable, stand-alone, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
+
+You can also sync shims to a remote machine with:
+
+```bash
+cswitch aliases --remote my-host
+```
+
+This uses your existing local `ssh`, `scp`, and `sftp` commands. With `--remote`, `cswitch` only syncs the remote machine; it does not print local aliases. Remote sync currently supports lightweight profiles only and skips full directory-isolated profiles. It probes the remote OS first and keeps the default output concise; add `--verbose` to see per-stage and per-file sync details:
+- remote Unix-like hosts receive shell shims in `~/.varusers/bin`
+- remote Windows hosts receive `.cmd` shims in `%USERPROFILE%\.local\bin`
+
+Only managed shim files with the generated `claude-` prefix are considered for stale cleanup.
 
 ## How profiles are stored
 
@@ -129,6 +159,11 @@ Profiles are tracked in `~/.claude-switch/registry.json`, keyed by UUID. Each pr
 - `alias` — optional short CLI-friendly name (alphanumeric, `-`, `_`)
 - `kind` — `full` or `lightweight`
 - `launch_args` — optional CLI flags passed to claude on launch (e.g. `--dangerously-skip-permissions`)
+- `provider_id` / `key_id` — optional shared provider/key reference for lightweight profiles
+
+Shared providers are tracked in the same registry. A provider stores a base URL and one or more named API keys; lightweight profiles can link to a specific key while keeping their model and extra env-var settings separate.
+
+Clipboard-driven provider import is also available in the TUI Provider Manager via `Ctrl+Y`.
 
 ### Full profiles
 
@@ -136,7 +171,7 @@ Stored in `~/.claude-switch/profiles/<alias-or-name>/`. Launch sets `CLAUDE_CONF
 
 ### Lightweight profiles
 
-No directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` JSON on launch.
+No directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` JSON on launch. Token and base URL can also come from a linked shared provider/key.
 
 Nothing in `~/.claude` is modified.
 
