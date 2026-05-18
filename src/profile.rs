@@ -1348,7 +1348,6 @@ impl ProfileManager {
 
     /// Build the `--settings` JSON for a lightweight profile (mirrors
     /// `launch_claude`), then escape it for embedding in a CMD command line.
-    #[cfg(target_os = "windows")]
     fn build_escaped_settings(
         env: &LightweightEnv,
         token: Option<&str>,
@@ -1414,7 +1413,6 @@ impl ProfileManager {
     }
 
     /// Generate the content of a self-contained `.cmd` file for a profile.
-    #[cfg(target_os = "windows")]
     fn generate_cmd_content(&self, profile: &Profile) -> Result<String> {
         let kind_label = if profile.kind == ProfileKind::Full {
             "full"
@@ -3416,5 +3414,20 @@ mod tests {
         assert_eq!(batch.matches("put ").count(), 2);
         assert!(batch.contains("chmod 755 \"/share/home/shark/.varusers/bin/claude-work\""));
         assert!(batch.contains("chmod 755 \"/share/home/shark/.varusers/bin/claude-play\""));
+    }
+
+    #[test]
+    fn generate_cmd_content_available_for_remote_windows_shims_on_non_windows_hosts() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let lite = mgr
+            .create_lightweight_profile("lite", Some("lite-alias"), LightweightEnv::default())
+            .unwrap();
+
+        let content = mgr.generate_cmd_content(&lite).unwrap();
+
+        assert!(content.contains("@echo off"));
+        assert!(content.contains(CMD_MARKER));
+        assert!(content.contains("claude"));
     }
 }
