@@ -1329,7 +1329,6 @@ impl ProfileManager {
     /// `"` as `\"` so the Windows C runtime preserves them when the child
     /// process parses argv.  Also escapes `%` (`%%`) and `!` (`^!`) so the
     /// batch-file parser passes them through.
-    #[cfg(target_os = "windows")]
     fn escape_cmd_json_arg(json: &str) -> String {
         let mut out = String::with_capacity(json.len() + 16);
         out.push('"');
@@ -3429,5 +3428,32 @@ mod tests {
         assert!(content.contains("@echo off"));
         assert!(content.contains(CMD_MARKER));
         assert!(content.contains("claude"));
+    }
+
+    #[test]
+    fn generate_cmd_content_escapes_settings_for_remote_windows_shims() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let lite = mgr
+            .create_lightweight_profile(
+                "lite",
+                Some("lite-alias"),
+                LightweightEnv {
+                    model: Some("claude-sonnet-4".into()),
+                    extras: vec![
+                        "PERCENT=value%with%percent".into(),
+                        "BANG=value!with!bang".into(),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let content = mgr.generate_cmd_content(&lite).unwrap();
+
+        assert!(content.contains("--settings "));
+        assert!(content.contains("PERCENT"));
+        assert!(content.contains("%%with%%percent"));
+        assert!(content.contains("^!with^!bang"));
     }
 }
