@@ -96,7 +96,8 @@ Run `cswitch` with no arguments to open the TUI.
 
 | Key | Action |
 |---|---|
-| `↑/↓` or `j/k` | Navigate profiles |
+| `Ctrl+P/N` | Navigate lists and selections |
+| `↑/↓` | Compatibility navigation keys |
 | `Enter` | Launch Claude with selected profile and stored launch args |
 | `Shift+Enter` | Launch without stored launch args |
 | `/` | Search profiles by name or alias |
@@ -106,12 +107,18 @@ Run `cswitch` with no arguments to open the TUI.
 | `a` | Add full profile (directory isolation) |
 | `e` | Edit profile (name/alias/flags, or full model editor for lite) |
 | `m` | Toggle [1m] suffix on model slots |
-| `Tab` | Complete: cycle model IDs / env vars / CLI flags |
+| `Tab` | Move to the next field, or complete/cycle values in model/provider editing flows |
+| `Ctrl+P/N` | Move between fields in multi-step forms; in model test, also browse fetched models when the model field is focused |
+| `Ctrl+A/E/B/F` | Move cursor in text fields |
+| `Ctrl+H/D/K/U/W` | Edit text in Emacs style |
+| `Ctrl+G` | Cancel or go back |
 | `Shift+Tab` | Switch between profile and provider managers |
 | `r` | Refresh — re-copy ~/.claude into selected |
 | `d` | Delete selected profile |
 | `?` | Help overlay |
 | `q` / `Esc` | Quit |
+
+`j/k` is still accepted in some pure list views for compatibility, but it is no longer the documented primary navigation scheme.
 
 ## Shell aliases
 

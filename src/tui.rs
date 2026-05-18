@@ -519,6 +519,71 @@ impl App {
         }
     }
 
+    fn is_manager_switch_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+        matches!(code, KeyCode::BackTab)
+            || (code == KeyCode::Tab && modifiers.contains(KeyModifiers::SHIFT))
+    }
+
+    fn mode_allows_manager_switch(&self) -> bool {
+        matches!(self.mode, Mode::Normal | Mode::Search | Mode::ProviderList)
+    }
+
+    fn switch_manager_page(&mut self) -> Result<()> {
+        self.page = match self.page {
+            Page::ProfileManager => {
+                self.providers_cache = self.manager.list_providers().unwrap_or_default();
+                self.provider_list_state = ListState::default();
+                if !self.providers_cache.is_empty() {
+                    self.provider_list_state.select(Some(0));
+                }
+                Page::ProviderManager
+            }
+            Page::ProviderManager => {
+                self.refresh()?;
+                Page::ProfileManager
+            }
+        };
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    fn handle_manager_switch_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<bool> {
+        if !Self::is_manager_switch_key(code, modifiers) || !self.mode_allows_manager_switch() {
+            return Ok(false);
+        }
+        self.switch_manager_page()?;
+        Ok(true)
+    }
+
+    fn is_cancel_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+        matches!(code, KeyCode::Esc)
+            || (code == KeyCode::Char('g') && modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    fn is_prev_list_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+        matches!(code, KeyCode::Up | KeyCode::Char('k'))
+            || (code == KeyCode::Char('p') && modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    fn is_next_list_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+        matches!(code, KeyCode::Down | KeyCode::Char('j'))
+            || (code == KeyCode::Char('n') && modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    fn is_prev_field_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+        matches!(code, KeyCode::Up)
+            || (code == KeyCode::Char('p') && modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    fn is_next_field_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+        matches!(code, KeyCode::Down)
+            || (code == KeyCode::Char('n') && modifiers.contains(KeyModifiers::CONTROL))
+    }
+
     fn select_by_id(&mut self, id: &str) {
         if let Some(fi) = self
             .filtered_indices
@@ -704,32 +769,8 @@ impl App {
                         continue;
                     }
 
-                    // Shift+Tab: switch page (only in Normal/Search/ProviderList)
-                    if (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
-                        || key.code == KeyCode::BackTab
-                    {
-                        match (&self.mode, self.page) {
-                            (Mode::Normal | Mode::Search, _) | (Mode::ProviderList, _) => {
-                                self.page = match self.page {
-                                    Page::ProfileManager => {
-                                        self.providers_cache =
-                                            self.manager.list_providers().unwrap_or_default();
-                                        self.provider_list_state = ListState::default();
-                                        if !self.providers_cache.is_empty() {
-                                            self.provider_list_state.select(Some(0));
-                                        }
-                                        Page::ProviderManager
-                                    }
-                                    Page::ProviderManager => {
-                                        self.refresh()?;
-                                        Page::ProfileManager
-                                    }
-                                };
-                                self.mode = Mode::Normal;
-                                continue;
-                            }
-                            _ => {}
-                        }
+                    if self.handle_manager_switch_key(key.code, key.modifiers)? {
+                        continue;
                     }
 
                     match &self.mode.clone() {
@@ -781,7 +822,7 @@ impl App {
                             self.handle_provider_anthropic_test(key.code, key.modifiers)?;
                         }
                         Mode::ProviderAnthropicOutcome { .. } => {
-                            self.handle_provider_anthropic_outcome(key.code)?;
+                            self.handle_provider_anthropic_outcome(key.code, key.modifiers)?;
                         }
                         Mode::EditProfile { .. } => {
                             self.handle_edit_profile(key.code, key.modifiers)?;
@@ -864,10 +905,8 @@ impl App {
 
     fn handle_profile_page_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         match code {
-            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_down(),
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => self.move_up(),
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => self.move_down(),
+            _ if Self::is_prev_list_key(code, modifiers) => self.move_up(),
+            _ if Self::is_next_list_key(code, modifiers) => self.move_down(),
 
             KeyCode::Char('/') => {
                 self.search_query.clear();
@@ -1055,14 +1094,8 @@ impl App {
         modifiers: KeyModifiers,
     ) -> Result<bool> {
         match code {
-            KeyCode::Up | KeyCode::Char('k') => self.move_provider_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_provider_down(),
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_provider_up()
-            }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_provider_down()
-            }
+            _ if Self::is_prev_list_key(code, modifiers) => self.move_provider_up(),
+            _ if Self::is_next_list_key(code, modifiers) => self.move_provider_down(),
 
             KeyCode::Enter => {
                 if let Some(p) = self
@@ -1149,7 +1182,7 @@ impl App {
             return Ok(true);
         }
         match code {
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 self.search_query.clear();
                 self.cursor_pos = 0;
                 self.apply_filter();
@@ -1158,14 +1191,8 @@ impl App {
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
             }
-            KeyCode::Up | KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_up();
-            }
-            KeyCode::Down | KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_down();
-            }
-            KeyCode::Up => self.move_up(),
-            KeyCode::Down => self.move_down(),
+            _ if Self::is_prev_list_key(code, modifiers) => self.move_up(),
+            _ if Self::is_next_list_key(code, modifiers) => self.move_down(),
             _ => {
                 if emacs_edit(
                     code,
@@ -1215,7 +1242,7 @@ impl App {
                 self.input_buffer.clear();
                 self.mode = Mode::AddFullAlias;
             }
-            KeyCode::Esc => self.mode = Mode::Normal,
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
             _ => {
                 emacs_edit(
                     code,
@@ -1249,7 +1276,7 @@ impl App {
                     Err(e) => self.mode = Mode::Message(e.to_string(), true),
                 }
             }
-            KeyCode::Esc => self.mode = Mode::Normal,
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
             _ => {
                 if let KeyCode::Char(c) = code {
                     if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -1298,7 +1325,7 @@ impl App {
         // 3 steps: 0=name, 1=alias, 2=launch_args
         let total_steps: usize = 3;
         match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
             KeyCode::Enter => {
                 let step = match &self.mode {
                     Mode::EditProfile { step, .. } => *step,
@@ -1356,7 +1383,9 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab | KeyCode::Down => {
+            KeyCode::Tab | KeyCode::Char('n')
+                if code == KeyCode::Tab || modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 let next_step = match &self.mode {
                     Mode::EditProfile { step, .. } => (step + 1) % total_steps,
                     _ => return Ok(()),
@@ -1374,7 +1403,7 @@ impl App {
                     _ => return Ok(()),
                 };
             }
-            KeyCode::Up | KeyCode::BackTab => {
+            _ if Self::is_prev_field_key(code, modifiers) => {
                 // Backward cycle
                 let step = match &self.mode {
                     Mode::EditProfile { step, .. } => *step,
@@ -1471,15 +1500,9 @@ impl App {
         }
 
         match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Up | KeyCode::Char('k') => self.move_provider_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_provider_down(),
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_provider_up()
-            }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_provider_down()
-            }
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
+            _ if Self::is_prev_list_key(code, modifiers) => self.move_provider_up(),
+            _ if Self::is_next_list_key(code, modifiers) => self.move_provider_down(),
             KeyCode::Enter => {
                 let provider = self
                     .provider_list_state
@@ -1525,15 +1548,9 @@ impl App {
         }
 
         match code {
-            KeyCode::Esc => self.mode = Mode::LiteProviderSelect,
-            KeyCode::Up | KeyCode::Char('k') => self.move_provider_key_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_provider_key_down(),
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_provider_key_up()
-            }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_provider_key_down()
-            }
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::LiteProviderSelect,
+            _ if Self::is_prev_list_key(code, modifiers) => self.move_provider_key_up(),
+            _ if Self::is_next_list_key(code, modifiers) => self.move_provider_key_down(),
             KeyCode::Enter => {
                 let Some(key) = self.selected_provider_key().cloned() else {
                     return Ok(());
@@ -1558,10 +1575,10 @@ impl App {
         let total_steps: usize = 11;
 
         match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
 
             // Slot navigation
-            KeyCode::Down | KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if Self::is_next_field_key(code, modifiers) => {
                 self.lite_step = (self.lite_step + 1) % total_steps;
                 self.cursor_pos = match self.lite_step {
                     0 => self.lite_name.len(),
@@ -1576,7 +1593,7 @@ impl App {
                     _ => 0,
                 };
             }
-            KeyCode::Up | KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if Self::is_prev_field_key(code, modifiers) => {
                 self.lite_step = if self.lite_step == 0 {
                     total_steps - 1
                 } else {
@@ -2729,7 +2746,11 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let keys: Vec<(&str, &str)> = if self.mode == Mode::Search {
-            vec![("↑/↓", "navigate"), ("enter", "confirm"), ("esc", "clear")]
+            vec![
+                ("Ctrl+P/N", "navigate"),
+                ("enter", "confirm"),
+                ("esc/Ctrl+G", "clear"),
+            ]
         } else if matches!(self.mode, Mode::ProviderAnthropicOutcome { .. }) {
             vec![("any key", "back"), ("q", "quit")]
         } else if matches!(self.mode, Mode::ProviderAnthropicTest { .. }) {
@@ -2738,22 +2759,22 @@ impl App {
                 ("Tab", "complete"),
                 ("PgUp/PgDn", "page"),
                 ("enter", "send"),
-                ("esc", "back"),
+                ("esc/Ctrl+G", "back"),
                 ("q", "quit"),
             ]
         } else if let Mode::ProviderKeyList { .. } = &self.mode {
             vec![
-                ("↑↓/jk", "nav"),
+                ("Ctrl+P/N", "nav"),
                 ("a", "add key"),
                 ("e", "edit key"),
                 ("d", "delete key"),
                 ("t", "test"),
-                ("esc", "back"),
+                ("esc/Ctrl+G", "back"),
             ]
         } else {
             match self.page {
                 Page::ProfileManager => vec![
-                    ("↑↓/jk", "nav"),
+                    ("Ctrl+P/N", "nav"),
                     ("enter", "launch"),
                     ("Shift+Enter", "w/o args"),
                     ("/", "search"),
@@ -2768,7 +2789,7 @@ impl App {
                     ("q", "quit"),
                 ],
                 Page::ProviderManager => vec![
-                    ("↑↓/jk", "nav"),
+                    ("Ctrl+P/N", "nav"),
                     ("enter", "keys"),
                     ("a", "add"),
                     ("t", "test"),
@@ -2814,7 +2835,8 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let help_entries: Vec<(&str, &str)> = vec![
-            ("↑/↓  j/k", "Navigate profiles"),
+            ("Ctrl+P/N", "Navigate lists and selections"),
+            ("↑/↓", "Compatibility navigation keys"),
             ("Enter", "Launch with stored flags (default)"),
             ("Shift+Enter", "Launch without stored flags"),
             ("/", "Search profiles by name or alias"),
@@ -2827,6 +2849,9 @@ impl App {
             ("a", "Add full (directory-isolated) profile"),
             ("e", "Edit profile (name/alias, or models for lite)"),
             ("m", "Toggle [1m] suffix (lightweight profiles)"),
+            ("Ctrl+A/E/B/F", "Move cursor in text fields"),
+            ("Ctrl+H/D/K/U/W", "Edit text in Emacs style"),
+            ("Ctrl+G / Esc", "Cancel or go back"),
             ("Shift+Tab", "Switch profile/provider manager"),
             ("r", "Refresh — re-copy ~/.claude into selected"),
             ("d / Del", "Delete selected profile"),
@@ -2929,7 +2954,7 @@ impl App {
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Any characters allowed. Enter to continue, Esc to cancel.",
+                    "  Any characters allowed. Enter to continue, Esc/Ctrl+G to cancel.",
                     Style::default().fg(DIM),
                 )),
             ]))
@@ -2968,7 +2993,7 @@ impl App {
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Short CLI-friendly name (a-z, 0-9, -, _). Enter to skip.",
+                    "  Short CLI-friendly name (a-z, 0-9, -, _). Enter to skip. Esc/Ctrl+G cancels.",
                     Style::default().fg(DIM),
                 )),
             ]))
@@ -3040,7 +3065,7 @@ impl App {
                 ),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  ↑/↓/Tab to switch  Enter to save  Esc to cancel",
+                    "  Ctrl+P/N fields  Tab next  Enter save  Esc/Ctrl+G cancel",
                     Style::default().fg(DIM),
                 )),
             ]))
@@ -3141,7 +3166,7 @@ impl App {
             Paragraph::new(Line::from(vec![
                 Span::styled("  Enter", Style::default().fg(ACCENT).bold()),
                 Span::styled(" select provider  ", Style::default().fg(DIM)),
-                Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+                Span::styled("Esc/Ctrl+G", Style::default().fg(ACCENT).bold()),
                 Span::styled(" cancel", Style::default().fg(DIM)),
             ])),
             hint_area,
@@ -3220,7 +3245,7 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled("  Enter", Style::default().fg(ACCENT).bold()),
             Span::styled(" continue  ", Style::default().fg(DIM)),
-            Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+            Span::styled("Esc/Ctrl+G", Style::default().fg(ACCENT).bold()),
             Span::styled(" back to providers", Style::default().fg(DIM)),
         ]));
 
@@ -3247,7 +3272,7 @@ impl App {
                     Style::default().fg(TEXT),
                 )),
                 Line::from(Span::styled(
-                    "  Press Esc to skip",
+                    "  Press Esc/Ctrl+G to skip",
                     Style::default().fg(DIM),
                 )),
             ]))
@@ -3544,7 +3569,7 @@ impl App {
         ]));
         if prov_focus {
             lines.push(Line::from(Span::styled(
-                "  Tab=cycle provider  Backspace=clear  ↑↓/Cp/Cn=previous field",
+                "  Tab=cycle provider  Backspace=clear  Ctrl+P/N=move fields",
                 Style::default().fg(DIM),
             )));
         }
@@ -3576,7 +3601,7 @@ impl App {
         ]));
         if key_focus && self.lite_provider_id.is_some() {
             lines.push(Line::from(Span::styled(
-                "  Tab=cycle key  ↑↓/Cp/Cn=previous field",
+                "  Tab=cycle key  Ctrl+P/N=move fields",
                 Style::default().fg(DIM),
             )));
         } else if key_focus {
@@ -3588,15 +3613,16 @@ impl App {
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("  ↑↓/", Style::default().fg(DIM)),
-            Span::styled("Cp/Cn", Style::default().fg(ACCENT).bold()),
-            Span::styled(" nav  ", Style::default().fg(DIM)),
+            Span::styled("  Ctrl+P/N", Style::default().fg(ACCENT).bold()),
+            Span::styled(" fields  ", Style::default().fg(DIM)),
             Span::styled("Tab", Style::default().fg(ACCENT).bold()),
             Span::styled(" complete  ", Style::default().fg(DIM)),
             Span::styled("Cm", Style::default().fg(ACCENT).bold()),
             Span::styled(" 1m  ", Style::default().fg(DIM)),
             Span::styled("Enter", Style::default().fg(ACCENT).bold()),
-            Span::styled(" save", Style::default().fg(DIM)),
+            Span::styled(" save  ", Style::default().fg(DIM)),
+            Span::styled("Esc/Ctrl+G", Style::default().fg(ACCENT).bold()),
+            Span::styled(" cancel", Style::default().fg(DIM)),
         ]));
 
         f.render_widget(Paragraph::new(lines).block(block), area);
@@ -3642,15 +3668,9 @@ impl App {
 
     fn handle_provider_list(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Up | KeyCode::Char('k') => self.move_provider_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_provider_down(),
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_provider_up()
-            }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_provider_down()
-            }
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
+            _ if Self::is_prev_list_key(code, modifiers) => self.move_provider_up(),
+            _ if Self::is_next_list_key(code, modifiers) => self.move_provider_down(),
             KeyCode::Enter => {
                 let pid = self
                     .provider_list_state
@@ -3711,24 +3731,38 @@ impl App {
     }
 
     fn handle_provider_add(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        let step = match &self.mode {
+            Mode::ProviderAdd { step } => *step,
+            _ => 0,
+        };
+        let total_steps = if self.provider_add_existing_id.is_some() {
+            1
+        } else {
+            4
+        };
+
         match code {
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 if self.page == Page::ProviderManager {
                     self.mode = Mode::Normal;
                 } else {
                     self.mode = Mode::ProviderList;
                 }
             }
+            KeyCode::Tab | KeyCode::Char('n')
+                if total_steps > 1
+                    && (code == KeyCode::Tab || modifiers.contains(KeyModifiers::CONTROL)) =>
+            {
+                self.mode = Mode::ProviderAdd {
+                    step: (step + 1) % total_steps,
+                };
+            }
+            _ if total_steps > 1 && Self::is_prev_field_key(code, modifiers) => {
+                self.mode = Mode::ProviderAdd {
+                    step: (step + total_steps - 1) % total_steps,
+                };
+            }
             KeyCode::Enter => {
-                let step = match &self.mode {
-                    Mode::ProviderAdd { step } => *step,
-                    _ => 0,
-                };
-                let total_steps = if self.provider_add_existing_id.is_some() {
-                    1
-                } else {
-                    4
-                };
                 if step + 1 == total_steps {
                     let name = self.provider_name_buf.trim().to_string();
                     let url = self.provider_url_buf.trim().to_string();
@@ -3770,10 +3804,6 @@ impl App {
                 }
             }
             _ => {
-                let step = match &self.mode {
-                    Mode::ProviderAdd { step } => *step,
-                    _ => 0,
-                };
                 let buf = match step {
                     0 if self.provider_add_existing_id.is_some() => &mut self.provider_key_name_buf,
                     0 => &mut self.provider_name_buf,
@@ -3803,7 +3833,7 @@ impl App {
         }
 
         match code {
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 self.reset_provider_smart_input();
                 self.mode = if self.page == Page::ProviderManager {
                     Mode::Normal
@@ -4041,7 +4071,7 @@ impl App {
             KeyCode::Char('q') => {
                 self.mode = provider_test_return_mode(source, &provider_id).unwrap_or(Mode::Normal);
             }
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 self.mode = provider_test_return_mode(source, &provider_id).unwrap_or(Mode::Normal);
             }
             KeyCode::Enter => {
@@ -4117,7 +4147,7 @@ impl App {
                     self.cursor_pos = self.provider_test_model_buf.len();
                 }
             }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if Self::is_next_field_key(code, modifiers) => {
                 let next_field = (field + 1) % 2;
                 self.cursor_pos = if next_field == 0 {
                     self.provider_test_model_buf.len()
@@ -4131,8 +4161,8 @@ impl App {
                     field: next_field,
                 };
             }
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                let next_field = (field + 1) % 2;
+            _ if Self::is_prev_field_key(code, modifiers) => {
+                let next_field = if field == 0 { 1 } else { field - 1 };
                 self.cursor_pos = if next_field == 0 {
                     self.provider_test_model_buf.len()
                 } else {
@@ -4145,7 +4175,7 @@ impl App {
                     field: next_field,
                 };
             }
-            KeyCode::Up | KeyCode::Char('k') if field == 0 => {
+            _ if field == 0 && Self::is_prev_list_key(code, modifiers) => {
                 if !self.provider_test_models.is_empty() {
                     if self.provider_test_model_selected == 0 {
                         self.provider_test_model_selected = self.provider_test_models.len() - 1;
@@ -4157,7 +4187,7 @@ impl App {
                     self.cursor_pos = self.provider_test_model_buf.len();
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') if field == 0 => {
+            _ if field == 0 && Self::is_next_list_key(code, modifiers) => {
                 if !self.provider_test_models.is_empty() {
                     self.provider_test_model_selected =
                         (self.provider_test_model_selected + 1) % self.provider_test_models.len();
@@ -4178,7 +4208,11 @@ impl App {
         Ok(())
     }
 
-    fn handle_provider_anthropic_outcome(&mut self, code: KeyCode) -> Result<()> {
+    fn handle_provider_anthropic_outcome(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
         let (provider_id, key_id, source, field) = match &self.mode {
             Mode::ProviderAnthropicOutcome {
                 provider_id,
@@ -4190,7 +4224,8 @@ impl App {
             _ => return Ok(()),
         };
 
-        self.mode = provider_test_outcome_next_mode(code, &provider_id, &key_id, source, field);
+        self.mode =
+            provider_test_outcome_next_mode(code, modifiers, &provider_id, &key_id, source, field);
         if matches!(self.mode, Mode::ProviderAnthropicTest { field: 0, .. }) {
             self.cursor_pos = self.provider_test_model_buf.len();
         } else if matches!(self.mode, Mode::ProviderAnthropicTest { field: 1, .. }) {
@@ -4208,6 +4243,7 @@ impl App {
 
         if step < 2
             && !matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab)
+            && !(code == KeyCode::Char('g') && modifiers.contains(KeyModifiers::CONTROL))
             && emacs_edit(
                 code,
                 modifiers,
@@ -4224,14 +4260,7 @@ impl App {
         }
 
         match code {
-            KeyCode::Esc => {
-                let name = self.provider_name_buf.trim().to_string();
-                if !name.is_empty() {
-                    let _ = self
-                        .manager
-                        .update_provider(&pid, &name, self.provider_url_buf.trim());
-                }
-                self.sync_shims();
+            _ if Self::is_cancel_key(code, modifiers) => {
                 self.providers_cache = self.manager.list_providers().unwrap_or_default();
                 if self.page == Page::ProviderManager {
                     self.mode = Mode::Normal;
@@ -4239,7 +4268,7 @@ impl App {
                     self.mode = Mode::ProviderList;
                 }
             }
-            KeyCode::Enter | KeyCode::Tab => {
+            KeyCode::Enter => {
                 if step == 2 {
                     let name = self.provider_name_buf.trim().to_string();
                     if !name.is_empty() {
@@ -4266,6 +4295,18 @@ impl App {
                         step: next_step,
                     };
                 }
+            }
+            KeyCode::Tab if step < 2 => {
+                let next_step = step + 1;
+                self.cursor_pos = provider_edit_cursor_pos(
+                    next_step,
+                    &self.provider_name_buf,
+                    &self.provider_url_buf,
+                );
+                self.mode = Mode::ProviderEdit {
+                    provider_id: pid,
+                    step: next_step,
+                };
             }
             KeyCode::Char('a') if step == 2 => {
                 // Add key from within edit
@@ -4302,25 +4343,15 @@ impl App {
                     };
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') if step == 2 && self.provider_key_selected > 0 => {
-                self.provider_key_selected -= 1;
-            }
-            KeyCode::Char('p')
-                if step == 2
-                    && modifiers.contains(KeyModifiers::CONTROL)
-                    && self.provider_key_selected > 0 =>
+            _ if step == 2
+                && Self::is_prev_list_key(code, modifiers)
+                && self.provider_key_selected > 0 =>
             {
                 self.provider_key_selected -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if step == 2 && self.provider_key_selected + 1 < self.provider_keys_cache.len() =>
-            {
-                self.provider_key_selected += 1;
-            }
-            KeyCode::Char('n')
-                if step == 2
-                    && modifiers.contains(KeyModifiers::CONTROL)
-                    && self.provider_key_selected + 1 < self.provider_keys_cache.len() =>
+            _ if step == 2
+                && Self::is_next_list_key(code, modifiers)
+                && self.provider_key_selected + 1 < self.provider_keys_cache.len() =>
             {
                 self.provider_key_selected += 1;
             }
@@ -4339,7 +4370,7 @@ impl App {
             _ => return Ok(()),
         };
         match code {
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
                 self.provider_key_selected = 0;
                 self.cursor_pos =
@@ -4347,6 +4378,28 @@ impl App {
                 self.mode = Mode::ProviderEdit {
                     provider_id: pid,
                     step: 2,
+                };
+            }
+            KeyCode::Tab | KeyCode::Char('n')
+                if code == KeyCode::Tab || modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let step = match &self.mode {
+                    Mode::ProviderEditKeyInput { step, .. } => *step,
+                    _ => 0,
+                };
+                self.mode = Mode::ProviderEditKeyInput {
+                    provider_id: pid,
+                    step: (step + 1) % 2,
+                };
+            }
+            _ if Self::is_prev_field_key(code, modifiers) => {
+                let step = match &self.mode {
+                    Mode::ProviderEditKeyInput { step, .. } => *step,
+                    _ => 0,
+                };
+                self.mode = Mode::ProviderEditKeyInput {
+                    provider_id: pid,
+                    step: (step + 1) % 2,
                 };
             }
             KeyCode::Enter => {
@@ -4397,7 +4450,7 @@ impl App {
 
     fn handle_provider_key_list(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         match code {
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 self.providers_cache = self.manager.list_providers().unwrap_or_default();
                 if self.page == Page::ProviderManager {
                     self.mode = Mode::Normal;
@@ -4405,28 +4458,14 @@ impl App {
                     self.mode = Mode::ProviderList;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            _ if Self::is_prev_list_key(code, modifiers) => {
                 if self.provider_key_selected > 0 {
                     self.provider_key_selected -= 1;
                 } else if !self.provider_keys_cache.is_empty() {
                     self.provider_key_selected = self.provider_keys_cache.len() - 1;
                 }
             }
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.provider_key_selected > 0 {
-                    self.provider_key_selected -= 1;
-                } else if !self.provider_keys_cache.is_empty() {
-                    self.provider_key_selected = self.provider_keys_cache.len() - 1;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
-                    self.provider_key_selected += 1;
-                } else {
-                    self.provider_key_selected = 0;
-                }
-            }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if Self::is_next_list_key(code, modifiers) => {
                 if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
                     self.provider_key_selected += 1;
                 } else {
@@ -4493,13 +4532,35 @@ impl App {
 
     fn handle_provider_key_add(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         match code {
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 let pid = match &self.mode {
                     Mode::ProviderKeyAdd { provider_id, .. } => provider_id.clone(),
                     _ => return Ok(()),
                 };
                 self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
                 self.mode = Mode::ProviderKeyList { provider_id: pid };
+            }
+            KeyCode::Tab | KeyCode::Char('n')
+                if code == KeyCode::Tab || modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let (pid, step) = match &self.mode {
+                    Mode::ProviderKeyAdd { provider_id, step } => (provider_id.clone(), *step),
+                    _ => return Ok(()),
+                };
+                self.mode = Mode::ProviderKeyAdd {
+                    provider_id: pid,
+                    step: (step + 1) % 2,
+                };
+            }
+            _ if Self::is_prev_field_key(code, modifiers) => {
+                let (pid, step) = match &self.mode {
+                    Mode::ProviderKeyAdd { provider_id, step } => (provider_id.clone(), *step),
+                    _ => return Ok(()),
+                };
+                self.mode = Mode::ProviderKeyAdd {
+                    provider_id: pid,
+                    step: (step + 1) % 2,
+                };
             }
             KeyCode::Enter => {
                 let (pid, step) = match &self.mode {
@@ -4549,31 +4610,17 @@ impl App {
         modifiers: KeyModifiers,
     ) -> Result<()> {
         match code {
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 self.mode = Mode::Normal;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            _ if Self::is_prev_list_key(code, modifiers) => {
                 if self.provider_key_selected > 0 {
                     self.provider_key_selected -= 1;
                 } else if !self.provider_keys_cache.is_empty() {
                     self.provider_key_selected = self.provider_keys_cache.len() - 1;
                 }
             }
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.provider_key_selected > 0 {
-                    self.provider_key_selected -= 1;
-                } else if !self.provider_keys_cache.is_empty() {
-                    self.provider_key_selected = self.provider_keys_cache.len() - 1;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
-                    self.provider_key_selected += 1;
-                } else {
-                    self.provider_key_selected = 0;
-                }
-            }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if Self::is_next_list_key(code, modifiers) => {
                 if self.provider_key_selected + 1 < self.provider_keys_cache.len() {
                     self.provider_key_selected += 1;
                 } else {
@@ -4655,7 +4702,7 @@ impl App {
             _ => return Ok(()),
         };
         match code {
-            KeyCode::Esc => {
+            _ if Self::is_cancel_key(code, modifiers) => {
                 self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
                 match source {
                     KeyEditSource::ProviderEdit => {
@@ -4668,6 +4715,32 @@ impl App {
                         self.mode = Mode::ProviderKeyList { provider_id: pid };
                     }
                 }
+            }
+            KeyCode::Tab | KeyCode::Char('n')
+                if code == KeyCode::Tab || modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let step = match &self.mode {
+                    Mode::ProviderKeyEdit { step, .. } => *step,
+                    _ => 0,
+                };
+                self.mode = Mode::ProviderKeyEdit {
+                    provider_id: pid,
+                    key_id: kid,
+                    step: (step + 1) % 2,
+                    source,
+                };
+            }
+            _ if Self::is_prev_field_key(code, modifiers) => {
+                let step = match &self.mode {
+                    Mode::ProviderKeyEdit { step, .. } => *step,
+                    _ => 0,
+                };
+                self.mode = Mode::ProviderKeyEdit {
+                    provider_id: pid,
+                    key_id: kid,
+                    step: (step + 1) % 2,
+                    source,
+                };
             }
             KeyCode::Enter => {
                 let step = match &self.mode {
@@ -4969,7 +5042,7 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled("  Enter", Style::default().fg(ACCENT).bold()),
             Span::styled(" next/save  ", Style::default().fg(DIM)),
-            Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+            Span::styled("Esc/Ctrl+G", Style::default().fg(ACCENT).bold()),
             Span::styled(" cancel", Style::default().fg(DIM)),
         ]));
         f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -5008,7 +5081,7 @@ impl App {
             Line::from(vec![
                 Span::styled("  Enter", Style::default().fg(ACCENT).bold()),
                 Span::styled(" parse  ", Style::default().fg(DIM)),
-                Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+                Span::styled("Esc/Ctrl+G", Style::default().fg(ACCENT).bold()),
                 Span::styled(" back", Style::default().fg(DIM)),
             ]),
         ];
@@ -5132,12 +5205,12 @@ impl App {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  a=add  d=delete  ↑↓=nav  Tab=next  Esc=save",
+                "  a=add  d=delete  Ctrl+P/N=nav  Enter=open/edit  Esc/Ctrl+G=cancel",
                 Style::default().fg(DIM),
             )));
         } else {
             lines.push(Line::from(Span::styled(
-                "  Tab/Enter to switch, Backspace to edit, Esc to save",
+                "  Ctrl+P/N fields  Tab next  Enter save/open  Esc/Ctrl+G cancel",
                 Style::default().fg(DIM),
             )));
         }
@@ -5198,7 +5271,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  a=add  e=edit  d=delete  t=models  T=anthropic  Esc=back",
+            "  Ctrl+P/N nav  a=add  e=edit  d=delete  t=models  T=anthropic  Esc/Ctrl+G=back",
             Style::default().fg(DIM),
         )));
         f.render_widget(Paragraph::new(Text::from(lines)), block.inner(area));
@@ -5263,7 +5336,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  t=models  T=anthropic  Esc=back",
+            "  Ctrl+P/N nav  t=models  T=anthropic  Esc/Ctrl+G=back",
             Style::default().fg(DIM),
         )));
         f.render_widget(Paragraph::new(Text::from(lines)), block.inner(area));
@@ -5306,7 +5379,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Enter to confirm, Esc to cancel",
+            "  Ctrl+P/N fields  Tab next  Enter confirm  Esc/Ctrl+G cancel",
             Style::default().fg(DIM),
         )));
         f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -5349,7 +5422,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Enter to confirm, Esc to cancel",
+            "  Ctrl+P/N fields  Tab next  Enter confirm  Esc/Ctrl+G cancel",
             Style::default().fg(DIM),
         )));
         f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -5508,11 +5581,11 @@ impl App {
 
         let footer_lines = vec![
             Line::from(Span::styled(
-                "  Ctrl+N/P switches fields. Enter sends one non-streaming /v1/messages request.",
+                "  Ctrl+P/N switches fields. When Model is focused, the same keys browse fetched models.",
                 Style::default().fg(DIM),
             )),
             Line::from(Span::styled(
-                "  Esc returns without sending. Press q to quit the test session.",
+                "  Enter sends one non-streaming /v1/messages request. Esc/Ctrl+G or q exits.",
                 Style::default().fg(DIM),
             )),
         ];
@@ -5614,7 +5687,7 @@ impl App {
 
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  Any key returns to test. Press q to quit.",
+                "  Enter returns to test. Esc/Ctrl+G or q exits.",
                 Style::default().fg(DIM),
             ))),
             sections[3],
@@ -5670,7 +5743,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Enter to confirm, Esc to cancel",
+            "  Enter to confirm, Esc/Ctrl+G to cancel",
             Style::default().fg(DIM),
         )));
         f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -5765,12 +5838,15 @@ fn provider_test_return_mode(source: ProviderTestSource, provider_id: &str) -> O
 
 fn provider_test_outcome_next_mode(
     code: KeyCode,
+    modifiers: KeyModifiers,
     provider_id: &str,
     key_id: &str,
     source: ProviderTestSource,
     field: usize,
 ) -> Mode {
-    if code == KeyCode::Char('q') {
+    if matches!(code, KeyCode::Char('q') | KeyCode::Esc)
+        || (code == KeyCode::Char('g') && modifiers.contains(KeyModifiers::CONTROL))
+    {
         provider_test_return_mode(source, provider_id).unwrap_or(Mode::Normal)
     } else {
         Mode::ProviderAnthropicTest {
@@ -6095,6 +6171,32 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::ProfileManager;
+    use std::env;
+    use tempfile::TempDir;
+
+    fn make_test_app() -> App {
+        let tmp = TempDir::new().unwrap();
+        let old_home = env::var_os("USERPROFILE");
+        let old_home_unix = env::var_os("HOME");
+        unsafe {
+            env::set_var("USERPROFILE", tmp.path());
+            env::set_var("HOME", tmp.path());
+        }
+        let manager = ProfileManager::new().unwrap();
+        let app = App::new(manager).unwrap();
+        unsafe {
+            match old_home {
+                Some(value) => env::set_var("USERPROFILE", value),
+                None => env::remove_var("USERPROFILE"),
+            }
+            match old_home_unix {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
+        app
+    }
 
     #[test]
     fn smart_paste_parses_newapi_json() {
@@ -6360,6 +6462,7 @@ mod tests {
         assert_eq!(
             provider_test_outcome_next_mode(
                 KeyCode::Enter,
+                KeyModifiers::empty(),
                 "prov_generated",
                 "key_generated",
                 ProviderTestSource::KeyList,
@@ -6379,6 +6482,7 @@ mod tests {
         assert_eq!(
             provider_test_outcome_next_mode(
                 KeyCode::Char('q'),
+                KeyModifiers::empty(),
                 "prov_generated",
                 "key_generated",
                 ProviderTestSource::KeyList,
@@ -6391,6 +6495,7 @@ mod tests {
         assert_eq!(
             provider_test_outcome_next_mode(
                 KeyCode::Char('q'),
+                KeyModifiers::empty(),
                 "prov_generated",
                 "key_generated",
                 ProviderTestSource::TestKeyList,
@@ -6403,6 +6508,7 @@ mod tests {
         assert_eq!(
             provider_test_outcome_next_mode(
                 KeyCode::Char('q'),
+                KeyModifiers::empty(),
                 "prov_generated",
                 "key_generated",
                 ProviderTestSource::Page,
@@ -6446,6 +6552,223 @@ mod tests {
         assert_eq!(
             provider_edit_cursor_pos(2, "Provider Name", "https://example.invalid"),
             0
+        );
+    }
+
+    #[test]
+    fn shift_tab_switches_manager_in_allowed_modes() {
+        let mut app = make_test_app();
+        app.mode = Mode::Normal;
+        app.page = Page::ProfileManager;
+
+        assert!(
+            app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
+                .unwrap()
+        );
+        assert_eq!(app.page, Page::ProviderManager);
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.mode = Mode::Search;
+        assert!(
+            app.handle_manager_switch_key(KeyCode::Tab, KeyModifiers::SHIFT)
+                .unwrap()
+        );
+        assert_eq!(app.page, Page::ProfileManager);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn shift_tab_does_not_switch_manager_in_edit_mode() {
+        let mut app = make_test_app();
+        app.mode = Mode::EditProfile {
+            profile_id: "profile-generated".into(),
+            step: 1,
+        };
+        app.page = Page::ProfileManager;
+
+        assert!(
+            !app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
+                .unwrap()
+        );
+        assert_eq!(app.page, Page::ProfileManager);
+        assert_eq!(
+            app.mode,
+            Mode::EditProfile {
+                profile_id: "profile-generated".into(),
+                step: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_edit_tab_only_advances_fields() {
+        let mut app = make_test_app();
+        app.page = Page::ProviderManager;
+        app.provider_name_buf = "Provider Name".into();
+        app.provider_url_buf = "https://example.invalid".into();
+        app.mode = Mode::ProviderEdit {
+            provider_id: "prov_generated".into(),
+            step: 0,
+        };
+
+        app.handle_provider_edit(KeyCode::Tab, KeyModifiers::empty())
+            .unwrap();
+        assert_eq!(
+            app.mode,
+            Mode::ProviderEdit {
+                provider_id: "prov_generated".into(),
+                step: 1,
+            }
+        );
+        assert_eq!(app.cursor_pos, "https://example.invalid".len());
+    }
+
+    #[test]
+    fn provider_test_ctrl_p_moves_to_previous_field() {
+        let mut app = make_test_app();
+        app.provider_test_model_buf = "claude-3-7-sonnet".into();
+        app.provider_test_prompt_buf = "Hello".into();
+        app.mode = Mode::ProviderAnthropicTest {
+            provider_id: "prov_generated".into(),
+            key_id: "key_generated".into(),
+            source: ProviderTestSource::Page,
+            field: 1,
+        };
+
+        app.handle_provider_anthropic_test(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            .unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::ProviderAnthropicTest {
+                provider_id: "prov_generated".into(),
+                key_id: "key_generated".into(),
+                source: ProviderTestSource::Page,
+                field: 0,
+            }
+        );
+        assert_eq!(app.cursor_pos, app.provider_test_model_buf.len());
+    }
+
+    #[test]
+    fn provider_edit_cancel_does_not_save_changes() {
+        let mut app = make_test_app();
+        let provider = app
+            .manager
+            .add_provider_with_key_name(
+                "Original Provider",
+                "https://example.invalid",
+                "Default",
+                "sk-test-generated-key-777777777777777777777777",
+            )
+            .unwrap();
+        app.providers_cache = app.manager.list_providers().unwrap();
+        app.page = Page::ProviderManager;
+        app.provider_name_buf = "Changed Provider".into();
+        app.provider_url_buf = "https://changed.invalid".into();
+        app.mode = Mode::ProviderEdit {
+            provider_id: provider.id.clone(),
+            step: 0,
+        };
+
+        app.handle_provider_edit(KeyCode::Esc, KeyModifiers::empty())
+            .unwrap();
+
+        let refreshed = app.manager.get_provider(&provider.id).unwrap();
+        assert_eq!(refreshed.name, "Original Provider");
+        assert_eq!(refreshed.base_url, "https://example.invalid");
+    }
+
+    #[test]
+    fn edit_profile_down_no_longer_advances_fields() {
+        let mut app = make_test_app();
+        app.mode = Mode::EditProfile {
+            profile_id: "profile-generated".into(),
+            step: 0,
+        };
+
+        app.handle_edit_profile(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::EditProfile {
+                profile_id: "profile-generated".into(),
+                step: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_key_add_ctrl_n_advances_fields() {
+        let mut app = make_test_app();
+        app.mode = Mode::ProviderKeyAdd {
+            provider_id: "prov_generated".into(),
+            step: 0,
+        };
+
+        app.handle_provider_key_add(KeyCode::Char('n'), KeyModifiers::CONTROL)
+            .unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::ProviderKeyAdd {
+                provider_id: "prov_generated".into(),
+                step: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_key_edit_ctrl_p_moves_to_previous_field() {
+        let mut app = make_test_app();
+        app.mode = Mode::ProviderKeyEdit {
+            provider_id: "prov_generated".into(),
+            key_id: "key_generated".into(),
+            step: 1,
+            source: KeyEditSource::ProviderKeyList,
+        };
+
+        app.handle_provider_key_edit(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            .unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::ProviderKeyEdit {
+                provider_id: "prov_generated".into(),
+                key_id: "key_generated".into(),
+                step: 0,
+                source: KeyEditSource::ProviderKeyList,
+            }
+        );
+    }
+
+    #[test]
+    fn add_full_name_ctrl_g_cancels() {
+        let mut app = make_test_app();
+        app.mode = Mode::AddFullName;
+        app.input_buffer = "demo".into();
+
+        app.handle_add_full_name(KeyCode::Char('g'), KeyModifiers::CONTROL)
+            .unwrap();
+
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn provider_test_outcome_ctrl_g_exits_to_parent_mode() {
+        assert_eq!(
+            provider_test_outcome_next_mode(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL,
+                "prov_generated",
+                "key_generated",
+                ProviderTestSource::KeyList,
+                0
+            ),
+            Mode::ProviderKeyList {
+                provider_id: "prov_generated".into(),
+            }
         );
     }
 }
