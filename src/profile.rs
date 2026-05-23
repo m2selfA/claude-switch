@@ -1135,28 +1135,21 @@ impl ProfileManager {
         let mut skipped_full_profiles = Vec::new();
         if verbose {
             progress(&format!(
-                "[remote:{host}] probing remote OS for {} profile(s)...",
+                "[remote:{host}] probing remote OS and home via sftp pwd for {} profile(s)...",
                 profiles.len()
             ));
         }
-        let remote_os = Self::probe_remote_os(host)?;
+        let (remote_os, remote_home) = Self::probe_remote_os_and_home(host)?;
+        let remote_bin_dir = match remote_os {
+            RemoteOs::Unix => format!("{}/.varusers/bin", remote_home.trim_end_matches('/')),
+            RemoteOs::Windows => {
+                format!("{}\\.local\\bin", remote_home.trim_end_matches(['\\', '/']))
+            }
+        };
         if verbose {
             progress(&format!(
-                "[remote:{host}] detected remote OS: {:?}",
-                remote_os
-            ));
-        }
-
-        if verbose {
-            progress(&format!(
-                "[remote:{host}] resolving remote shim directory..."
-            ));
-        }
-        let remote_bin_dir = Self::probe_remote_bin_dir(host, remote_os)?;
-        if verbose {
-            progress(&format!(
-                "[remote:{host}] remote shim directory: {}",
-                remote_bin_dir
+                "[remote:{host}] detected {:?}, home: {}, shim dir: {}",
+                remote_os, remote_home, remote_bin_dir
             ));
         }
 
@@ -1165,7 +1158,7 @@ impl ProfileManager {
                 "[remote:{host}] ensuring remote directory exists..."
             ));
         }
-        Self::ensure_remote_dir(host, remote_os, &remote_bin_dir)?;
+        Self::ensure_remote_dir(host, &remote_bin_dir)?;
 
         let mut desired: Vec<(String, String)> = Vec::new();
         for profile in &profiles {
@@ -1565,21 +1558,47 @@ impl ProfileManager {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    fn run_remote_ssh_command(host: &str, remote_command: &str) -> Result<String> {
-        let args: Vec<&str> = vec![
-            "-x",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            "ForwardX11=no",
-            host,
-            remote_command,
-        ];
-        Self::run_local_command("ssh", &args)
+    fn run_remote_sftp_commands(host: &str, stdin: &str) -> Result<String> {
+        let mut child = Command::new("sftp")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ForwardX11=no",
+                "-b",
+                "-",
+                host,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to spawn sftp")?;
+
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .context("Failed to write sftp batch commands")?;
+
+        let output = child.wait_with_output().context("Failed to wait on sftp")?;
+
+        if !output.status.success() {
+            // sftp exits non-zero on some glitches that are harmless;
+            // only bail if both stdout and stderr are empty.
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stdout.is_empty() && stderr.is_empty() {
+                bail!("sftp failed silently");
+            }
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     fn run_remote_sftp_batch(host: &str, batch_path: &str) -> Result<String> {
@@ -1601,116 +1620,80 @@ impl ProfileManager {
         )
     }
 
-    fn probe_remote_os(host: &str) -> Result<RemoteOs> {
-        // Try Windows probe first: `cmd /c "echo WINDOWS"` wrapped in single
-        // quotes so the local shell does not expand `%` or `$` and the remote
-        // cmd.exe receives the double-quoted command intact.  The output is
-        // trimmed so trailing `"` noise from cmd.exe argument parsing is stripped.
-        if let Ok(windows) = Self::run_remote_ssh_command(host, "cmd /c \"echo WINDOWS\"") {
-            let trimmed = windows.trim().trim_matches('"');
-            if trimmed == "WINDOWS" {
-                return Ok(RemoteOs::Windows);
-            }
-        }
+    fn probe_remote_os_and_home(host: &str) -> Result<(RemoteOs, String)> {
+        let output = Self::run_remote_sftp_commands(host, "pwd\n")?;
+        // sftp pwd prints: "Remote working directory: /home/alice" (Unix)
+        // or               "Remote working directory: /C:/Users/alice" (Windows)
+        let home = output
+            .lines()
+            .find(|line| line.contains("Remote working directory:"))
+            .and_then(|line| line.split(": ").nth(1))
+            .map(str::trim)
+            .map(str::to_string)
+            .context("sftp pwd did not produce a usable directory")?;
 
-        // Unix probe: `uname` is available on all Unix-like systems and
-        // also on Windows when a POSIX layer (Git Bash, MSYS2, Cygwin) is
-        // installed.  We reject those via uname_indicates_unix.
-        if let Ok(uname) = Self::run_remote_ssh_command(host, "uname")
-            && Self::uname_indicates_unix(&uname)
-        {
-            return Ok(RemoteOs::Unix);
-        }
-
-        bail!("Could not determine remote OS for '{}'", host)
+        let remote_os = if home.starts_with("/C:") || home.starts_with("/D:") {
+            RemoteOs::Windows
+        } else {
+            RemoteOs::Unix
+        };
+        Ok((remote_os, home))
     }
 
-    fn uname_indicates_unix(uname: &str) -> bool {
-        let uname = uname.trim().to_ascii_lowercase();
-        if uname.is_empty() {
-            return false;
-        }
-        for marker in ["mingw", "msys", "cygwin", "windows"] {
-            if uname.contains(marker) {
-                return false;
-            }
-        }
-        [
-            "linux",
-            "darwin",
-            "freebsd",
-            "openbsd",
-            "netbsd",
-            "dragonfly",
-            "sunos",
-            "solaris",
-            "aix",
-        ]
-        .iter()
-        .any(|marker| uname.contains(marker))
-    }
-
-    fn probe_remote_bin_dir(host: &str, remote_os: RemoteOs) -> Result<String> {
-        match remote_os {
-            RemoteOs::Unix => {
-                let home = Self::run_remote_ssh_command(host, "sh -lc 'printf \"%s\" \"$HOME\"'")?;
-                if home.trim().is_empty() {
-                    bail!("Remote Unix host '{}' did not report HOME", host);
-                }
-                Ok(format!("{}/.varusers/bin", home.trim_end_matches('/')))
-            }
-            RemoteOs::Windows => {
-                let home = Self::run_remote_ssh_command(host, "cmd /c \"echo %USERPROFILE%\"")?;
-                let trimmed = home.trim().trim_end_matches(['\\', '/']);
-                if trimmed.is_empty() {
-                    bail!("Remote Windows host '{}' did not report USERPROFILE", host);
-                }
-                Ok(format!("{trimmed}\\.local\\bin"))
-            }
-        }
-    }
-
-    fn ensure_remote_dir(host: &str, remote_os: RemoteOs, remote_dir: &str) -> Result<()> {
-        match remote_os {
-            RemoteOs::Unix => {
-                Self::run_remote_ssh_command(
-                    host,
-                    &format!("sh -lc 'mkdir -p \"{}\"'", remote_dir),
-                )?;
-            }
-            RemoteOs::Windows => {
-                Self::run_remote_ssh_command(
-                    host,
-                    &format!(
-                        "cmd /c \"if not exist \"{}\" mkdir \"{}\"\"",
-                        remote_dir, remote_dir
-                    ),
-                )?;
-            }
-        }
+    fn ensure_remote_dir(host: &str, remote_bin_dir: &str) -> Result<()> {
+        Self::run_remote_sftp_commands(host, &format!("-mkdir {}\n", remote_bin_dir))?;
         Ok(())
     }
 
-    fn list_remote_files(host: &str, remote_dir: &str, remote_os: RemoteOs) -> Result<Vec<String>> {
-        let output = match remote_os {
-            RemoteOs::Unix => Self::run_remote_ssh_command(
-                host,
-                &format!(
-                    "sh -lc 'cd \"{}\" 2>/dev/null && ls -1 || true'",
-                    remote_dir
-                ),
-            )?,
-            RemoteOs::Windows => Self::run_remote_ssh_command(
-                host,
-                &format!("cmd /c \"dir /b \"{}\\claude-*.cmd\" 2>nul\"", remote_dir),
-            )?,
+    fn list_remote_files(
+        host: &str,
+        remote_bin_dir: &str,
+        remote_os: RemoteOs,
+    ) -> Result<Vec<String>> {
+        let sftp_dir = if matches!(remote_os, RemoteOs::Windows) {
+            remote_bin_dir.replace('\\', "/")
+        } else {
+            remote_bin_dir.to_string()
         };
+        let output = Self::run_remote_sftp_commands(host, &format!("ls -1 {}/\n", sftp_dir))?;
         Ok(output
             .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
+            .filter_map(|line| {
+                let name = line.trim();
+                if name.is_empty() || name.starts_with("sftp>") {
+                    None
+                } else {
+                    // Strip leading path prefix to get just the filename
+                    name.rsplit('/').next().map(str::to_string)
+                }
+            })
             .collect())
+    }
+
+    fn remote_file_has_marker(host: &str, remote_path: &str, remote_os: RemoteOs) -> Result<bool> {
+        let sftp_path = if matches!(remote_os, RemoteOs::Windows) {
+            remote_path.replace('\\', "/")
+        } else {
+            remote_path.to_string()
+        };
+        let local_tmp = std::env::temp_dir().join(format!("cswitch-marker-{}", Uuid::new_v4()));
+        Self::run_remote_sftp_commands(
+            host,
+            &format!("get {} {}\n", sftp_path, local_tmp.display()),
+        )?;
+        let content = fs::read_to_string(&local_tmp).unwrap_or_default();
+        let _ = fs::remove_file(&local_tmp);
+        Ok(content.contains(CMD_MARKER) || content.contains(SH_MARKER))
+    }
+
+    fn remove_remote_file(host: &str, remote_path: &str, remote_os: RemoteOs) -> Result<()> {
+        let sftp_path = if matches!(remote_os, RemoteOs::Windows) {
+            remote_path.replace('\\', "/")
+        } else {
+            remote_path.to_string()
+        };
+        Self::run_remote_sftp_commands(host, &format!("rm {}\n", sftp_path))?;
+        Ok(())
     }
 
     fn join_remote_path(remote_dir: &str, remote_os: RemoteOs, file_name: &str) -> String {
@@ -1787,35 +1770,6 @@ impl ProfileManager {
         let _ = fs::remove_dir_all(&temp_root);
         let _ = fs::remove_file(&batch_path);
         result?;
-        Ok(())
-    }
-
-    fn remote_file_has_marker(host: &str, remote_path: &str, remote_os: RemoteOs) -> Result<bool> {
-        let content = match remote_os {
-            RemoteOs::Unix => Self::run_remote_ssh_command(
-                host,
-                &format!("sh -lc 'cat \"{}\" 2>/dev/null || true'", remote_path),
-            )?,
-            RemoteOs::Windows => Self::run_remote_ssh_command(
-                host,
-                &format!("cmd /c \"type \"{}\" 2>nul\"", remote_path),
-            )?,
-        };
-        Ok(content.contains(CMD_MARKER) || content.contains(SH_MARKER))
-    }
-
-    fn remove_remote_file(host: &str, remote_path: &str, remote_os: RemoteOs) -> Result<()> {
-        match remote_os {
-            RemoteOs::Unix => {
-                Self::run_remote_ssh_command(host, &format!("sh -lc 'rm -f \"{}\"'", remote_path))?;
-            }
-            RemoteOs::Windows => {
-                Self::run_remote_ssh_command(
-                    host,
-                    &format!("cmd /c \"del \"{}\" 2>nul\"", remote_path),
-                )?;
-            }
-        }
         Ok(())
     }
 
@@ -3381,15 +3335,6 @@ mod tests {
             ProfileManager::remote_shim_file_name(&lite, RemoteOs::Windows).as_deref(),
             Some("claude-lite-alias.cmd")
         );
-    }
-
-    #[test]
-    fn uname_indicates_unix_rejects_windows_posix_layers() {
-        assert!(ProfileManager::uname_indicates_unix("Linux"));
-        assert!(ProfileManager::uname_indicates_unix("Darwin"));
-        assert!(!ProfileManager::uname_indicates_unix("MINGW64_NT-10.0"));
-        assert!(!ProfileManager::uname_indicates_unix("MSYS_NT-10.0"));
-        assert!(!ProfileManager::uname_indicates_unix("CYGWIN_NT-10.0"));
     }
 
     #[test]
