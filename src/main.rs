@@ -4,6 +4,7 @@ mod profile;
 mod tui;
 
 use anyhow::Result;
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use profile::{LightweightEnv, ProfileManager, fetch_models};
 use std::io::{self, Write};
@@ -74,12 +75,17 @@ enum Commands {
         name: String,
     },
 
-    /// Print shell aliases for all profiles, or sync remote lightweight shims only with --remote
+    /// Print/sync shell aliases and shims locally and/or on remote hosts
     Aliases {
-        /// Also sync self-contained shims to a remote host reachable via ssh/scp/sftp
+        /// Generate/sync local aliases and shims (implied when neither --local nor --remote are given)
         #[arg(long)]
-        remote: Option<String>,
-        /// Show detailed remote sync progress
+        local: bool,
+
+        /// Sync self-contained shims to a remote host via sftp; repeatable
+        #[arg(long)]
+        remote: Vec<String>,
+
+        /// Show detailed alias/shim sync progress
         #[arg(short, long)]
         verbose: bool,
     },
@@ -337,17 +343,63 @@ fn main() -> Result<()> {
             }
         },
 
-        Some(Commands::Aliases { remote, verbose }) => {
-            if let Some(host) = remote {
+        Some(Commands::Aliases {
+            local,
+            remote,
+            verbose,
+        }) => {
+            let run_local = local || remote.is_empty();
+            let multi_section = run_local && !remote.is_empty() || remote.len() > 1;
+            let mut errors: Vec<String> = Vec::new();
+
+            if run_local {
+                if verbose {
+                    eprintln!("# local alias/shim sync target");
+                }
+                match manager.generate_aliases() {
+                    Ok(report) => {
+                        if multi_section {
+                            println!("# Local aliases/shims");
+                        }
+                        println!("{}", report);
+                    }
+                    Err(err) => {
+                        errors.push(format!("local: {err}"));
+                    }
+                }
+            }
+
+            for host in remote {
                 if verbose {
                     eprintln!("# remote sync target: {}", host);
                 }
-                let report = manager.sync_remote_aliases_with_progress(&host, verbose, |line| {
+                match manager.sync_remote_aliases_with_progress(&host, verbose, |line| {
                     eprintln!("{}", line);
-                })?;
-                eprintln!("{}", report);
-            } else {
-                println!("{}", manager.generate_aliases()?);
+                }) {
+                    Ok(report) => {
+                        if multi_section {
+                            eprintln!("# Remote aliases/shims: {}", host);
+                        }
+                        eprintln!("{}", report);
+                    }
+                    Err(err) => {
+                        let msg = format!("remote {}: {}", host, err);
+                        eprintln!("# ERROR: {}", msg);
+                        errors.push(msg);
+                    }
+                }
+            }
+
+            if !errors.is_empty() {
+                bail!(
+                    "alias sync completed with {} error(s):\n{}",
+                    errors.len(),
+                    errors
+                        .iter()
+                        .map(|e| format!("  - {e}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
             }
         }
 
@@ -722,8 +774,13 @@ mod tests {
         let cli =
             Cli::try_parse_from(["cswitch", "aliases", "--remote", "devbox", "--verbose"]).unwrap();
         match cli.command {
-            Some(Commands::Aliases { remote, verbose }) => {
-                assert_eq!(remote.as_deref(), Some("devbox"));
+            Some(Commands::Aliases {
+                local,
+                remote,
+                verbose,
+            }) => {
+                assert!(!local);
+                assert_eq!(remote, vec!["devbox"]);
                 assert!(verbose);
             }
             _ => panic!("unexpected aliases parse result"),
@@ -734,8 +791,77 @@ mod tests {
     fn aliases_verbose_only_parses() {
         let cli = Cli::try_parse_from(["cswitch", "aliases", "--verbose"]).unwrap();
         match cli.command {
-            Some(Commands::Aliases { remote, verbose }) => {
-                assert!(remote.is_none());
+            Some(Commands::Aliases {
+                local,
+                remote,
+                verbose,
+            }) => {
+                assert!(!local);
+                assert!(remote.is_empty());
+                assert!(verbose);
+            }
+            _ => panic!("unexpected aliases parse result"),
+        }
+    }
+
+    #[test]
+    fn aliases_multiple_remote_options_parse() {
+        let cli = Cli::try_parse_from([
+            "cswitch", "aliases", "--remote", "host1", "--remote", "host2",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Aliases {
+                local,
+                remote,
+                verbose,
+            }) => {
+                assert!(!local);
+                assert_eq!(remote, vec!["host1", "host2"]);
+                assert!(!verbose);
+            }
+            _ => panic!("unexpected aliases parse result"),
+        }
+    }
+
+    #[test]
+    fn aliases_local_option_parses() {
+        let cli = Cli::try_parse_from(["cswitch", "aliases", "--local"]).unwrap();
+        match cli.command {
+            Some(Commands::Aliases {
+                local,
+                remote,
+                verbose,
+            }) => {
+                assert!(local);
+                assert!(remote.is_empty());
+                assert!(!verbose);
+            }
+            _ => panic!("unexpected aliases parse result"),
+        }
+    }
+
+    #[test]
+    fn aliases_local_and_remote_options_parse() {
+        let cli = Cli::try_parse_from([
+            "cswitch",
+            "aliases",
+            "--local",
+            "--remote",
+            "host1",
+            "--remote",
+            "host2",
+            "--verbose",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Aliases {
+                local,
+                remote,
+                verbose,
+            }) => {
+                assert!(local);
+                assert_eq!(remote, vec!["host1", "host2"]);
                 assert!(verbose);
             }
             _ => panic!("unexpected aliases parse result"),
