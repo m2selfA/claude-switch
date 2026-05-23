@@ -1602,12 +1602,20 @@ impl ProfileManager {
     }
 
     fn probe_remote_os(host: &str) -> Result<RemoteOs> {
-        if let Ok(windows) = Self::run_remote_ssh_command(host, "cmd /c echo WINDOWS")
-            && windows.trim() == "WINDOWS"
-        {
-            return Ok(RemoteOs::Windows);
+        // Try Windows probe first: `cmd /c "echo WINDOWS"` wrapped in single
+        // quotes so the local shell does not expand `%` or `$` and the remote
+        // cmd.exe receives the double-quoted command intact.  The output is
+        // trimmed so trailing `"` noise from cmd.exe argument parsing is stripped.
+        if let Ok(windows) = Self::run_remote_ssh_command(host, "cmd /c \"echo WINDOWS\"") {
+            let trimmed = windows.trim().trim_matches('"');
+            if trimmed == "WINDOWS" {
+                return Ok(RemoteOs::Windows);
+            }
         }
 
+        // Unix probe: `uname` is available on all Unix-like systems and
+        // also on Windows when a POSIX layer (Git Bash, MSYS2, Cygwin) is
+        // installed.  We reject those via uname_indicates_unix.
         if let Ok(uname) = Self::run_remote_ssh_command(host, "uname")
             && Self::uname_indicates_unix(&uname)
         {
@@ -1652,10 +1660,7 @@ impl ProfileManager {
                 Ok(format!("{}/.varusers/bin", home.trim_end_matches('/')))
             }
             RemoteOs::Windows => {
-                let home = Self::run_remote_ssh_command(
-                    host,
-                    "powershell -NoProfile -Command \"$env:USERPROFILE\"",
-                )?;
+                let home = Self::run_remote_ssh_command(host, "cmd /c \"echo %USERPROFILE%\"")?;
                 let trimmed = home.trim().trim_end_matches(['\\', '/']);
                 if trimmed.is_empty() {
                     bail!("Remote Windows host '{}' did not report USERPROFILE", host);
@@ -1677,8 +1682,8 @@ impl ProfileManager {
                 Self::run_remote_ssh_command(
                     host,
                     &format!(
-                        "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '{}' | Out-Null\"",
-                        remote_dir.replace('\'', "''")
+                        "cmd /c \"if not exist \"{}\" mkdir \"{}\"\"",
+                        remote_dir, remote_dir
                     ),
                 )?;
             }
@@ -1697,11 +1702,7 @@ impl ProfileManager {
             )?,
             RemoteOs::Windows => Self::run_remote_ssh_command(
                 host,
-                &format!(
-                    "powershell -NoProfile -Command \"if (Test-Path '{}') {{ Get-ChildItem -Name '{}' }}\"",
-                    remote_dir.replace('\'', "''"),
-                    remote_dir.replace('\'', "''")
-                ),
+                &format!("cmd /c \"dir /b \"{}\\claude-*.cmd\" 2>nul\"", remote_dir),
             )?,
         };
         Ok(output
@@ -1797,11 +1798,7 @@ impl ProfileManager {
             )?,
             RemoteOs::Windows => Self::run_remote_ssh_command(
                 host,
-                &format!(
-                    "powershell -NoProfile -Command \"if (Test-Path '{}') {{ Get-Content -Raw '{}' }}\"",
-                    remote_path.replace('\'', "''"),
-                    remote_path.replace('\'', "''")
-                ),
+                &format!("cmd /c \"type \"{}\" 2>nul\"", remote_path),
             )?,
         };
         Ok(content.contains(CMD_MARKER) || content.contains(SH_MARKER))
@@ -1815,10 +1812,7 @@ impl ProfileManager {
             RemoteOs::Windows => {
                 Self::run_remote_ssh_command(
                     host,
-                    &format!(
-                        "powershell -NoProfile -Command \"Remove-Item -Force -ErrorAction SilentlyContinue '{}'\"",
-                        remote_path.replace('\'', "''")
-                    ),
+                    &format!("cmd /c \"del \"{}\" 2>nul\"", remote_path),
                 )?;
             }
         }
