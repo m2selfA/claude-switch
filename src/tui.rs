@@ -332,6 +332,65 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
     next
 }
 
+fn display_with_cursor(value: &str, cursor_pos: usize) -> String {
+    let pos = nearest_prev_char_boundary(value, cursor_pos);
+    format!("{}█{}", &value[..pos], &value[pos..])
+}
+
+fn insert_str_at_cursor(buf: &mut String, cursor_pos: &mut usize, text: &str) {
+    *cursor_pos = nearest_prev_char_boundary(buf, *cursor_pos);
+    buf.insert_str(*cursor_pos, text);
+    *cursor_pos += text.len();
+}
+
+fn insert_filtered_str_at_cursor(
+    buf: &mut String,
+    cursor_pos: &mut usize,
+    text: &str,
+    keep: impl Fn(char) -> bool,
+) {
+    let filtered: String = text.chars().filter(|ch| keep(*ch)).collect();
+    insert_str_at_cursor(buf, cursor_pos, &filtered);
+}
+
+fn is_alias_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'
+}
+
+fn provider_key_cursor_pos(step: usize, key_name: &str, key: &str) -> usize {
+    match step {
+        0 => key_name.len(),
+        _ => key.len(),
+    }
+}
+
+fn provider_add_cursor_pos(
+    step: usize,
+    existing_id: Option<&str>,
+    name: &str,
+    url: &str,
+    key_name: &str,
+    key: &str,
+) -> usize {
+    match step {
+        0 if existing_id.is_some() => key_name.len(),
+        0 => name.len(),
+        1 => url.len(),
+        2 => key_name.len(),
+        _ => key.len(),
+    }
+}
+
+fn visible_window(selected: usize, total: usize, page_size: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let page_size = page_size.max(1);
+    let start = (selected / page_size) * page_size;
+    let end = (start + page_size).min(total);
+    (start, end)
+}
+
 fn provider_edit_cursor_pos(step: usize, name: &str, url: &str) -> usize {
     match step {
         0 => name.len(),
@@ -574,6 +633,16 @@ impl App {
             || (code == KeyCode::Char('n') && modifiers.contains(KeyModifiers::CONTROL))
     }
 
+    fn is_prev_selection_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+        matches!(code, KeyCode::Up)
+            || (code == KeyCode::Char('p') && modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    fn is_next_selection_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+        matches!(code, KeyCode::Down)
+            || (code == KeyCode::Char('n') && modifiers.contains(KeyModifiers::CONTROL))
+    }
+
     fn is_prev_field_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
         matches!(code, KeyCode::Up)
             || (code == KeyCode::Char('p') && modifiers.contains(KeyModifiers::CONTROL))
@@ -637,6 +706,21 @@ impl App {
         }
     }
 
+    fn lite_cursor_pos_for_step(&self, step: usize) -> usize {
+        match step {
+            0 => self.lite_name.len(),
+            1 => self.lite_alias.len(),
+            2 => self.lite_mod_opus.len(),
+            3 => self.lite_mod_sonnet.len(),
+            4 => self.lite_mod_haiku.len(),
+            5 => self.lite_mod_model.len(),
+            6 => self.lite_mod_subagent.len(),
+            7 => self.input_buffer.len(),
+            8 => self.lite_launch_args.len(),
+            _ => 0,
+        }
+    }
+
     fn set_slot_value(&mut self, val: String) {
         match self.lite_step {
             2 => self.lite_mod_opus = val,
@@ -646,6 +730,7 @@ impl App {
             6 => self.lite_mod_subagent = val,
             _ => {}
         }
+        self.cursor_pos = self.lite_cursor_pos_for_step(self.lite_step);
     }
 
     fn reset_lite_builder(&mut self) {
@@ -714,6 +799,16 @@ impl App {
                 self.provider_test_model_fetch_state =
                     ModelFetchState::Unavailable(model_fetch_unavailable_message(&e.to_string()));
             }
+        }
+    }
+
+    fn sync_provider_test_model_selection_from_buffer(&mut self) {
+        if let Some(index) = self
+            .provider_test_models
+            .iter()
+            .position(|model| model == &self.provider_test_model_buf)
+        {
+            self.provider_test_model_selected = index;
         }
     }
 
@@ -808,7 +903,7 @@ impl App {
                             self.handle_lite_key_select(key.code, key.modifiers)?;
                         }
                         Mode::LiteFetching => {
-                            if key.code == KeyCode::Esc {
+                            if Self::is_cancel_key(key.code, key.modifiers) {
                                 self.mode = Mode::Normal;
                             }
                         }
@@ -866,10 +961,7 @@ impl App {
                     }
                 }
                 Event::Paste(text) => {
-                    if matches!(self.mode, Mode::ProviderSmartPaste) {
-                        self.provider_smart_paste_buf.push_str(&text);
-                        self.cursor_pos = self.provider_smart_paste_buf.len();
-                    }
+                    self.handle_paste(&text)?;
                 }
                 _ => {}
             }
@@ -877,6 +969,106 @@ impl App {
     }
 
     // ── Key handlers ──────────────────────────────────────────────────────────
+
+    fn handle_paste(&mut self, text: &str) -> Result<()> {
+        match self.mode.clone() {
+            Mode::Search => {
+                insert_str_at_cursor(&mut self.search_query, &mut self.cursor_pos, text);
+                self.apply_filter();
+            }
+            Mode::AddFullName => {
+                insert_str_at_cursor(&mut self.input_buffer, &mut self.cursor_pos, text);
+            }
+            Mode::AddFullAlias => {
+                insert_filtered_str_at_cursor(
+                    &mut self.input_buffer,
+                    &mut self.cursor_pos,
+                    text,
+                    is_alias_char,
+                );
+            }
+            Mode::EditProfile { step, .. } => match step {
+                0 => insert_str_at_cursor(&mut self.lite_name, &mut self.cursor_pos, text),
+                1 => insert_filtered_str_at_cursor(
+                    &mut self.lite_alias,
+                    &mut self.cursor_pos,
+                    text,
+                    is_alias_char,
+                ),
+                _ => insert_str_at_cursor(&mut self.lite_launch_args, &mut self.cursor_pos, text),
+            },
+            Mode::LiteModelSelect { .. } | Mode::LiteEdit { .. } => match self.lite_step {
+                0 => insert_str_at_cursor(&mut self.lite_name, &mut self.cursor_pos, text),
+                1 => insert_filtered_str_at_cursor(
+                    &mut self.lite_alias,
+                    &mut self.cursor_pos,
+                    text,
+                    is_alias_char,
+                ),
+                2 => insert_str_at_cursor(&mut self.lite_mod_opus, &mut self.cursor_pos, text),
+                3 => insert_str_at_cursor(&mut self.lite_mod_sonnet, &mut self.cursor_pos, text),
+                4 => insert_str_at_cursor(&mut self.lite_mod_haiku, &mut self.cursor_pos, text),
+                5 => insert_str_at_cursor(&mut self.lite_mod_model, &mut self.cursor_pos, text),
+                6 => insert_str_at_cursor(&mut self.lite_mod_subagent, &mut self.cursor_pos, text),
+                7 => insert_str_at_cursor(&mut self.input_buffer, &mut self.cursor_pos, text),
+                8 => insert_str_at_cursor(&mut self.lite_launch_args, &mut self.cursor_pos, text),
+                _ => {}
+            },
+            Mode::ProviderSmartPaste => {
+                insert_str_at_cursor(
+                    &mut self.provider_smart_paste_buf,
+                    &mut self.cursor_pos,
+                    text,
+                );
+            }
+            Mode::ProviderAnthropicTest { field, .. } => {
+                if field == 0 {
+                    insert_str_at_cursor(
+                        &mut self.provider_test_model_buf,
+                        &mut self.cursor_pos,
+                        text,
+                    );
+                    self.sync_provider_test_model_selection_from_buffer();
+                } else {
+                    insert_str_at_cursor(
+                        &mut self.provider_test_prompt_buf,
+                        &mut self.cursor_pos,
+                        text,
+                    );
+                }
+            }
+            Mode::ProviderAdd { step } => {
+                let buf = match step {
+                    0 if self.provider_add_existing_id.is_some() => &mut self.provider_key_name_buf,
+                    0 => &mut self.provider_name_buf,
+                    1 => &mut self.provider_url_buf,
+                    2 => &mut self.provider_key_name_buf,
+                    _ => &mut self.provider_key_buf,
+                };
+                insert_str_at_cursor(buf, &mut self.cursor_pos, text);
+            }
+            Mode::ProviderEdit { step, .. } if step < 2 => {
+                let buf = if step == 0 {
+                    &mut self.provider_name_buf
+                } else {
+                    &mut self.provider_url_buf
+                };
+                insert_str_at_cursor(buf, &mut self.cursor_pos, text);
+            }
+            Mode::ProviderEditKeyInput { step, .. }
+            | Mode::ProviderKeyAdd { step, .. }
+            | Mode::ProviderKeyEdit { step, .. } => {
+                let buf = if step == 0 {
+                    &mut self.provider_key_name_buf
+                } else {
+                    &mut self.provider_key_buf
+                };
+                insert_str_at_cursor(buf, &mut self.cursor_pos, text);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 
     fn handle_first_run_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
@@ -1160,12 +1352,6 @@ impl App {
                         name,
                     };
                 }
-            }
-
-            KeyCode::Char('/') => {
-                self.search_query.clear();
-                self.apply_filter();
-                self.mode = Mode::Search;
             }
 
             KeyCode::Char('?') => {
@@ -1580,18 +1766,7 @@ impl App {
             // Slot navigation
             _ if Self::is_next_field_key(code, modifiers) => {
                 self.lite_step = (self.lite_step + 1) % total_steps;
-                self.cursor_pos = match self.lite_step {
-                    0 => self.lite_name.len(),
-                    1 => self.lite_alias.len(),
-                    2 => self.lite_mod_opus.len(),
-                    3 => self.lite_mod_sonnet.len(),
-                    4 => self.lite_mod_haiku.len(),
-                    5 => self.lite_mod_model.len(),
-                    6 => self.lite_mod_subagent.len(),
-                    7 => self.input_buffer.len(),
-                    8 => self.lite_launch_args.len(),
-                    _ => 0,
-                };
+                self.cursor_pos = self.lite_cursor_pos_for_step(self.lite_step);
             }
             _ if Self::is_prev_field_key(code, modifiers) => {
                 self.lite_step = if self.lite_step == 0 {
@@ -1599,18 +1774,7 @@ impl App {
                 } else {
                     self.lite_step - 1
                 };
-                self.cursor_pos = match self.lite_step {
-                    0 => self.lite_name.len(),
-                    1 => self.lite_alias.len(),
-                    2 => self.lite_mod_opus.len(),
-                    3 => self.lite_mod_sonnet.len(),
-                    4 => self.lite_mod_haiku.len(),
-                    5 => self.lite_mod_model.len(),
-                    6 => self.lite_mod_subagent.len(),
-                    7 => self.input_buffer.len(),
-                    8 => self.lite_launch_args.len(),
-                    _ => 0,
-                };
+                self.cursor_pos = self.lite_cursor_pos_for_step(self.lite_step);
             }
             KeyCode::Tab => {
                 // Tab = completion on model slots, extras, launch_args, and provider/key.
@@ -1633,10 +1797,12 @@ impl App {
                     if let Some(pos) = vars.iter().position(|v| v == &prefix) {
                         let next = (pos + 1) % vars.len();
                         self.input_buffer = format!("{}=", vars[next]);
+                        self.cursor_pos = self.input_buffer.len();
                     } else if !prefix.is_empty()
                         && let Some(v) = vars.iter().find(|v| v.starts_with(prefix))
                     {
                         self.input_buffer = format!("{}=", v);
+                        self.cursor_pos = self.input_buffer.len();
                     }
                 } else if self.lite_step == 8 {
                     // Launch args: cycle through known CLI flags (replace the last word)
@@ -1651,10 +1817,12 @@ impl App {
                             let next = (pos + 1) % flags.len();
                             self.lite_launch_args =
                                 replace_last_word(&self.lite_launch_args, flags[next]);
+                            self.cursor_pos = self.lite_launch_args.len();
                         } else if !last_word.is_empty()
                             && let Some(f) = flags.iter().find(|f| f.starts_with(last_word))
                         {
                             self.lite_launch_args = replace_last_word(&self.lite_launch_args, f);
+                            self.cursor_pos = self.lite_launch_args.len();
                         }
                     }
                 } else if self.lite_step == 9 {
@@ -1697,18 +1865,7 @@ impl App {
                     }
                 } else {
                     self.lite_step = (self.lite_step + 1) % total_steps;
-                    self.cursor_pos = match self.lite_step {
-                        0 => self.lite_name.len(),
-                        1 => self.lite_alias.len(),
-                        2 => self.lite_mod_opus.len(),
-                        3 => self.lite_mod_sonnet.len(),
-                        4 => self.lite_mod_haiku.len(),
-                        5 => self.lite_mod_model.len(),
-                        6 => self.lite_mod_subagent.len(),
-                        7 => self.input_buffer.len(),
-                        8 => self.lite_launch_args.len(),
-                        _ => 0,
-                    };
+                    self.cursor_pos = self.lite_cursor_pos_for_step(self.lite_step);
                 }
             }
 
@@ -2796,7 +2953,6 @@ impl App {
                     ("Ctrl+Y", "smart input"),
                     ("e", "edit"),
                     ("d", "delete"),
-                    ("/", "search"),
                     ("?", "help"),
                     ("Shift+Tab", "profiles"),
                     ("q", "quit"),
@@ -2949,8 +3105,10 @@ impl App {
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  Name: ", Style::default().fg(DIM)),
-                    Span::styled(self.input_buffer.clone(), Style::default().fg(TEXT).bold()),
-                    Span::styled("█", Style::default().fg(ACCENT)),
+                    Span::styled(
+                        display_with_cursor(&self.input_buffer, self.cursor_pos),
+                        Style::default().fg(TEXT).bold(),
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -2984,9 +3142,9 @@ impl App {
                     Span::styled("  Alias: ", Style::default().fg(DIM)),
                     Span::styled(
                         if self.input_buffer.is_empty() {
-                            "(none)".to_string()
+                            "█".to_string()
                         } else {
-                            format!("{}█", self.input_buffer)
+                            display_with_cursor(&self.input_buffer, self.cursor_pos)
                         },
                         Style::default().fg(TEXT).bold(),
                     ),
@@ -3017,28 +3175,26 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         macro_rules! field {
-            ($step:expr, $label:expr, $display:expr, $color:expr) => {{
+            ($step:expr, $label:expr, $value:expr, $color:expr) => {{
                 let prefix = if step == $step { "▶ " } else { "  " };
-                let cursor = if step == $step { "█" } else { "" };
+                let display = if step == $step {
+                    display_with_cursor($value, self.cursor_pos)
+                } else if $value.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    $value.to_string()
+                };
                 Line::from(vec![
                     Span::styled(prefix, Style::default().fg(ACCENT).bold()),
                     Span::styled($label, Style::default().fg(DIM)),
-                    Span::styled(format!("{}{}", $display, cursor), $color),
+                    Span::styled(display, $color),
                 ])
             }};
         }
 
         let name_disp = self.lite_name.to_string();
-        let alias_disp = if self.lite_alias.is_empty() && step != 1 {
-            "(none)".to_string()
-        } else {
-            self.lite_alias.clone()
-        };
-        let args_disp = if self.lite_launch_args.is_empty() && step != 2 {
-            "(none)".to_string()
-        } else {
-            self.lite_launch_args.clone()
-        };
+        let alias_disp = self.lite_alias.to_string();
+        let args_disp = self.lite_launch_args.to_string();
 
         f.render_widget(
             Paragraph::new(Text::from(vec![
@@ -3375,7 +3531,7 @@ impl App {
         // Step 0: Profile name (any characters)
         let nf = if self.lite_step == 0 { "▶ " } else { "  " };
         let nd = if self.lite_step == 0 {
-            format!("{}█", self.lite_name)
+            display_with_cursor(&self.lite_name, self.cursor_pos)
         } else {
             self.lite_name.clone()
         };
@@ -3388,7 +3544,7 @@ impl App {
         // Step 1: Alias (alphanumeric only)
         let af = if self.lite_step == 1 { "▶ " } else { "  " };
         let ad = if self.lite_step == 1 {
-            format!("{}█", self.lite_alias)
+            display_with_cursor(&self.lite_alias, self.cursor_pos)
         } else {
             self.lite_alias.clone()
         };
@@ -3417,7 +3573,6 @@ impl App {
             } else {
                 "  "
             };
-            let cursor = if *step == self.lite_step { "█" } else { "" };
             let val = match *step {
                 2 => &self.lite_mod_opus,
                 3 => &self.lite_mod_sonnet,
@@ -3426,7 +3581,11 @@ impl App {
                 6 => &self.lite_mod_subagent,
                 _ => unreachable!(),
             };
-            let display = format!("{}{}", val, cursor);
+            let display = if *step == self.lite_step {
+                display_with_cursor(val, self.cursor_pos)
+            } else {
+                val.clone()
+            };
             let ck = if self.lite_1m[*idx1m] { "1m✓" } else { "1m " };
             let hint = if !val.is_empty() && !self.lite_models.is_empty() {
                 if let Some(m) = self.lite_models.iter().find(|m| m.contains(val.as_str())) {
@@ -3505,11 +3664,7 @@ impl App {
             )));
         }
         if extras_focus {
-            let buf = if self.input_buffer.is_empty() {
-                "█".to_string()
-            } else {
-                format!("{}█", self.input_buffer)
-            };
+            let buf = display_with_cursor(&self.input_buffer, self.cursor_pos);
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(buf, Style::default().fg(TEXT).bold()),
@@ -3527,19 +3682,17 @@ impl App {
         )));
         let la_focus = self.lite_step == 8;
         let la_prefix = if la_focus { "▶ " } else { "  " };
-        let la_val = if self.lite_launch_args.is_empty() && !la_focus {
-            "(none)"
+        let la_display = if la_focus {
+            display_with_cursor(&self.lite_launch_args, self.cursor_pos)
+        } else if self.lite_launch_args.is_empty() {
+            "(none)".to_string()
         } else {
-            &self.lite_launch_args
+            self.lite_launch_args.clone()
         };
-        let la_cursor = if la_focus { "█" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(la_prefix, Style::default().fg(ACCENT).bold()),
             Span::styled("L. args  ", Style::default().fg(DIM)),
-            Span::styled(
-                format!("{}{}", la_val, la_cursor),
-                Style::default().fg(Color::Rgb(200, 160, 100)),
-            ),
+            Span::styled(la_display, Style::default().fg(Color::Rgb(200, 160, 100))),
         ]));
         lines.push(Line::from(Span::styled(
             "  CLI flags to pass to claude on launch (space-separated, e.g. --dangerously-skip-permissions)",
@@ -3753,14 +3906,28 @@ impl App {
                 if total_steps > 1
                     && (code == KeyCode::Tab || modifiers.contains(KeyModifiers::CONTROL)) =>
             {
-                self.mode = Mode::ProviderAdd {
-                    step: (step + 1) % total_steps,
-                };
+                let next_step = (step + 1) % total_steps;
+                self.cursor_pos = provider_add_cursor_pos(
+                    next_step,
+                    self.provider_add_existing_id.as_deref(),
+                    &self.provider_name_buf,
+                    &self.provider_url_buf,
+                    &self.provider_key_name_buf,
+                    &self.provider_key_buf,
+                );
+                self.mode = Mode::ProviderAdd { step: next_step };
             }
             _ if total_steps > 1 && Self::is_prev_field_key(code, modifiers) => {
-                self.mode = Mode::ProviderAdd {
-                    step: (step + total_steps - 1) % total_steps,
-                };
+                let next_step = (step + total_steps - 1) % total_steps;
+                self.cursor_pos = provider_add_cursor_pos(
+                    next_step,
+                    self.provider_add_existing_id.as_deref(),
+                    &self.provider_name_buf,
+                    &self.provider_url_buf,
+                    &self.provider_key_name_buf,
+                    &self.provider_key_buf,
+                );
+                self.mode = Mode::ProviderAdd { step: next_step };
             }
             KeyCode::Enter => {
                 if step + 1 == total_steps {
@@ -3800,7 +3967,16 @@ impl App {
                         Err(e) => self.mode = Mode::Message(e.to_string(), true),
                     }
                 } else {
-                    self.mode = Mode::ProviderAdd { step: step + 1 };
+                    let next_step = step + 1;
+                    self.cursor_pos = provider_add_cursor_pos(
+                        next_step,
+                        self.provider_add_existing_id.as_deref(),
+                        &self.provider_name_buf,
+                        &self.provider_url_buf,
+                        &self.provider_key_name_buf,
+                        &self.provider_key_buf,
+                    );
+                    self.mode = Mode::ProviderAdd { step: next_step };
                 }
             }
             _ => {
@@ -4068,9 +4244,6 @@ impl App {
         };
 
         match code {
-            KeyCode::Char('q') => {
-                self.mode = provider_test_return_mode(source, &provider_id).unwrap_or(Mode::Normal);
-            }
             _ if Self::is_cancel_key(code, modifiers) => {
                 self.mode = provider_test_return_mode(source, &provider_id).unwrap_or(Mode::Normal);
             }
@@ -4145,6 +4318,28 @@ impl App {
                 ) {
                     self.provider_test_model_buf = completed;
                     self.cursor_pos = self.provider_test_model_buf.len();
+                    self.sync_provider_test_model_selection_from_buffer();
+                }
+            }
+            _ if field == 0 && Self::is_prev_selection_key(code, modifiers) => {
+                if !self.provider_test_models.is_empty() {
+                    if self.provider_test_model_selected == 0 {
+                        self.provider_test_model_selected = self.provider_test_models.len() - 1;
+                    } else {
+                        self.provider_test_model_selected -= 1;
+                    }
+                    self.provider_test_model_buf =
+                        self.provider_test_models[self.provider_test_model_selected].clone();
+                    self.cursor_pos = self.provider_test_model_buf.len();
+                }
+            }
+            _ if field == 0 && Self::is_next_selection_key(code, modifiers) => {
+                if !self.provider_test_models.is_empty() {
+                    self.provider_test_model_selected =
+                        (self.provider_test_model_selected + 1) % self.provider_test_models.len();
+                    self.provider_test_model_buf =
+                        self.provider_test_models[self.provider_test_model_selected].clone();
+                    self.cursor_pos = self.provider_test_model_buf.len();
                 }
             }
             _ if Self::is_next_field_key(code, modifiers) => {
@@ -4175,34 +4370,27 @@ impl App {
                     field: next_field,
                 };
             }
-            _ if field == 0 && Self::is_prev_list_key(code, modifiers) => {
-                if !self.provider_test_models.is_empty() {
-                    if self.provider_test_model_selected == 0 {
-                        self.provider_test_model_selected = self.provider_test_models.len() - 1;
-                    } else {
-                        self.provider_test_model_selected -= 1;
-                    }
-                    self.provider_test_model_buf =
-                        self.provider_test_models[self.provider_test_model_selected].clone();
-                    self.cursor_pos = self.provider_test_model_buf.len();
-                }
-            }
-            _ if field == 0 && Self::is_next_list_key(code, modifiers) => {
-                if !self.provider_test_models.is_empty() {
-                    self.provider_test_model_selected =
-                        (self.provider_test_model_selected + 1) % self.provider_test_models.len();
-                    self.provider_test_model_buf =
-                        self.provider_test_models[self.provider_test_model_selected].clone();
-                    self.cursor_pos = self.provider_test_model_buf.len();
-                }
-            }
             _ => {
-                let buf = if field == 0 {
-                    &mut self.provider_test_model_buf
+                let consumed = if field == 0 {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.provider_test_model_buf,
+                        &mut self.cursor_pos,
+                        true,
+                    )
                 } else {
-                    &mut self.provider_test_prompt_buf
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.provider_test_prompt_buf,
+                        &mut self.cursor_pos,
+                        true,
+                    )
                 };
-                emacs_edit(code, modifiers, buf, &mut self.cursor_pos, true);
+                if consumed && field == 0 {
+                    self.sync_provider_test_model_selection_from_buffer();
+                }
             }
         }
         Ok(())
@@ -4387,9 +4575,15 @@ impl App {
                     Mode::ProviderEditKeyInput { step, .. } => *step,
                     _ => 0,
                 };
+                let next_step = (step + 1) % 2;
+                self.cursor_pos = provider_key_cursor_pos(
+                    next_step,
+                    &self.provider_key_name_buf,
+                    &self.provider_key_buf,
+                );
                 self.mode = Mode::ProviderEditKeyInput {
                     provider_id: pid,
-                    step: (step + 1) % 2,
+                    step: next_step,
                 };
             }
             _ if Self::is_prev_field_key(code, modifiers) => {
@@ -4397,9 +4591,15 @@ impl App {
                     Mode::ProviderEditKeyInput { step, .. } => *step,
                     _ => 0,
                 };
+                let next_step = (step + 1) % 2;
+                self.cursor_pos = provider_key_cursor_pos(
+                    next_step,
+                    &self.provider_key_name_buf,
+                    &self.provider_key_buf,
+                );
                 self.mode = Mode::ProviderEditKeyInput {
                     provider_id: pid,
-                    step: (step + 1) % 2,
+                    step: next_step,
                 };
             }
             KeyCode::Enter => {
@@ -4427,9 +4627,15 @@ impl App {
                         step: 2,
                     };
                 } else {
+                    let next_step = step + 1;
+                    self.cursor_pos = provider_key_cursor_pos(
+                        next_step,
+                        &self.provider_key_name_buf,
+                        &self.provider_key_buf,
+                    );
                     self.mode = Mode::ProviderEditKeyInput {
                         provider_id: pid,
-                        step: step + 1,
+                        step: next_step,
                     };
                 }
             }
@@ -4547,9 +4753,15 @@ impl App {
                     Mode::ProviderKeyAdd { provider_id, step } => (provider_id.clone(), *step),
                     _ => return Ok(()),
                 };
+                let next_step = (step + 1) % 2;
+                self.cursor_pos = provider_key_cursor_pos(
+                    next_step,
+                    &self.provider_key_name_buf,
+                    &self.provider_key_buf,
+                );
                 self.mode = Mode::ProviderKeyAdd {
                     provider_id: pid,
-                    step: (step + 1) % 2,
+                    step: next_step,
                 };
             }
             _ if Self::is_prev_field_key(code, modifiers) => {
@@ -4557,9 +4769,15 @@ impl App {
                     Mode::ProviderKeyAdd { provider_id, step } => (provider_id.clone(), *step),
                     _ => return Ok(()),
                 };
+                let next_step = (step + 1) % 2;
+                self.cursor_pos = provider_key_cursor_pos(
+                    next_step,
+                    &self.provider_key_name_buf,
+                    &self.provider_key_buf,
+                );
                 self.mode = Mode::ProviderKeyAdd {
                     provider_id: pid,
-                    step: (step + 1) % 2,
+                    step: next_step,
                 };
             }
             KeyCode::Enter => {
@@ -4583,9 +4801,15 @@ impl App {
                         Err(e) => self.mode = Mode::Message(e.to_string(), true),
                     }
                 } else {
+                    let next_step = step + 1;
+                    self.cursor_pos = provider_key_cursor_pos(
+                        next_step,
+                        &self.provider_key_name_buf,
+                        &self.provider_key_buf,
+                    );
                     self.mode = Mode::ProviderKeyAdd {
                         provider_id: pid,
-                        step: step + 1,
+                        step: next_step,
                     };
                 }
             }
@@ -4723,10 +4947,16 @@ impl App {
                     Mode::ProviderKeyEdit { step, .. } => *step,
                     _ => 0,
                 };
+                let next_step = (step + 1) % 2;
+                self.cursor_pos = provider_key_cursor_pos(
+                    next_step,
+                    &self.provider_key_name_buf,
+                    &self.provider_key_buf,
+                );
                 self.mode = Mode::ProviderKeyEdit {
                     provider_id: pid,
                     key_id: kid,
-                    step: (step + 1) % 2,
+                    step: next_step,
                     source,
                 };
             }
@@ -4735,10 +4965,16 @@ impl App {
                     Mode::ProviderKeyEdit { step, .. } => *step,
                     _ => 0,
                 };
+                let next_step = (step + 1) % 2;
+                self.cursor_pos = provider_key_cursor_pos(
+                    next_step,
+                    &self.provider_key_name_buf,
+                    &self.provider_key_buf,
+                );
                 self.mode = Mode::ProviderKeyEdit {
                     provider_id: pid,
                     key_id: kid,
-                    step: (step + 1) % 2,
+                    step: next_step,
                     source,
                 };
             }
@@ -4773,10 +5009,16 @@ impl App {
                         Err(e) => self.mode = Mode::Message(e.to_string(), true),
                     }
                 } else {
+                    let next_step = step + 1;
+                    self.cursor_pos = provider_key_cursor_pos(
+                        next_step,
+                        &self.provider_key_name_buf,
+                        &self.provider_key_buf,
+                    );
                     self.mode = Mode::ProviderKeyEdit {
                         provider_id: pid,
                         key_id: kid,
-                        step: step + 1,
+                        step: next_step,
                         source,
                     };
                 }
@@ -5016,24 +5258,22 @@ impl App {
         for (label, value, editable) in fields {
             let active = editable && step == editable_index;
             let prefix = if active { "▶ " } else { "  " };
-            let cursor = if active { "█" } else { "" };
-            let val = if value.is_empty() && !active {
-                "(empty)"
+            let display = if active {
+                display_with_cursor(value, self.cursor_pos)
+            } else if value.is_empty() {
+                "(empty)".to_string()
             } else {
-                value
+                value.clone()
             };
             let style = if active {
                 Style::default().fg(TEXT).bold()
             } else {
                 Style::default().fg(MUTED)
             };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {}{}: {}", prefix, display_pad(label, 9), val),
-                    style,
-                ),
-                Span::styled(cursor, Style::default().fg(ACCENT)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {}{}: {}", prefix, display_pad(label, 9), display),
+                style,
+            )]));
             if editable {
                 editable_index += 1;
             }
@@ -5064,7 +5304,7 @@ impl App {
         let display = if self.provider_smart_paste_buf.is_empty() {
             "█".to_string()
         } else {
-            format!("{}█", self.provider_smart_paste_buf)
+            display_with_cursor(&self.provider_smart_paste_buf, self.cursor_pos)
         };
         let mut lines = vec![
             Line::from(""),
@@ -5109,8 +5349,9 @@ impl App {
             _ => return,
         };
 
+        let key_page_size = 6usize;
         let key_count = if step == 2 {
-            self.provider_keys_cache.len().min(6)
+            self.provider_keys_cache.len().min(key_page_size)
         } else {
             0
         };
@@ -5132,11 +5373,12 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let nf = if step == 0 { "▶ " } else { "  " };
-        let nc = if step == 0 { "█" } else { "" };
-        let nv = if self.provider_name_buf.is_empty() && step != 0 {
-            "(empty)"
+        let nv = if step == 0 {
+            display_with_cursor(&self.provider_name_buf, self.cursor_pos)
+        } else if self.provider_name_buf.is_empty() {
+            "(empty)".to_string()
         } else {
-            &self.provider_name_buf
+            self.provider_name_buf.clone()
         };
         let ns = if step == 0 {
             Style::default().fg(TEXT).bold()
@@ -5145,11 +5387,12 @@ impl App {
         };
 
         let uf = if step == 1 { "▶ " } else { "  " };
-        let uc = if step == 1 { "█" } else { "" };
-        let uv = if self.provider_url_buf.is_empty() && step != 1 {
-            "(empty)"
+        let uv = if step == 1 {
+            display_with_cursor(&self.provider_url_buf, self.cursor_pos)
+        } else if self.provider_url_buf.is_empty() {
+            "(empty)".to_string()
         } else {
-            &self.provider_url_buf
+            self.provider_url_buf.clone()
         };
         let us = if step == 1 {
             Style::default().fg(TEXT).bold()
@@ -5166,14 +5409,8 @@ impl App {
 
         let mut lines = vec![
             Line::from(""),
-            Line::from(vec![Span::styled(
-                format!("  {}Name:  {}{}", nf, nv, nc),
-                ns,
-            )]),
-            Line::from(vec![Span::styled(
-                format!("  {}URL:   {}{}", uf, uv, uc),
-                us,
-            )]),
+            Line::from(vec![Span::styled(format!("  {}Name:  {}", nf, nv), ns)]),
+            Line::from(vec![Span::styled(format!("  {}URL:   {}", uf, uv), us)]),
             Line::from(vec![Span::styled(
                 format!("  {}Keys: {} keys", kf, self.provider_keys_cache.len()),
                 ks,
@@ -5188,8 +5425,11 @@ impl App {
                     Style::default().fg(DIM),
                 )));
             } else {
-                for (i, k) in self.provider_keys_cache.iter().take(6).enumerate() {
-                    let selected = i == self.provider_key_selected;
+                let total = self.provider_keys_cache.len();
+                let (start, end) = visible_window(self.provider_key_selected, total, key_page_size);
+                for (i, k) in self.provider_keys_cache[start..end].iter().enumerate() {
+                    let index = start + i;
+                    let selected = index == self.provider_key_selected;
                     let style = if selected {
                         Style::default().fg(ACCENT).bold()
                     } else {
@@ -5254,9 +5494,13 @@ impl App {
         }
 
         let sel = self.provider_key_selected;
+        let total = self.provider_keys_cache.len();
+        let page_size = 6usize;
+        let (start, end) = visible_window(sel, total, page_size);
         let mut lines: Vec<Line> = Vec::new();
-        for (i, k) in self.provider_keys_cache.iter().enumerate() {
-            let selected = i == sel;
+        for (i, k) in self.provider_keys_cache[start..end].iter().enumerate() {
+            let index = start + i;
+            let selected = index == sel;
             let style = if selected {
                 Style::default().fg(ACCENT).bold()
             } else {
@@ -5268,6 +5512,17 @@ impl App {
                 Span::styled(format!("{} ", display_pad(&k.name, 20)), style),
                 Span::styled(mask_api_key(&k.api_key), Style::default().fg(DIM)),
             ]));
+        }
+        if total > page_size {
+            let current_page = start / page_size + 1;
+            let total_pages = total.div_ceil(page_size);
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  Page {}/{}  Ctrl+P/N to scroll",
+                    current_page, total_pages
+                ),
+                Style::default().fg(DIM),
+            )));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -5314,14 +5569,18 @@ impl App {
         }
 
         let sel = self.provider_key_selected;
+        let total = self.provider_keys_cache.len();
+        let page_size = 6usize;
+        let (start, end) = visible_window(sel, total, page_size);
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
             "  Select a key for provider testing.",
             Style::default().fg(DIM),
         )));
         lines.push(Line::from(""));
-        for (i, k) in self.provider_keys_cache.iter().enumerate() {
-            let selected = i == sel;
+        for (i, k) in self.provider_keys_cache[start..end].iter().enumerate() {
+            let index = start + i;
+            let selected = index == sel;
             let style = if selected {
                 Style::default().fg(ACCENT).bold()
             } else {
@@ -5333,6 +5592,14 @@ impl App {
                 Span::styled(format!("{} ", display_pad(&k.name, 20)), style),
                 Span::styled(mask_api_key(&k.api_key), Style::default().fg(DIM)),
             ]));
+        }
+        if total > page_size {
+            let current_page = start / page_size + 1;
+            let total_pages = total.div_ceil(page_size);
+            lines.push(Line::from(Span::styled(
+                format!("  Page {}/{}", current_page, total_pages),
+                Style::default().fg(DIM),
+            )));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -5361,21 +5628,22 @@ impl App {
         for i in 0..2 {
             let active = step == i;
             let prefix = if active { "▶ " } else { "  " };
-            let cursor = if active { "█" } else { "" };
-            let val = if values[i].is_empty() && !active {
-                "(empty)"
+            let display = if active {
+                display_with_cursor(values[i], self.cursor_pos)
+            } else if values[i].is_empty() {
+                "(empty)".to_string()
             } else {
-                values[i]
+                values[i].clone()
             };
             let style = if active {
                 Style::default().fg(TEXT).bold()
             } else {
                 Style::default().fg(MUTED)
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {}{}: {}", prefix, labels[i], val), style),
-                Span::styled(cursor, Style::default().fg(ACCENT)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {}{}: {}", prefix, labels[i], display),
+                style,
+            )]));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -5404,21 +5672,22 @@ impl App {
         for i in 0..2 {
             let active = step == i;
             let prefix = if active { "▶ " } else { "  " };
-            let cursor = if active { "█" } else { "" };
-            let val = if values[i].is_empty() && !active {
-                "(empty)"
+            let display = if active {
+                display_with_cursor(values[i], self.cursor_pos)
+            } else if values[i].is_empty() {
+                "(empty)".to_string()
             } else {
-                values[i]
+                values[i].clone()
             };
             let style = if active {
                 Style::default().fg(TEXT).bold()
             } else {
                 Style::default().fg(MUTED)
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {}{}: {}", prefix, labels[i], val), style),
-                Span::styled(cursor, Style::default().fg(ACCENT)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {}{}: {}", prefix, labels[i], display),
+                style,
+            )]));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -5479,14 +5748,14 @@ impl App {
         let model_active = field == 0;
         let prompt_active = field == 1;
         let model_value = if model_active {
-            format!("{}█", self.provider_test_model_buf)
+            display_with_cursor(&self.provider_test_model_buf, self.cursor_pos)
         } else if self.provider_test_model_buf.is_empty() {
             "(empty)".to_string()
         } else {
             self.provider_test_model_buf.clone()
         };
         let prompt_value = if prompt_active {
-            format!("{}█", self.provider_test_prompt_buf)
+            display_with_cursor(&self.provider_test_prompt_buf, self.cursor_pos)
         } else if self.provider_test_prompt_buf.is_empty() {
             "(empty)".to_string()
         } else {
@@ -5505,8 +5774,8 @@ impl App {
         let mut list_lines = vec![Line::from("")];
         let page_size = 5usize;
         let total = self.provider_test_models.len();
-        let page_start = (self.provider_test_model_selected / page_size) * page_size;
-        let page_end = (page_start + page_size).min(total);
+        let (page_start, page_end) =
+            visible_window(self.provider_test_model_selected, total, page_size);
         if total == 0 {
             let msg = match &self.provider_test_model_fetch_state {
                 ModelFetchState::Loaded | ModelFetchState::Empty => {
@@ -5585,7 +5854,7 @@ impl App {
                 Style::default().fg(DIM),
             )),
             Line::from(Span::styled(
-                "  Enter sends one non-streaming /v1/messages request. Esc/Ctrl+G or q exits.",
+                "  Enter sends one non-streaming /v1/messages request. Esc/Ctrl+G exits.",
                 Style::default().fg(DIM),
             )),
         ];
@@ -5725,21 +5994,22 @@ impl App {
         for i in 0..2 {
             let active = step == i;
             let prefix = if active { "▶ " } else { "  " };
-            let cursor = if active { "█" } else { "" };
-            let val = if values[i].is_empty() && !active {
-                "(empty)"
+            let display = if active {
+                display_with_cursor(values[i], self.cursor_pos)
+            } else if values[i].is_empty() {
+                "(empty)".to_string()
             } else {
-                values[i]
+                values[i].clone()
             };
             let style = if active {
                 Style::default().fg(TEXT).bold()
             } else {
                 Style::default().fg(MUTED)
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {}{}: {}", prefix, labels[i], val), style),
-                Span::styled(cursor, Style::default().fg(ACCENT)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {}{}: {}", prefix, labels[i], display),
+                style,
+            )]));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -6268,6 +6538,57 @@ mod tests {
     }
 
     #[test]
+    fn visible_window_returns_correct_range() {
+        assert_eq!(visible_window(0, 10, 6), (0, 6));
+        assert_eq!(visible_window(5, 10, 6), (0, 6));
+        assert_eq!(visible_window(6, 10, 6), (6, 10));
+        assert_eq!(visible_window(9, 10, 6), (6, 10));
+        assert_eq!(visible_window(0, 0, 6), (0, 0));
+        assert_eq!(visible_window(0, 3, 6), (0, 3));
+    }
+
+    #[test]
+    fn display_with_cursor_inserts_at_start_middle_end() {
+        assert_eq!(display_with_cursor("abc", 0), "█abc");
+        assert_eq!(display_with_cursor("abc", 1), "a█bc");
+        assert_eq!(display_with_cursor("abc", 3), "abc█");
+    }
+
+    #[test]
+    fn display_with_cursor_handles_empty_string() {
+        assert_eq!(display_with_cursor("", 0), "█");
+    }
+
+    #[test]
+    fn display_with_cursor_clamps_to_utf8_boundary() {
+        assert_eq!(display_with_cursor("白日", "白".len()), "白█日");
+        assert_eq!(display_with_cursor("白日", 1), "█白日");
+        assert_eq!(display_with_cursor("白日", usize::MAX), "白日█");
+    }
+
+    #[test]
+    fn insert_str_at_cursor_inserts_at_utf8_boundary() {
+        let mut buf = "白日".to_string();
+        let mut cursor_pos = 1usize;
+
+        insert_str_at_cursor(&mut buf, &mut cursor_pos, "X");
+
+        assert_eq!(buf, "X白日");
+        assert_eq!(cursor_pos, "X".len());
+    }
+
+    #[test]
+    fn insert_filtered_str_at_cursor_filters_alias_chars() {
+        let mut buf = "ab".to_string();
+        let mut cursor_pos = 1usize;
+
+        insert_filtered_str_at_cursor(&mut buf, &mut cursor_pos, "c.d_1-", is_alias_char);
+
+        assert_eq!(buf, "acd_1-b");
+        assert_eq!(cursor_pos, "acd_1-".len());
+    }
+
+    #[test]
     fn emacs_edit_handles_multiple_chinese_characters() {
         let mut buf = String::new();
         let mut pos = 0usize;
@@ -6455,6 +6776,165 @@ mod tests {
             complete_provider_test_model(&models, "deepseek-v4"),
             Some("deepseek-ai/deepseek-v4-flash".to_string())
         );
+    }
+
+    #[test]
+    fn provider_test_q_is_text_input() {
+        let mut app = make_test_app();
+        app.provider_test_prompt_buf = "quic".into();
+        app.cursor_pos = app.provider_test_prompt_buf.len();
+        app.mode = Mode::ProviderAnthropicTest {
+            provider_id: "prov_generated".into(),
+            key_id: "key_generated".into(),
+            source: ProviderTestSource::Page,
+            field: 1,
+        };
+
+        app.handle_provider_anthropic_test(KeyCode::Char('q'), KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(app.provider_test_prompt_buf, "quicq");
+        assert_eq!(app.cursor_pos, app.provider_test_prompt_buf.len());
+        assert_eq!(
+            app.mode,
+            Mode::ProviderAnthropicTest {
+                provider_id: "prov_generated".into(),
+                key_id: "key_generated".into(),
+                source: ProviderTestSource::Page,
+                field: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_test_model_navigation_takes_priority_when_model_field_is_active() {
+        let mut app = make_test_app();
+        app.provider_test_models = vec!["model-a".into(), "model-b".into()];
+        app.provider_test_model_buf = "model-a".into();
+        app.provider_test_prompt_buf = "Hello".into();
+        app.provider_test_model_selected = 0;
+        app.cursor_pos = app.provider_test_model_buf.len();
+        app.mode = Mode::ProviderAnthropicTest {
+            provider_id: "prov_generated".into(),
+            key_id: "key_generated".into(),
+            source: ProviderTestSource::Page,
+            field: 0,
+        };
+
+        app.handle_provider_anthropic_test(KeyCode::Char('n'), KeyModifiers::CONTROL)
+            .unwrap();
+
+        assert_eq!(app.provider_test_model_selected, 1);
+        assert_eq!(app.provider_test_model_buf, "model-b");
+        assert_eq!(app.cursor_pos, app.provider_test_model_buf.len());
+        assert_eq!(
+            app.mode,
+            Mode::ProviderAnthropicTest {
+                provider_id: "prov_generated".into(),
+                key_id: "key_generated".into(),
+                source: ProviderTestSource::Page,
+                field: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_test_model_field_accepts_bare_j_and_k() {
+        let mut app = make_test_app();
+        app.provider_test_models = vec!["model-a".into(), "model-b".into()];
+        app.provider_test_model_buf.clear();
+        app.provider_test_model_selected = 0;
+        app.cursor_pos = 0;
+        app.mode = Mode::ProviderAnthropicTest {
+            provider_id: "prov_generated".into(),
+            key_id: "key_generated".into(),
+            source: ProviderTestSource::Page,
+            field: 0,
+        };
+
+        app.handle_provider_anthropic_test(KeyCode::Char('j'), KeyModifiers::empty())
+            .unwrap();
+        app.handle_provider_anthropic_test(KeyCode::Char('k'), KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(app.provider_test_model_buf, "jk");
+        assert_eq!(app.provider_test_model_selected, 0);
+    }
+
+    #[test]
+    fn provider_test_model_field_down_still_navigates_models() {
+        let mut app = make_test_app();
+        app.provider_test_models = vec!["model-a".into(), "model-b".into()];
+        app.provider_test_model_buf = "model-a".into();
+        app.provider_test_model_selected = 0;
+        app.cursor_pos = app.provider_test_model_buf.len();
+        app.mode = Mode::ProviderAnthropicTest {
+            provider_id: "prov_generated".into(),
+            key_id: "key_generated".into(),
+            source: ProviderTestSource::Page,
+            field: 0,
+        };
+
+        app.handle_provider_anthropic_test(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(app.provider_test_model_buf, "model-b");
+        assert_eq!(app.provider_test_model_selected, 1);
+        assert_eq!(app.cursor_pos, app.provider_test_model_buf.len());
+    }
+
+    #[test]
+    fn provider_test_manual_model_match_syncs_selection() {
+        let mut app = make_test_app();
+        app.provider_test_models = vec!["model-a".into(), "model-b".into(), "model-c".into()];
+        app.provider_test_model_buf = "model-a".into();
+        app.provider_test_model_selected = 0;
+        app.cursor_pos = app.provider_test_model_buf.len();
+        app.mode = Mode::ProviderAnthropicTest {
+            provider_id: "prov_generated".into(),
+            key_id: "key_generated".into(),
+            source: ProviderTestSource::Page,
+            field: 0,
+        };
+
+        app.handle_provider_anthropic_test(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            .unwrap();
+        for ch in "model-c".chars() {
+            app.handle_provider_anthropic_test(KeyCode::Char(ch), KeyModifiers::empty())
+                .unwrap();
+        }
+
+        assert_eq!(app.provider_test_model_buf, "model-c");
+        assert_eq!(app.provider_test_model_selected, 2);
+    }
+
+    #[test]
+    fn lite_set_slot_value_moves_cursor_to_end() {
+        let mut app = make_test_app();
+        app.lite_step = 5;
+        app.cursor_pos = 0;
+
+        app.set_slot_value("claude-sonnet".into());
+
+        assert_eq!(app.lite_mod_model, "claude-sonnet");
+        assert_eq!(app.cursor_pos, app.lite_mod_model.len());
+    }
+
+    #[test]
+    fn lite_fetching_ctrl_g_cancels() {
+        let mut app = make_test_app();
+        app.mode = Mode::LiteFetching;
+
+        match app.mode.clone() {
+            Mode::LiteFetching => {
+                if App::is_cancel_key(KeyCode::Char('g'), KeyModifiers::CONTROL) {
+                    app.mode = Mode::Normal;
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]
