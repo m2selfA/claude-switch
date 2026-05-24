@@ -1,6 +1,6 @@
 [package]
 name = "cswitch"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
 description = "Multi-account profile manager for Claude Code"
 license = "MIT"

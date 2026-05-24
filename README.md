@@ -75,7 +75,7 @@ cswitch
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
-| `cswitch aliases [--remote <host>] [--verbose]` | Generate local shell aliases, or sync remote shims via ssh/scp/sftp when `--remote` is supplied |
+| `cswitch aliases [--local] [--remote <host>]... [--verbose]` | Generate/sync local shell aliases and shims, and/or sync self-contained shims to remote hosts via sftp (`--remote` is repeatable) |
 | `cswitch provider list` | List shared API providers |
 | `cswitch provider add <name> --url <url> --key <key>` | Add a shared provider with an initial key |
 | `cswitch provider keys <provider-id>` | List keys for a provider |
@@ -146,13 +146,20 @@ On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, 
 
 On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs self-contained bash scripts there instead of printing aliases. Each script is executable, stand-alone, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
 
-You can also sync shims to a remote machine with:
+You can also sync shims to remote machines with:
 
 ```bash
+# Sync to a single remote host
 cswitch aliases --remote my-host
+
+# Sync to multiple remote hosts at once
+cswitch aliases --remote host1 --remote host2
+
+# Sync both locally and remotely
+cswitch aliases --local --remote my-host
 ```
 
-This uses your existing local `ssh`, `scp`, and `sftp` commands. With `--remote`, `cswitch` only syncs the remote machine; it does not print local aliases. Remote sync currently supports lightweight profiles only and skips full directory-isolated profiles. It probes the remote OS first and keeps the default output concise; add `--verbose` to see per-stage and per-file sync details:
+This uses your existing local `sftp` command. Without `--local` or `--remote`, aliases are generated locally as before. `--remote` is repeatable for batch syncing multiple hosts. Remote sync currently supports lightweight profiles only and skips full directory-isolated profiles. It probes the remote OS first and keeps the default output concise; add `--verbose` to see per-stage and per-file sync details:
 - remote Unix-like hosts receive shell shims in `~/.varusers/bin`
 - remote Windows hosts receive `.cmd` shims in `%USERPROFILE%\.local\bin`
 

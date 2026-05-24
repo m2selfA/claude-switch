@@ -1589,16 +1589,20 @@ impl ProfileManager {
 
         let output = child.wait_with_output().context("Failed to wait on sftp")?;
 
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
         if !output.status.success() {
-            // sftp exits non-zero on some glitches that are harmless;
-            // only bail if both stdout and stderr are empty.
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stdout.is_empty() && stderr.is_empty() {
+            // sftp exits non-zero on some benign glitches (e.g. -mkdir on
+            // an existing dir).  Only bail when there is actual error output.
+            if !stderr.is_empty() {
+                bail!("sftp error: {}", stderr);
+            }
+            if stdout.is_empty() {
                 bail!("sftp failed silently");
             }
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(stdout)
     }
 
     fn run_remote_sftp_batch(host: &str, batch_path: &str) -> Result<String> {
@@ -1632,16 +1636,54 @@ impl ProfileManager {
             .map(str::to_string)
             .context("sftp pwd did not produce a usable directory")?;
 
-        let remote_os = if home.starts_with("/C:") || home.starts_with("/D:") {
-            RemoteOs::Windows
-        } else {
-            RemoteOs::Unix
+        // Windows sftp pwd looks like /C:/Users/alice — detect any drive letter
+        let remote_os = {
+            let bytes = home.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0] == b'/'
+                && bytes[1].is_ascii_alphabetic()
+                && bytes[2] == b':'
+            {
+                RemoteOs::Windows
+            } else {
+                RemoteOs::Unix
+            }
         };
         Ok((remote_os, home))
     }
 
+    /// Wrap a path in double quotes for sftp batch mode (handles spaces).
+    fn sftp_quote(path: &str) -> String {
+        format!("\"{}\"", path.replace('"', "\\\""))
+    }
+
     fn ensure_remote_dir(host: &str, remote_bin_dir: &str) -> Result<()> {
-        Self::run_remote_sftp_commands(host, &format!("-mkdir {}\n", remote_bin_dir))?;
+        // Normalize backslashes to forward slashes for sftp
+        let dir = remote_bin_dir.replace('\\', "/");
+        // Build -mkdir commands for every prefix so parents are created
+        let mut cmds = String::new();
+        let mut accumulated = String::new();
+        for component in dir.split('/') {
+            if component.is_empty() {
+                if dir.starts_with('/') {
+                    accumulated.push('/');
+                }
+                continue;
+            }
+            if accumulated == "/" {
+                accumulated.push_str(component);
+            } else if accumulated.is_empty() {
+                accumulated = component.to_string();
+            } else {
+                accumulated.push('/');
+                accumulated.push_str(component);
+            }
+            cmds.push_str(&format!("-mkdir {}\n", Self::sftp_quote(&accumulated)));
+        }
+        if !cmds.is_empty() {
+            // Errors are benign (dirs already exist); stderr will be empty thanks to -prefix
+            let _ = Self::run_remote_sftp_commands(host, &cmds);
+        }
         Ok(())
     }
 
@@ -1655,7 +1697,10 @@ impl ProfileManager {
         } else {
             remote_bin_dir.to_string()
         };
-        let output = Self::run_remote_sftp_commands(host, &format!("ls -1 {}/\n", sftp_dir))?;
+        let output = Self::run_remote_sftp_commands(
+            host,
+            &format!("ls -1 {}\n", Self::sftp_quote(&format!("{}/", sftp_dir))),
+        )?;
         Ok(output
             .lines()
             .filter_map(|line| {
@@ -1679,7 +1724,11 @@ impl ProfileManager {
         let local_tmp = std::env::temp_dir().join(format!("cswitch-marker-{}", Uuid::new_v4()));
         Self::run_remote_sftp_commands(
             host,
-            &format!("get {} {}\n", sftp_path, local_tmp.display()),
+            &format!(
+                "get {} {}\n",
+                Self::sftp_quote(&sftp_path),
+                local_tmp.display()
+            ),
         )?;
         let content = fs::read_to_string(&local_tmp).unwrap_or_default();
         let _ = fs::remove_file(&local_tmp);
@@ -1692,7 +1741,7 @@ impl ProfileManager {
         } else {
             remote_path.to_string()
         };
-        Self::run_remote_sftp_commands(host, &format!("rm {}\n", sftp_path))?;
+        Self::run_remote_sftp_commands(host, &format!("rm {}\n", Self::sftp_quote(&sftp_path)))?;
         Ok(())
     }
 
