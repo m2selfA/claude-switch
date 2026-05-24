@@ -10,15 +10,21 @@ use ureq::RequestExt;
 use uuid::Uuid;
 
 const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
+    "/compatible-mode/v1", // DashScope style
     "/api/claudecode",
     "/api/anthropic",
     "/apps/anthropic",
+    "/v1/messages", // full message endpoint
     "/api/coding",
     "/claudecode",
-    "/anthropic",
     "/step_plan",
+    "/anthropic",
+    "/messages", // bare message endpoint
+    "/api/v1",   // new-api/one-api style
     "/coding",
     "/claude",
+    "/api", // OpenRouter style
+    "/v1",  // LM Studio bare /v1
 ];
 
 const API_TEST_TIMEOUT_SECS: u64 = 8;
@@ -2354,6 +2360,33 @@ fn strip_compat_suffix(base_url: &str) -> Option<&str> {
     None
 }
 
+fn build_message_candidates(base_url: &str) -> Result<Vec<String>> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("Base URL is empty");
+    }
+    let mut candidates = Vec::new();
+    if trimmed.ends_with("/v1") {
+        candidates.push(format!("{trimmed}/messages"));
+    } else {
+        candidates.push(format!("{trimmed}/v1/messages"));
+    }
+    if let Some(stripped) = strip_compat_suffix(trimmed) {
+        let root = stripped.trim_end_matches('/');
+        if !root.is_empty() && root.contains("://") {
+            candidates.push(format!("{root}/v1/messages"));
+            candidates.push(format!("{root}/messages"));
+        }
+    }
+    let mut unique = Vec::with_capacity(candidates.len());
+    for url in candidates {
+        if !unique.iter().any(|existing| existing == &url) {
+            unique.push(url);
+        }
+    }
+    Ok(unique)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicTestResult {
     pub text: String,
@@ -2361,15 +2394,16 @@ pub struct AnthropicTestResult {
     pub output_tokens: Option<u64>,
 }
 
-/// Send one non-streaming Anthropic-compatible /v1/messages request.
+/// Send one non-streaming Anthropic-compatible /v1/messages request,
+/// trying multiple endpoint candidates derived from the base URL.
 pub fn test_anthropic_message(
     base_url: &str,
     auth_token: &str,
     model: &str,
     prompt: &str,
 ) -> Result<AnthropicTestResult> {
-    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
+    let candidates = build_message_candidates(base_url)?;
+    let body_json = serde_json::json!({
         "model": model,
         "max_tokens": 64,
         "messages": [
@@ -2379,48 +2413,78 @@ pub fn test_anthropic_message(
             }
         ],
     });
-    let send_body = ureq::SendBody::from_json(&body).context("Failed to encode request JSON")?;
-    let request = ureq::http::Request::builder()
-        .method(ureq::http::Method::POST)
-        .uri(url.as_str())
-        .header("content-type", "application/json; charset=utf-8")
-        .header(
-            "x-api-key",
-            ureq::http::HeaderValue::from_bytes(auth_token.as_bytes())
-                .context("Invalid API key for x-api-key header")?,
-        )
-        .header("anthropic-version", "2023-06-01")
-        .body(send_body)
-        .context("Failed to build Anthropic test request")?;
+    let api_key_header = ureq::http::HeaderValue::from_bytes(auth_token.as_bytes())
+        .context("Invalid API key for x-api-key header")?;
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(API_TEST_TIMEOUT_SECS)))
         .build()
         .new_agent();
-    let mut resp = request
-        .with_agent(&agent)
-        .configure()
-        .http_status_as_error(false)
-        .run()
-        .context("Failed to call Anthropic /v1/messages")?;
-    let status = resp.status();
-    let raw = resp
-        .body_mut()
-        .read_to_string()
-        .context("Failed to read Anthropic /v1/messages response")?;
-    if !status.is_success() {
-        let body = raw.trim();
-        let body = if body.is_empty() {
-            "(empty body)"
-        } else {
-            body
+
+    let mut last_err: Option<String> = None;
+    for url in &candidates {
+        let send_body =
+            ureq::SendBody::from_json(&body_json).context("Failed to encode request JSON")?;
+        let request = ureq::http::Request::builder()
+            .method(ureq::http::Method::POST)
+            .uri(url.as_str())
+            .header("content-type", "application/json; charset=utf-8")
+            .header("x-api-key", api_key_header.clone())
+            .header("anthropic-version", "2023-06-01")
+            .body(send_body)
+            .context("Failed to build Anthropic test request")?;
+        let resp = request
+            .with_agent(&agent)
+            .configure()
+            .http_status_as_error(false)
+            .run();
+        let mut resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format!("Failed to call {url}: {e:#}"));
+                continue;
+            }
         };
-        bail!(
-            "Anthropic test failed with HTTP {}: {}",
-            status.as_u16(),
-            body
-        );
+        let status = resp.status();
+        let raw = resp
+            .body_mut()
+            .read_to_string()
+            .context("Failed to read Anthropic /v1/messages response")?;
+        if status == ureq::http::StatusCode::NOT_FOUND
+            || status == ureq::http::StatusCode::METHOD_NOT_ALLOWED
+        {
+            continue;
+        }
+        if status == ureq::http::StatusCode::UNAUTHORIZED
+            || status == ureq::http::StatusCode::FORBIDDEN
+        {
+            let body = raw.trim();
+            let body = if body.is_empty() {
+                "(empty body)"
+            } else {
+                body
+            };
+            bail!(
+                "Anthropic test failed with HTTP {} at {url}: {}",
+                status.as_u16(),
+                body
+            );
+        }
+        if !status.is_success() {
+            let body = raw.trim();
+            let body = if body.is_empty() {
+                "(empty body)"
+            } else {
+                body
+            };
+            last_err = Some(format!("HTTP {} at {url}: {body}", status.as_u16()));
+            continue;
+        }
+        return parse_anthropic_message_response(&raw);
     }
-    parse_anthropic_message_response(&raw)
+    match last_err {
+        Some(err) => bail!("All message endpoint candidates failed. Last error: {err}"),
+        None => bail!("No message endpoint candidates available for base URL: {base_url}"),
+    }
 }
 
 fn parse_anthropic_message_response(raw: &str) -> Result<AnthropicTestResult> {
@@ -3242,6 +3306,9 @@ mod tests {
 
     #[test]
     fn test_anthropic_message_sends_expected_request_and_parses_response() {
+        // For a bare host like http://127.0.0.1:PORT, build_message_candidates
+        // produces only one candidate: {host}/v1/messages. So a single-response
+        // test server is sufficient.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
@@ -3471,5 +3538,123 @@ mod tests {
         assert!(content.contains("PERCENT"));
         assert!(content.contains("%%with%%percent"));
         assert!(content.contains("^!with^!bang"));
+    }
+
+    #[test]
+    fn strip_compat_suffix_strips_new_entries() {
+        let cases = vec![
+            (
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "https://dashscope.aliyuncs.com",
+            ),
+            ("https://api.openrouter.ai/api", "https://api.openrouter.ai"),
+            (
+                "https://proxy.example.com/api/v1",
+                "https://proxy.example.com",
+            ),
+            ("https://example.com/v1", "https://example.com"),
+            ("https://example.com/v1/messages", "https://example.com"),
+            ("https://example.com/messages", "https://example.com"),
+        ];
+        for (url, expected_root) in cases {
+            let stripped = strip_compat_suffix(url.trim_end_matches('/'));
+            assert_eq!(stripped, Some(expected_root), "strip_compat_suffix({url})");
+        }
+    }
+
+    #[test]
+    fn build_message_candidates_basic() {
+        let candidates = build_message_candidates("https://api.anthropic.com").unwrap();
+        assert_eq!(candidates, vec!["https://api.anthropic.com/v1/messages"]);
+    }
+
+    #[test]
+    fn build_message_candidates_with_compat_suffix() {
+        let candidates = build_message_candidates("https://proxy.example.com/api").unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                "https://proxy.example.com/api/v1/messages",
+                "https://proxy.example.com/v1/messages",
+                "https://proxy.example.com/messages",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_message_candidates_v1_suffix() {
+        let candidates = build_message_candidates("https://example.com/v1").unwrap();
+        // /v1 is a KNOWN_COMPAT_SUFFIX, so strip yields root https://example.com
+        assert_eq!(
+            candidates,
+            vec![
+                "https://example.com/v1/messages",
+                "https://example.com/messages",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_message_candidates_messages_suffix() {
+        let candidates = build_message_candidates("https://example.com/v1/messages").unwrap();
+        // /v1/messages is stripped, root is https://example.com
+        assert_eq!(
+            candidates,
+            vec![
+                "https://example.com/v1/messages/v1/messages",
+                "https://example.com/v1/messages",
+                "https://example.com/messages",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_message_candidates_empty_url() {
+        assert!(build_message_candidates("").is_err());
+        assert!(build_message_candidates("   ").is_err());
+    }
+
+    #[test]
+    fn build_model_discovery_candidates_new_suffixes() {
+        let cases = vec![
+            (
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                vec![
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+                    "https://dashscope.aliyuncs.com/v1/models",
+                    "https://dashscope.aliyuncs.com/models",
+                ],
+            ),
+            (
+                "https://api.openrouter.ai/api",
+                vec![
+                    "https://api.openrouter.ai/api/v1/models",
+                    "https://api.openrouter.ai/v1/models",
+                    "https://api.openrouter.ai/models",
+                ],
+            ),
+            (
+                "https://proxy.example.com/api/v1",
+                vec![
+                    "https://proxy.example.com/api/v1/models",
+                    "https://proxy.example.com/v1/models",
+                    "https://proxy.example.com/models",
+                ],
+            ),
+            (
+                "http://localhost:1234/v1",
+                vec![
+                    "http://localhost:1234/v1/models",
+                    "http://localhost:1234/models",
+                ],
+            ),
+        ];
+        for (url, expected) in cases {
+            let candidates = build_model_discovery_candidates(url).unwrap();
+            assert_eq!(
+                candidates, expected,
+                "build_model_discovery_candidates({url})"
+            );
+        }
     }
 }

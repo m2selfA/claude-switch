@@ -103,7 +103,7 @@ Run `cswitch` with no arguments to open the TUI.
 | `/` | Search profiles by name or alias |
 | `t` | Add lightweight profile from provider/key |
 | `Ctrl+Y` | Smart input provider/key from clipboard in Provider Manager |
-| `Provider Manager: t` | Discover models from provider-aware candidate endpoints; failure does not prove the provider is unusable, and manual model names may still work |
+| `Provider Manager: t` | Discover models from provider-aware candidate endpoints; tries multiple URL patterns (e.g. `/v1`, `/api`, `/compatible-mode/v1`, `/anthropic` suffixes) and falls back to the root; failure does not prove the provider is unusable, and manual model names may still work |
 | `a` | Add full profile (directory isolation) |
 | `e` | Edit profile (name/alias/flags, or full model editor for lite) |
 | `m` | Toggle [1m] suffix on model slots |
