@@ -4591,7 +4591,7 @@ impl App {
                     Mode::ProviderEditKeyInput { step, .. } => *step,
                     _ => 0,
                 };
-                let next_step = (step + 1) % 2;
+                let next_step = (step + 2 - 1) % 2;
                 self.cursor_pos = provider_key_cursor_pos(
                     next_step,
                     &self.provider_key_name_buf,
@@ -4769,7 +4769,7 @@ impl App {
                     Mode::ProviderKeyAdd { provider_id, step } => (provider_id.clone(), *step),
                     _ => return Ok(()),
                 };
-                let next_step = (step + 1) % 2;
+                let next_step = (step + 2 - 1) % 2;
                 self.cursor_pos = provider_key_cursor_pos(
                     next_step,
                     &self.provider_key_name_buf,
@@ -4965,7 +4965,7 @@ impl App {
                     Mode::ProviderKeyEdit { step, .. } => *step,
                     _ => 0,
                 };
-                let next_step = (step + 1) % 2;
+                let next_step = (step + 2 - 1) % 2;
                 self.cursor_pos = provider_key_cursor_pos(
                     next_step,
                     &self.provider_key_name_buf,

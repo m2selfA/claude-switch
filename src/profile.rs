@@ -455,16 +455,22 @@ impl ProfileManager {
 
         // Remove conflicting profiles
         let registry = self.load_registry()?;
-        for (id, p) in &registry.profiles {
-            if p.name == name || p.alias.as_deref() == alias {
-                let dir = self.profiles_dir.join(p.dir_name());
+        let conflicts: Vec<_> = registry
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.name == name || p.alias.as_deref() == alias)
+            .map(|(id, p)| (id.clone(), p.dir_name()))
+            .collect();
+        if !conflicts.is_empty() {
+            let mut reg = self.load_registry()?;
+            for (id, dir_name) in conflicts {
+                let dir = self.profiles_dir.join(dir_name);
                 if dir.exists() {
                     let _ = fs::remove_dir_all(&dir);
                 }
-                let mut reg = self.load_registry()?;
-                reg.profiles.remove(id);
-                self.save_registry(&reg)?;
+                reg.profiles.remove(&id);
             }
+            self.save_registry(&reg)?;
         }
 
         let id = Uuid::new_v4().to_string();
@@ -1580,12 +1586,11 @@ impl ProfileManager {
             .context("Failed to spawn sftp")?;
 
         use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .context("Failed to write sftp batch commands")?;
+        {
+            let mut stdin_handle = child.stdin.take().unwrap();
+            let _ = stdin_handle.write_all(stdin.as_bytes());
+            // stdin_handle is dropped here, closing the pipe so sftp sees EOF.
+        }
 
         let output = child.wait_with_output().context("Failed to wait on sftp")?;
 
@@ -1600,6 +1605,18 @@ impl ProfileManager {
             }
             if stdout.is_empty() {
                 bail!("sftp failed silently");
+            }
+            // Some sftp implementations print errors to stdout with empty stderr.
+            // Bail if stdout contains known error patterns.
+            let lower = stdout.to_lowercase();
+            if lower.contains("no such file")
+                || lower.contains("not found")
+                || lower.contains("permission denied")
+                || lower.contains("failure")
+                || lower.contains("couldn't")
+                || lower.contains("cannot")
+            {
+                bail!("sftp error (stdout): {}", stdout);
             }
         }
         Ok(stdout)
@@ -1637,17 +1654,21 @@ impl ProfileManager {
             .context("sftp pwd did not produce a usable directory")?;
 
         // Windows sftp pwd looks like /C:/Users/alice — detect any drive letter
-        let remote_os = {
-            let bytes = home.as_bytes();
-            if bytes.len() >= 3
-                && bytes[0] == b'/'
-                && bytes[1].is_ascii_alphabetic()
-                && bytes[2] == b':'
-            {
-                RemoteOs::Windows
-            } else {
-                RemoteOs::Unix
-            }
+        let bytes = home.as_bytes();
+        let is_windows = bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':';
+        let remote_os = if is_windows {
+            RemoteOs::Windows
+        } else if home.starts_with('/') {
+            RemoteOs::Unix
+        } else {
+            bail!(
+                "Could not determine remote OS for '{}' from sftp pwd output: {}",
+                host,
+                home
+            );
         };
         Ok((remote_os, home))
     }
@@ -1722,16 +1743,23 @@ impl ProfileManager {
             remote_path.to_string()
         };
         let local_tmp = std::env::temp_dir().join(format!("cswitch-marker-{}", Uuid::new_v4()));
-        Self::run_remote_sftp_commands(
-            host,
-            &format!(
-                "get {} {}\n",
-                Self::sftp_quote(&sftp_path),
-                local_tmp.display()
-            ),
-        )?;
-        let content = fs::read_to_string(&local_tmp).unwrap_or_default();
+        let sftp_cmd = format!(
+            "get {} {}\n",
+            Self::sftp_quote(&sftp_path),
+            Self::sftp_quote(&local_tmp.display().to_string()),
+        );
+        let get_result = Self::run_remote_sftp_commands(host, &sftp_cmd);
+        // Clean up temp file regardless of success/failure
+        let content = match &get_result {
+            Ok(_) => fs::read_to_string(&local_tmp).context("Failed to read temp marker file")?,
+            Err(_) => String::new(),
+        };
         let _ = fs::remove_file(&local_tmp);
+        // If the remote file doesn't exist, sftp get fails — treat as "no marker"
+        if get_result.is_err() {
+            return Ok(false);
+        }
+        get_result?;
         Ok(content.contains(CMD_MARKER) || content.contains(SH_MARKER))
     }
 
@@ -1785,12 +1813,12 @@ impl ProfileManager {
             let local_path = temp_root.join(file_name);
             let remote_path = Self::join_remote_path(remote_dir, remote_os, file_name);
             batch.push_str(&format!(
-                "put \"{}\" \"{}\"\n",
-                local_path.display(),
-                remote_path
+                "put {} {}\n",
+                Self::sftp_quote(&local_path.display().to_string()),
+                Self::sftp_quote(&remote_path),
             ));
             if matches!(remote_os, RemoteOs::Unix) {
-                batch.push_str(&format!("chmod 755 \"{}\"\n", remote_path));
+                batch.push_str(&format!("chmod 755 {}\n", Self::sftp_quote(&remote_path),));
             }
         }
         batch
