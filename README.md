@@ -13,7 +13,7 @@ Two isolation modes:
 ### Cargo (requires Rust)
 
 ```bash
-cargo install cswitch
+cargo install cswitch --version 0.7.8
 ```
 
 ### Pre-built binaries
@@ -75,7 +75,7 @@ cswitch
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
-| `cswitch aliases [--local] [--remote <host>]... [--verbose]` | Generate/sync local shell aliases and shims, and/or sync self-contained shims to remote hosts via sftp (`--remote` is repeatable) |
+| `cswitch aliases [--local] [--remote <host>]... [--verbose]` | Generate/sync local shell aliases and launchers, and/or sync remote launchers plus any required TinyFish prompt/plugin companion files via sftp (`--remote` is repeatable) |
 | `cswitch provider list` | List shared API providers |
 | `cswitch provider add <name> --url <url> --key <key>` | Add a shared provider with an initial key |
 | `cswitch provider keys <provider-id>` | List keys for a provider |
@@ -102,6 +102,7 @@ Run `cswitch` with no arguments to open the TUI.
 | `Shift+Enter` | Launch without stored launch args |
 | `/` | Search profiles by name or alias |
 | `t` | Add lightweight profile from provider/key |
+| `T` | Batch-test all non-official provider keys from Profile Manager using one editable Anthropic prompt, with per-base-URL spacing and sorted results |
 | `Ctrl+Y` | Smart input provider/key from clipboard in Provider Manager |
 | `Provider Manager: t` | Discover models from provider-aware candidate endpoints; tries multiple URL patterns (e.g. `/v1`, `/api`, `/compatible-mode/v1`, `/anthropic` suffixes) and falls back to the root; failure does not prove the provider is unusable, and manual model names may still work |
 | `a` | Add full profile (directory isolation) |
@@ -142,9 +143,9 @@ claude-work       # launch with the "work" profile
 claude-personal   # launch with the "personal" profile
 ```
 
-On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs self-contained `.cmd` files into `~/.local/bin` (`%USERPROFILE%\.local\bin`). Each `.cmd` is fully stand-alone (no dependency on `cswitch`) and supports `--no-extras` to skip stored launch args. The files are maintained automatically — added, updated, and cleaned up when profiles change.
+On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs generated `.cmd` launchers into `~/.local/bin` (`%USERPROFILE%\.local\bin`). For ordinary lightweight profiles the `.cmd` stays self-contained; for TinyFish-enhanced profiles `cswitch` also maintains companion prompt/plugin files under `~/.claude-switch/generated/`. Each generated plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. The launchers support `--no-extras`, and all generated files are added, updated, and cleaned up automatically when profiles change.
 
-On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs self-contained bash scripts there instead of printing aliases. Each script is executable, stand-alone, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
+On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs generated bash launchers there instead of printing aliases. Non-TinyFish lightweight profiles remain self-contained; TinyFish-enhanced profiles also use managed companion prompt/plugin files under `~/.claude-switch/generated/`. Each generated plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. Each script is executable, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
 
 You can also sync shims to remote machines with:
 
@@ -159,7 +160,7 @@ cswitch aliases --remote host1 --remote host2
 cswitch aliases --local --remote my-host
 ```
 
-This uses your existing local `sftp` command. Without `--local` or `--remote`, aliases are generated locally as before. `--remote` is repeatable for batch syncing multiple hosts. Remote sync currently supports lightweight profiles only and skips full directory-isolated profiles. It probes the remote OS first and keeps the default output concise; add `--verbose` to see per-stage and per-file sync details:
+This uses your existing local `sftp` command. Without `--local` or `--remote`, aliases are generated locally as before. `--remote` is repeatable for batch syncing multiple hosts. Remote sync currently supports lightweight profiles only and skips full directory-isolated profiles. It probes the remote OS first and syncs both the launchers and any required TinyFish prompt/plugin companion files; add `--verbose` to see per-stage and per-file sync details:
 - remote Unix-like hosts receive shell shims in `~/.varusers/bin`
 - remote Windows hosts receive `.cmd` shims in `%USERPROFILE%\.local\bin`
 
@@ -185,7 +186,9 @@ Stored in `~/.claude-switch/profiles/<alias-or-name>/`. Launch sets `CLAUDE_CONF
 
 ### Lightweight profiles
 
-No directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` JSON on launch. Token and base URL can also come from a linked shared provider/key.
+No dedicated profile directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` on launch. For ordinary profiles this remains an inline settings payload; for TinyFish-enhanced profiles `cswitch` also materializes managed prompt/plugin files under `~/.claude-switch/generated/`, with plugins written as standard Claude plugin directories containing `.claude-plugin/plugin.json` and `hooks/hooks.json`, while TinyFish-specific permissions remain inline in `--settings`. Token and base URL can also come from a linked shared provider/key.
+
+`extras` may also include the reserved control entry `CLAUDE_SWITCH_TINYFISH=off` to keep a profile on the normal inline-settings path even when its `base_url` would otherwise trigger TinyFish plugin generation.
 
 Nothing in `~/.claude` is modified.
 

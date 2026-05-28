@@ -12,12 +12,19 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::cli_args::all_flag_names;
 use crate::env_vars::all_var_names;
 use crate::profile::{
     LightweightEnv, ModelDiscoverySuccess, Profile, ProfileKind, ProfileManager, Provider,
-    ProviderKey, discover_models, fetch_models, test_anthropic_message,
+    ProviderKey, discover_models, discover_models_with_timeout, fetch_models,
+    test_anthropic_message, test_anthropic_message_with_timeout,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -65,6 +72,7 @@ enum Mode {
         source: ProviderTestSource,
         field: usize,
         model: String,
+        endpoint_used: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         body: String,
@@ -136,6 +144,16 @@ enum Mode {
         key_id: String,
         name: String,
     },
+    /// Key cannot be deleted because profiles still reference it.
+    ProviderKeyInUse {
+        provider_id: String,
+        key_id: String,
+        name: String,
+        return_mode: Box<Mode>,
+    },
+    PublicSitePrompt,
+    PublicSiteTesting,
+    PublicSiteResults,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -169,6 +187,75 @@ enum ModelFetchState {
     Loaded,
     Empty,
     Unavailable(String),
+}
+
+const PUBLIC_SITE_TEST_DEFAULT_PROMPT: &str = "Hello";
+const PUBLIC_SITE_TEST_GROUP_GAP_MS: u64 = 1500;
+const PUBLIC_SITE_TEST_TIMEOUT_SECS: u64 = 16;
+const PUBLIC_SITE_TEST_PAGE_SIZE: usize = 5;
+const PUBLIC_SITE_EVENT_POLL_MS: u64 = 100;
+const PUBLIC_SITE_DETAIL_SCROLL_STEP: u16 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PublicSiteModelSource {
+    None,
+    DefaultHaiku,
+    DefaultOpus,
+    DefaultSonnet,
+    ExplicitModel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicSiteTarget {
+    provider_id: String,
+    provider_name: String,
+    key_id: String,
+    key_name: String,
+    base_url: String,
+    profile_id: String,
+    profile_name: String,
+    api_key: String,
+    preflight_error: Option<String>,
+    configured_model: Option<String>,
+    model_source: PublicSiteModelSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PublicSiteRequestKey {
+    base_url: String,
+    provider_identity: String,
+    key_identity: String,
+    model_identity: String,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicSiteRequestPlan {
+    key: PublicSiteRequestKey,
+    request_target: PublicSiteTarget,
+    consumers: Vec<PublicSiteTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicSiteTestResult {
+    provider_name: String,
+    key_name: String,
+    base_url: String,
+    profile_name: String,
+    model: String,
+    first_char: Option<String>,
+    response_preview: Option<String>,
+    endpoint_used: Option<String>,
+    latency_ms: Option<u128>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    is_success: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+enum PublicSiteWorkerEvent {
+    Result(PublicSiteTestResult),
 }
 
 /// Emacs-style text editing on a String buffer with cursor position.
@@ -399,6 +486,381 @@ fn provider_edit_cursor_pos(step: usize, name: &str, url: &str) -> usize {
     }
 }
 
+fn normalize_base_url_key(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn base_url_host(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    let without_scheme = trimmed.split("://").nth(1).unwrap_or(trimmed);
+    let host = without_scheme
+        .split('/')
+        .next()?
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+fn is_public_test_excluded_base_url(base_url: &str) -> bool {
+    matches!(
+        base_url_host(base_url).as_deref(),
+        Some("api.anthropic.com" | "api.deepseek.com")
+    )
+}
+
+fn normalized_public_site_model(model: &str) -> Option<String> {
+    let trimmed = trim_model_context_suffix(model).trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn public_site_model_from_profile(profile: &Profile) -> (PublicSiteModelSource, Option<String>) {
+    let Some(env) = profile.env.as_ref() else {
+        return (PublicSiteModelSource::None, None);
+    };
+    if let Some(model) = env
+        .default_haiku_model
+        .as_deref()
+        .and_then(normalized_public_site_model)
+    {
+        return (PublicSiteModelSource::DefaultHaiku, Some(model));
+    }
+    if let Some(model) = env.model.as_deref().and_then(normalized_public_site_model) {
+        return (PublicSiteModelSource::ExplicitModel, Some(model));
+    }
+    if let Some(model) = env
+        .default_sonnet_model
+        .as_deref()
+        .and_then(normalized_public_site_model)
+    {
+        return (PublicSiteModelSource::DefaultSonnet, Some(model));
+    }
+    if let Some(model) = env
+        .default_opus_model
+        .as_deref()
+        .and_then(normalized_public_site_model)
+    {
+        return (PublicSiteModelSource::DefaultOpus, Some(model));
+    }
+    (PublicSiteModelSource::None, None)
+}
+
+fn sort_public_site_results(results: &mut [PublicSiteTestResult]) {
+    results.sort_by(|left, right| {
+        right
+            .is_success
+            .cmp(&left.is_success)
+            .then_with(|| left.latency_ms.cmp(&right.latency_ms))
+            .then_with(|| left.first_char.cmp(&right.first_char))
+            .then_with(|| left.provider_name.cmp(&right.provider_name))
+            .then_with(|| left.key_name.cmp(&right.key_name))
+    });
+}
+
+fn public_site_first_char(text: &str) -> Option<String> {
+    text.trim().chars().next().map(|ch| ch.to_string())
+}
+
+fn public_site_preview(text: &str, max_chars: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut preview = String::new();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        if idx >= max_chars {
+            preview.push_str("...");
+            break;
+        }
+        preview.push(ch);
+    }
+    Some(preview)
+}
+
+fn public_site_request_timeout() -> Duration {
+    Duration::from_secs(PUBLIC_SITE_TEST_TIMEOUT_SECS)
+}
+
+fn public_site_target_preflight_result(target: &PublicSiteTarget) -> PublicSiteTestResult {
+    PublicSiteTestResult {
+        provider_name: target.provider_name.clone(),
+        key_name: target.key_name.clone(),
+        base_url: target.base_url.clone(),
+        profile_name: target.profile_name.clone(),
+        model: target.configured_model.clone().unwrap_or_default(),
+        first_char: None,
+        response_preview: None,
+        endpoint_used: None,
+        latency_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        is_success: false,
+        error: Some(
+            target
+                .preflight_error
+                .clone()
+                .unwrap_or_else(|| "Unknown public-test preflight error.".into()),
+        ),
+    }
+}
+
+fn public_site_result_detail(result: &PublicSiteTestResult) -> String {
+    let latency = result
+        .latency_ms
+        .map(|ms| format!("{ms}ms"))
+        .unwrap_or_else(|| "n/a".into());
+    let endpoint = result.endpoint_used.as_deref().unwrap_or("(none)");
+    if result.is_success {
+        format!(
+            "Provider: {}\nKey: {}\nBase URL: {}\nProfile: {}\nModel: {}\nLatency: {}\nEndpoint: {}\nReply: {}",
+            result.provider_name,
+            result.key_name,
+            result.base_url,
+            result.profile_name,
+            result.model,
+            latency,
+            endpoint,
+            result.response_preview.as_deref().unwrap_or("(empty)")
+        )
+    } else {
+        format!(
+            "Error: {}\n\nProvider: {}\nKey: {}\nBase URL: {}\nProfile: {}\nModel: {}\nLatency: {}",
+            result.error.as_deref().unwrap_or("Unknown error"),
+            result.provider_name,
+            result.key_name,
+            result.base_url,
+            result.profile_name,
+            if result.model.is_empty() {
+                "(unresolved)"
+            } else {
+                &result.model
+            },
+            latency
+        )
+    }
+}
+
+fn public_site_result_detail_lines(result: &PublicSiteTestResult) -> Vec<String> {
+    public_site_result_detail(result)
+        .lines()
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn wrapped_visual_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    UnicodeWidthStr::width(text).max(1).div_ceil(width)
+}
+
+fn public_site_detail_scroll_limit(detail_lines: &[String], width: u16, height: u16) -> u16 {
+    let visible_height = height.max(1) as usize;
+    let width = width.max(1) as usize;
+    let total_lines = detail_lines
+        .iter()
+        .map(|line| wrapped_visual_line_count(line, width))
+        .sum::<usize>()
+        .max(1);
+    total_lines.saturating_sub(visible_height) as u16
+}
+
+fn public_site_request_key(target: &PublicSiteTarget, prompt: &str) -> PublicSiteRequestKey {
+    PublicSiteRequestKey {
+        base_url: normalize_base_url_key(&target.base_url),
+        provider_identity: if target.provider_id.is_empty() {
+            "inline".to_string()
+        } else {
+            target.provider_id.clone()
+        },
+        key_identity: if target.key_id.is_empty() {
+            format!("inline:{}", target.api_key)
+        } else {
+            target.key_id.clone()
+        },
+        model_identity: target
+            .configured_model
+            .clone()
+            .unwrap_or_else(|| "__DISCOVER__".to_string()),
+        prompt: prompt.to_string(),
+    }
+}
+
+fn build_public_site_request_plans(
+    targets: &[PublicSiteTarget],
+    prompt: &str,
+) -> Vec<PublicSiteRequestPlan> {
+    let mut plans: BTreeMap<PublicSiteRequestKey, PublicSiteRequestPlan> = BTreeMap::new();
+
+    for target in targets {
+        if target.preflight_error.is_some() {
+            continue;
+        }
+        let key = public_site_request_key(target, prompt);
+        plans
+            .entry(key.clone())
+            .and_modify(|plan| plan.consumers.push(target.clone()))
+            .or_insert_with(|| PublicSiteRequestPlan {
+                key,
+                request_target: target.clone(),
+                consumers: vec![target.clone()],
+            });
+    }
+
+    plans.into_values().collect()
+}
+
+fn fan_out_public_site_result(
+    template: &PublicSiteTestResult,
+    target: &PublicSiteTarget,
+) -> PublicSiteTestResult {
+    let mut result = template.clone();
+    result.provider_name = target.provider_name.clone();
+    result.key_name = target.key_name.clone();
+    result.base_url = target.base_url.clone();
+    result.profile_name = target.profile_name.clone();
+    result
+}
+
+fn ellipsize(value: &str, max_chars: usize) -> String {
+    let mut shortened = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            shortened.push_str("...");
+            return shortened;
+        }
+        shortened.push(ch);
+    }
+    shortened
+}
+
+fn execute_public_site_target_with_timeout(
+    target: &PublicSiteTarget,
+    prompt: &str,
+    timeout: Duration,
+) -> PublicSiteTestResult {
+    if let Some(error) = target.preflight_error.as_ref() {
+        return PublicSiteTestResult {
+            provider_name: target.provider_name.clone(),
+            key_name: target.key_name.clone(),
+            base_url: target.base_url.clone(),
+            profile_name: target.profile_name.clone(),
+            model: target.configured_model.clone().unwrap_or_default(),
+            first_char: None,
+            response_preview: None,
+            endpoint_used: None,
+            latency_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            is_success: false,
+            error: Some(error.clone()),
+        };
+    }
+    let mut model = target.configured_model.clone();
+    if model.is_none() {
+        match discover_models_with_timeout(&target.base_url, &target.api_key, timeout) {
+            Ok(discovery) => {
+                model = discovery
+                    .models
+                    .into_iter()
+                    .find(|candidate| !candidate.trim().is_empty());
+                if model.is_some() {
+                    thread::sleep(Duration::from_millis(PUBLIC_SITE_TEST_GROUP_GAP_MS));
+                }
+            }
+            Err(failure) => {
+                return PublicSiteTestResult {
+                    provider_name: target.provider_name.clone(),
+                    key_name: target.key_name.clone(),
+                    base_url: target.base_url.clone(),
+                    profile_name: target.profile_name.clone(),
+                    model: String::new(),
+                    first_char: None,
+                    response_preview: None,
+                    endpoint_used: None,
+                    latency_ms: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    is_success: false,
+                    error: Some(format!(
+                        "No configured model and model discovery failed: {}",
+                        failure.message
+                    )),
+                };
+            }
+        }
+    }
+
+    let Some(model) = model else {
+        return PublicSiteTestResult {
+            provider_name: target.provider_name.clone(),
+            key_name: target.key_name.clone(),
+            base_url: target.base_url.clone(),
+            profile_name: target.profile_name.clone(),
+            model: String::new(),
+            first_char: None,
+            response_preview: None,
+            endpoint_used: None,
+            latency_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            is_success: false,
+            error: Some("No configured model and discovery returned no models.".into()),
+        };
+    };
+
+    let started = Instant::now();
+    match test_anthropic_message_with_timeout(
+        &target.base_url,
+        &target.api_key,
+        &model,
+        prompt,
+        timeout,
+    ) {
+        Ok(response) => PublicSiteTestResult {
+            provider_name: target.provider_name.clone(),
+            key_name: target.key_name.clone(),
+            base_url: target.base_url.clone(),
+            profile_name: target.profile_name.clone(),
+            model,
+            first_char: public_site_first_char(&response.text),
+            response_preview: public_site_preview(&response.text, 40),
+            endpoint_used: Some(response.endpoint_used),
+            latency_ms: Some(started.elapsed().as_millis()),
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            is_success: true,
+            error: None,
+        },
+        Err(error) => PublicSiteTestResult {
+            provider_name: target.provider_name.clone(),
+            key_name: target.key_name.clone(),
+            base_url: target.base_url.clone(),
+            profile_name: target.profile_name.clone(),
+            model,
+            first_char: None,
+            response_preview: None,
+            endpoint_used: None,
+            latency_ms: Some(started.elapsed().as_millis()),
+            input_tokens: None,
+            output_tokens: None,
+            is_success: false,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn execute_public_site_target(target: &PublicSiteTarget, prompt: &str) -> PublicSiteTestResult {
+    execute_public_site_target_with_timeout(target, prompt, public_site_request_timeout())
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 pub struct App {
     manager: ProfileManager,
@@ -449,6 +911,17 @@ pub struct App {
     providers_cache: Vec<Provider>,
     provider_keys_cache: Vec<ProviderKey>,
     provider_key_selected: usize,
+    provider_key_linked_profiles: Vec<Profile>,
+    provider_key_linked_profile_selected: usize,
+    public_site_prompt_buf: String,
+    public_site_targets: Vec<PublicSiteTarget>,
+    public_site_results: Vec<PublicSiteTestResult>,
+    public_site_result_selected: usize,
+    public_site_detail_scroll: u16,
+    public_site_completed: usize,
+    public_site_total: usize,
+    public_site_status: String,
+    public_site_event_rx: Option<mpsc::Receiver<PublicSiteWorkerEvent>>,
     lite_mod_opus: String,
     lite_mod_sonnet: String,
     lite_mod_haiku: String,
@@ -514,6 +987,17 @@ impl App {
             providers_cache: Vec::new(),
             provider_keys_cache: Vec::new(),
             provider_key_selected: 0,
+            provider_key_linked_profiles: Vec::new(),
+            provider_key_linked_profile_selected: 0,
+            public_site_prompt_buf: PUBLIC_SITE_TEST_DEFAULT_PROMPT.to_string(),
+            public_site_targets: Vec::new(),
+            public_site_results: Vec::new(),
+            public_site_result_selected: 0,
+            public_site_detail_scroll: 0,
+            public_site_completed: 0,
+            public_site_total: 0,
+            public_site_status: String::new(),
+            public_site_event_rx: None,
             lite_edit_id: String::new(),
             lite_mod_opus: String::new(),
             lite_mod_sonnet: String::new(),
@@ -543,6 +1027,57 @@ impl App {
                 .position(idx);
         }
         Ok(())
+    }
+
+    fn poll_public_site_worker_events(&mut self) {
+        let mut disconnected = false;
+        let mut pending = Vec::new();
+        if let Some(rx) = self.public_site_event_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => pending.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in pending {
+            match event {
+                PublicSiteWorkerEvent::Result(result) => {
+                    self.public_site_completed += 1;
+                    self.public_site_status = format!(
+                        "Completed {}/{} provider keys",
+                        self.public_site_completed, self.public_site_total
+                    );
+                    self.public_site_results.push(result);
+                    sort_public_site_results(&mut self.public_site_results);
+                    if self.public_site_result_selected >= self.public_site_results.len()
+                        && !self.public_site_results.is_empty()
+                    {
+                        self.public_site_result_selected = self.public_site_results.len() - 1;
+                    }
+                }
+            }
+        }
+
+        if (disconnected || self.public_site_completed >= self.public_site_total)
+            && self.public_site_event_rx.is_some()
+        {
+            self.public_site_event_rx = None;
+            if matches!(self.mode, Mode::PublicSiteTesting) {
+                self.mode = Mode::PublicSiteResults;
+            }
+            if self.public_site_total == 0 {
+                self.public_site_status = "No eligible non-official provider keys found.".into();
+            } else {
+                self.public_site_status =
+                    format!("Finished {} provider-key tests", self.public_site_total);
+            }
+        }
     }
 
     fn apply_filter(&mut self) {
@@ -669,6 +1204,109 @@ impl App {
             .selected()
             .and_then(|fi| self.filtered_indices.get(fi))
             .and_then(|&i| self.profiles.get(i))
+    }
+
+    fn resolve_public_site_credentials(
+        &self,
+        profile: &Profile,
+    ) -> (String, String, Option<String>) {
+        match self.manager.resolve_credentials(profile) {
+            Ok((token, url)) => {
+                let token = token.unwrap_or_default().trim().to_string();
+                let url = url
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string();
+                let preflight_error = if token.is_empty() {
+                    Some("No resolved auth token/key for this profile.".to_string())
+                } else if url.is_empty() {
+                    Some("No resolved base URL for this profile.".to_string())
+                } else {
+                    None
+                };
+                (token, url, preflight_error)
+            }
+            Err(error) => (String::new(), String::new(), Some(error.to_string())),
+        }
+    }
+
+    fn collect_public_site_targets(&self) -> Result<Vec<PublicSiteTarget>> {
+        let providers = self.manager.list_providers()?;
+        let provider_map: HashMap<String, Provider> = providers
+            .into_iter()
+            .map(|provider| (provider.id.clone(), provider))
+            .collect();
+        let mut targets = Vec::new();
+
+        for profile in &self.profiles {
+            if profile.kind != ProfileKind::Lightweight {
+                continue;
+            }
+            let (token, resolved_url, preflight_error) =
+                self.resolve_public_site_credentials(profile);
+            let (model_source, configured_model) = public_site_model_from_profile(profile);
+
+            if let (Some(provider_id), Some(key_id)) = (&profile.provider_id, &profile.key_id) {
+                let provider = provider_map.get(provider_id);
+                let fallback_base_url = provider
+                    .map(|p| p.base_url.trim().trim_end_matches('/').to_string())
+                    .unwrap_or_default();
+                let target_base_url = if resolved_url.is_empty() {
+                    fallback_base_url
+                } else {
+                    resolved_url
+                };
+                if !target_base_url.is_empty() && is_public_test_excluded_base_url(&target_base_url)
+                {
+                    continue;
+                }
+                let key = provider.and_then(|p| p.keys.get(key_id));
+                targets.push(PublicSiteTarget {
+                    provider_id: provider_id.clone(),
+                    provider_name: provider
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| provider_id.clone()),
+                    key_id: key_id.clone(),
+                    key_name: key
+                        .map(|k| k.name.clone())
+                        .unwrap_or_else(|| key_id.clone()),
+                    base_url: target_base_url,
+                    profile_id: profile.id.clone(),
+                    profile_name: profile.name.clone(),
+                    api_key: token,
+                    preflight_error,
+                    configured_model,
+                    model_source,
+                });
+            } else {
+                if !resolved_url.is_empty() && is_public_test_excluded_base_url(&resolved_url) {
+                    continue;
+                }
+                targets.push(PublicSiteTarget {
+                    provider_id: String::new(),
+                    provider_name: "Inline".into(),
+                    key_id: String::new(),
+                    key_name: "Inline".into(),
+                    base_url: resolved_url,
+                    profile_id: profile.id.clone(),
+                    profile_name: profile.name.clone(),
+                    api_key: token,
+                    preflight_error,
+                    configured_model,
+                    model_source,
+                });
+            }
+        }
+
+        targets.sort_by(|left, right| {
+            normalize_base_url_key(&left.base_url)
+                .cmp(&normalize_base_url_key(&right.base_url))
+                .then_with(|| left.profile_name.cmp(&right.profile_name))
+                .then_with(|| left.provider_name.cmp(&right.provider_name))
+                .then_with(|| left.key_name.cmp(&right.key_name))
+        });
+        Ok(targets)
     }
 
     fn move_up(&mut self) {
@@ -856,7 +1494,12 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
+            self.poll_public_site_worker_events();
             terminal.draw(|f| self.render(f))?;
+
+            if !event::poll(Duration::from_millis(PUBLIC_SITE_EVENT_POLL_MS))? {
+                continue;
+            }
 
             match event::read()? {
                 Event::Key(key) => {
@@ -955,6 +1598,18 @@ impl App {
                         Mode::ConfirmDeleteKey { .. } => {
                             self.handle_confirm_delete_key(key.code)?;
                         }
+                        Mode::ProviderKeyInUse { .. } => {
+                            self.handle_provider_key_in_use(key.code, key.modifiers)?;
+                        }
+                        Mode::PublicSitePrompt => {
+                            self.handle_public_site_prompt(key.code, key.modifiers)?;
+                        }
+                        Mode::PublicSiteTesting => {
+                            self.handle_public_site_results(key.code, key.modifiers)?;
+                        }
+                        Mode::PublicSiteResults => {
+                            self.handle_public_site_results(key.code, key.modifiers)?;
+                        }
                         Mode::Message(_, _) => {
                             self.mode = self.message_return_mode.take().unwrap_or(Mode::Normal);
                         }
@@ -1036,6 +1691,9 @@ impl App {
                         text,
                     );
                 }
+            }
+            Mode::PublicSitePrompt => {
+                insert_str_at_cursor(&mut self.public_site_prompt_buf, &mut self.cursor_pos, text);
             }
             Mode::ProviderAdd { step } => {
                 let buf = match step {
@@ -1136,6 +1794,10 @@ impl App {
 
             KeyCode::Char('t') => {
                 self.start_lite_profile_creation()?;
+            }
+
+            KeyCode::Char('T') => {
+                self.start_public_site_prompt()?;
             }
 
             KeyCode::Char('a') => {
@@ -1491,6 +2153,10 @@ impl App {
     // ── Shim sync ─────────────────────────────────────────────────────────────
 
     fn sync_shims(&self) {
+        #[cfg(test)]
+        if std::env::var_os("CSWITCH_TEST_DISABLE_SHIM_SYNC").is_some() {
+            return;
+        }
         #[cfg(target_os = "windows")]
         {
             if let Err(e) = self.manager.sync_cmd_aliases() {
@@ -1793,7 +2459,10 @@ impl App {
                 } else if self.lite_step == 7 {
                     // Extras: cycle through known Claude Code env var names
                     let prefix = self.input_buffer.split('=').next().unwrap_or("");
-                    let vars = all_var_names();
+                    let mut vars: Vec<&str> = all_var_names().to_vec();
+                    vars.push("CLAUDE_SWITCH_TINYFISH");
+                    vars.sort();
+                    vars.dedup();
                     if let Some(pos) = vars.iter().position(|v| v == &prefix) {
                         let next = (pos + 1) % vars.len();
                         self.input_buffer = format!("{}=", vars[next]);
@@ -2317,6 +2986,11 @@ impl App {
             Mode::ProviderKeyEdit { step, .. } => self.render_provider_key_edit_popup(f, *step),
             Mode::ConfirmDeleteProvider { .. } => self.render_confirm_delete_provider_popup(f),
             Mode::ConfirmDeleteKey { .. } => self.render_confirm_delete_key_popup(f),
+            Mode::ProviderKeyInUse { .. } => self.render_provider_key_in_use_popup(f),
+            Mode::PublicSitePrompt => self.render_public_site_prompt_popup(f),
+            Mode::PublicSiteTesting | Mode::PublicSiteResults => {
+                self.render_public_site_results_popup(f)
+            }
             _ => {}
         }
     }
@@ -2908,6 +3582,27 @@ impl App {
                 ("enter", "confirm"),
                 ("esc/Ctrl+G", "clear"),
             ]
+        } else if matches!(self.mode, Mode::PublicSitePrompt) {
+            vec![
+                ("type", "prompt"),
+                ("enter", "run"),
+                ("esc/Ctrl+G", "back"),
+                ("q", "text"),
+            ]
+        } else if matches!(self.mode, Mode::PublicSiteTesting) {
+            vec![
+                ("Ctrl+P/N", "results"),
+                ("PgUp/PgDn", "page"),
+                ("esc/Ctrl+G", "cancel"),
+                ("q", "close"),
+            ]
+        } else if matches!(self.mode, Mode::PublicSiteResults) {
+            vec![
+                ("Ctrl+P/N", "results"),
+                ("PgUp/PgDn", "page"),
+                ("enter", "close"),
+                ("esc/Ctrl+G", "back"),
+            ]
         } else if matches!(self.mode, Mode::ProviderAnthropicOutcome { .. }) {
             vec![("any key", "back"), ("q", "quit")]
         } else if matches!(self.mode, Mode::ProviderAnthropicTest { .. }) {
@@ -2936,6 +3631,7 @@ impl App {
                     ("Shift+Enter", "w/o args"),
                     ("/", "search"),
                     ("t", "lite"),
+                    ("T", "public test"),
                     ("a", "add"),
                     ("e", "edit"),
                     ("m", "[1m]"),
@@ -2997,6 +3693,7 @@ impl App {
             ("Shift+Enter", "Launch without stored flags"),
             ("/", "Search profiles by name or alias"),
             ("t", "Add lightweight profile from provider/key"),
+            ("T", "Batch test non-official provider keys"),
             ("Ctrl+Y", "Smart input provider from clipboard"),
             (
                 "Provider: t",
@@ -3643,6 +4340,7 @@ impl App {
             "API_TIMEOUT_MS",
             "MAX_THINKING_TOKENS",
             "CLAUDE_CONFIG_DIR",
+            "CLAUDE_SWITCH_TINYFISH",
         ];
         let total_known = crate::env_vars::all_var_names().len();
         lines.push(Line::from(Span::styled(
@@ -3655,6 +4353,10 @@ impl App {
         lines.push(Line::from(Span::styled(
             format!("  {}", hint_vars.join("  ")),
             Style::default().fg(Color::Rgb(70, 80, 90)),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  cswitch-only control: CLAUDE_SWITCH_TINYFISH=off disables TinyFish injection for this profile",
+            Style::default().fg(Color::Rgb(95, 105, 115)),
         )));
 
         for extra in &self.lite_extras {
@@ -4092,6 +4794,189 @@ impl App {
         self.mode = Mode::Message(msg, is_err);
     }
 
+    fn start_public_site_prompt(&mut self) -> Result<()> {
+        self.refresh()?;
+        let targets = self.collect_public_site_targets()?;
+        if targets.is_empty() {
+            self.show_message(
+                "No non-official provider-key linked lightweight profiles found.".into(),
+                true,
+                None,
+            );
+            return Ok(());
+        }
+        self.public_site_targets = targets;
+        self.public_site_prompt_buf = PUBLIC_SITE_TEST_DEFAULT_PROMPT.to_string();
+        self.public_site_results.clear();
+        self.public_site_result_selected = 0;
+        self.public_site_detail_scroll = 0;
+        self.public_site_completed = 0;
+        self.public_site_total = 0;
+        self.public_site_status.clear();
+        self.public_site_event_rx = None;
+        self.cursor_pos = self.public_site_prompt_buf.len();
+        self.mode = Mode::PublicSitePrompt;
+        Ok(())
+    }
+
+    fn start_public_site_batch_test(&mut self) {
+        let prompt = self.public_site_prompt_buf.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+
+        self.public_site_results.clear();
+        self.public_site_result_selected = 0;
+        self.public_site_detail_scroll = 0;
+        self.public_site_completed = 0;
+        self.public_site_total = self.public_site_targets.len();
+        let request_plans = build_public_site_request_plans(&self.public_site_targets, &prompt);
+        self.public_site_status = format!(
+            "Running {} profiles via {} request plans across {} base URLs",
+            self.public_site_total,
+            request_plans.len(),
+            request_plans
+                .iter()
+                .map(|plan| plan.key.base_url.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+
+        for target in &self.public_site_targets {
+            if target.preflight_error.is_some() {
+                self.public_site_results
+                    .push(public_site_target_preflight_result(target));
+                self.public_site_completed += 1;
+            }
+        }
+        sort_public_site_results(&mut self.public_site_results);
+
+        if self.public_site_completed >= self.public_site_total {
+            self.public_site_event_rx = None;
+            self.public_site_status = if self.public_site_total == 0 {
+                "No eligible non-official provider keys found.".into()
+            } else {
+                format!("Finished {} provider-key tests", self.public_site_total)
+            };
+            self.mode = Mode::PublicSiteResults;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut groups: BTreeMap<String, Vec<PublicSiteRequestPlan>> = BTreeMap::new();
+        for plan in request_plans {
+            groups
+                .entry(plan.key.base_url.clone())
+                .or_default()
+                .push(plan);
+        }
+        for (_, group) in groups {
+            let tx = tx.clone();
+            let prompt = prompt.clone();
+            thread::spawn(move || {
+                let total = group.len();
+                for (idx, plan) in group.into_iter().enumerate() {
+                    let template = execute_public_site_target(&plan.request_target, &prompt);
+                    for target in &plan.consumers {
+                        let result = fan_out_public_site_result(&template, target);
+                        if tx.send(PublicSiteWorkerEvent::Result(result)).is_err() {
+                            return;
+                        }
+                    }
+                    if idx + 1 < total {
+                        thread::sleep(Duration::from_millis(PUBLIC_SITE_TEST_GROUP_GAP_MS));
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        self.public_site_event_rx = Some(rx);
+        self.mode =
+            if self.public_site_completed >= self.public_site_total && self.public_site_total > 0 {
+                Mode::PublicSiteResults
+            } else {
+                Mode::PublicSiteTesting
+            };
+    }
+
+    fn handle_public_site_prompt(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        if Self::is_cancel_key(code, modifiers) {
+            self.mode = Mode::Normal;
+            return Ok(());
+        }
+
+        match code {
+            KeyCode::Enter => {
+                if !self.public_site_prompt_buf.trim().is_empty() {
+                    self.start_public_site_batch_test();
+                }
+            }
+            _ => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.public_site_prompt_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_public_site_results(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        if Self::is_cancel_key(code, modifiers)
+            || matches!(code, KeyCode::Enter | KeyCode::Char('q'))
+        {
+            self.public_site_event_rx = None;
+            self.public_site_detail_scroll = 0;
+            self.mode = Mode::Normal;
+            return Ok(());
+        }
+
+        let previous_selected = self.public_site_result_selected;
+        match code {
+            _ if Self::is_prev_list_key(code, modifiers)
+                && !self.public_site_results.is_empty() =>
+            {
+                self.public_site_result_selected =
+                    self.public_site_result_selected.saturating_sub(1);
+            }
+            _ if Self::is_next_list_key(code, modifiers)
+                && !self.public_site_results.is_empty() =>
+            {
+                self.public_site_result_selected = (self.public_site_result_selected + 1)
+                    .min(self.public_site_results.len().saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                self.public_site_result_selected = self
+                    .public_site_result_selected
+                    .saturating_sub(PUBLIC_SITE_TEST_PAGE_SIZE);
+            }
+            KeyCode::PageDown if !self.public_site_results.is_empty() => {
+                self.public_site_result_selected = (self.public_site_result_selected
+                    + PUBLIC_SITE_TEST_PAGE_SIZE)
+                    .min(self.public_site_results.len().saturating_sub(1));
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.public_site_detail_scroll = self
+                    .public_site_detail_scroll
+                    .saturating_sub(PUBLIC_SITE_DETAIL_SCROLL_STEP);
+            }
+            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.public_site_detail_scroll = self
+                    .public_site_detail_scroll
+                    .saturating_add(PUBLIC_SITE_DETAIL_SCROLL_STEP);
+            }
+            _ => {}
+        }
+        if self.public_site_result_selected != previous_selected {
+            self.public_site_detail_scroll = 0;
+        }
+        Ok(())
+    }
+
     fn start_selected_provider_test(&mut self) -> Result<()> {
         let provider = self
             .provider_list_state
@@ -4150,9 +5035,14 @@ impl App {
         source: ProviderTestSource,
     ) -> Result<()> {
         let fetched_models = discover_models(&provider.base_url, &key.api_key).map_err(|failure| {
+            let tried = if failure.tried_endpoints.is_empty() {
+                String::new()
+            } else {
+                format!("\n  Tried: {}", failure.tried_endpoints.join(" → "))
+            };
             format!(
-                "Provider '{}' key '{}' could not discover models: {}",
-                provider.name, key.name, failure.message
+                "Provider '{}' key '{}' could not discover models: {}{}",
+                provider.name, key.name, failure.message, tried
             )
         });
         self.set_provider_test_models_from_result(fetched_models);
@@ -4267,6 +5157,7 @@ impl App {
                             source,
                             field,
                             model,
+                            endpoint_used: Some(result.endpoint_used),
                             input_tokens: result.input_tokens,
                             output_tokens: result.output_tokens,
                             body: result.text.trim().to_string(),
@@ -4280,6 +5171,7 @@ impl App {
                             source,
                             field,
                             model,
+                            endpoint_used: None,
                             input_tokens: None,
                             output_tokens: None,
                             body: e.to_string(),
@@ -4508,8 +5400,19 @@ impl App {
             }
             KeyCode::Char('d') if step == 2 => {
                 // Delete selected key
-                if let Some(k) = self.selected_provider_key() {
-                    let _ = self.manager.remove_key(&pid, &k.id);
+                if let Some(k) = self.selected_provider_key().cloned() {
+                    if self.open_provider_key_in_use_popup_if_needed(
+                        &pid,
+                        &k.id,
+                        &k.name,
+                        Mode::ProviderEdit {
+                            provider_id: pid.clone(),
+                            step: 2,
+                        },
+                    )? {
+                        return Ok(());
+                    }
+                    self.manager.remove_key(&pid, &k.id)?;
                     self.sync_shims();
                     self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
                     if self.provider_key_selected >= self.provider_keys_cache.len() {
@@ -4896,10 +5799,15 @@ impl App {
                         self.show_message(summary, false, return_mode);
                     }
                     Err(failure) => {
+                        let tried = if failure.tried_endpoints.is_empty() {
+                            String::new()
+                        } else {
+                            format!(". Tried: {}", failure.tried_endpoints.join(" → "))
+                        };
                         self.show_message(
                             format!(
-                                "Provider '{}' key '{}' could not discover models: {}. The provider may still work with a manually entered model name.",
-                                provider.name, key.name, failure.message
+                                "Provider '{}' key '{}' could not discover models: {}{}. The provider may still work with a manually entered model name.",
+                                provider.name, key.name, failure.message, tried
                             ),
                             false,
                             return_mode,
@@ -5072,14 +5980,24 @@ impl App {
     fn handle_confirm_delete_key(&mut self, code: KeyCode) -> Result<()> {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let (pid, kid) = match &self.mode {
+                let (pid, kid, name) = match &self.mode {
                     Mode::ConfirmDeleteKey {
                         provider_id,
                         key_id,
-                        ..
-                    } => (provider_id.clone(), key_id.clone()),
+                        name,
+                    } => (provider_id.clone(), key_id.clone(), name.clone()),
                     _ => return Ok(()),
                 };
+                if self.open_provider_key_in_use_popup_if_needed(
+                    &pid,
+                    &kid,
+                    &name,
+                    Mode::ProviderKeyList {
+                        provider_id: pid.clone(),
+                    },
+                )? {
+                    return Ok(());
+                }
                 match self.manager.remove_key(&pid, &kid) {
                     Ok(_) => {
                         self.sync_shims();
@@ -5096,6 +6014,102 @@ impl App {
                 };
                 self.mode = Mode::ProviderKeyList { provider_id: pid };
             }
+        }
+        Ok(())
+    }
+
+    fn open_provider_key_in_use_popup_if_needed(
+        &mut self,
+        provider_id: &str,
+        key_id: &str,
+        key_name: &str,
+        return_mode: Mode,
+    ) -> Result<bool> {
+        let linked = self.manager.list_profiles_using_key(provider_id, key_id)?;
+        if linked.is_empty() {
+            return Ok(false);
+        }
+        self.provider_key_linked_profiles = linked;
+        self.provider_key_linked_profile_selected = 0;
+        self.mode = Mode::ProviderKeyInUse {
+            provider_id: provider_id.to_string(),
+            key_id: key_id.to_string(),
+            name: key_name.to_string(),
+            return_mode: Box::new(return_mode),
+        };
+        Ok(true)
+    }
+
+    fn force_remove_provider_key(
+        &mut self,
+        provider_id: &str,
+        key_id: &str,
+        return_mode: Mode,
+    ) -> Result<()> {
+        let linked = self.manager.list_profiles_using_key(provider_id, key_id)?;
+        for profile in linked {
+            self.manager.unset_provider(&profile.id)?;
+        }
+        self.manager.remove_key(provider_id, key_id)?;
+        self.sync_shims();
+        self.refresh()?;
+        self.provider_keys_cache = self.manager.list_keys(provider_id).unwrap_or_default();
+        if self.provider_key_selected >= self.provider_keys_cache.len() {
+            self.provider_key_selected = self.provider_key_selected.saturating_sub(1);
+        }
+        self.provider_key_linked_profiles.clear();
+        self.provider_key_linked_profile_selected = 0;
+        self.mode = return_mode;
+        Ok(())
+    }
+
+    fn handle_provider_key_in_use(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        let (pid, kid, return_mode) = match &self.mode {
+            Mode::ProviderKeyInUse {
+                provider_id,
+                key_id,
+                return_mode,
+                ..
+            } => (provider_id.clone(), key_id.clone(), *return_mode.clone()),
+            _ => return Ok(()),
+        };
+        match code {
+            _ if Self::is_prev_list_key(code, modifiers) => {
+                self.move_provider_key_linked_profile_up();
+            }
+            _ if Self::is_next_list_key(code, modifiers) => {
+                self.move_provider_key_linked_profile_down();
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                let Some(profile) = self.selected_provider_key_linked_profile().cloned() else {
+                    return Ok(());
+                };
+                self.manager.remove_profile(&profile.id)?;
+                self.sync_shims();
+                self.refresh()?;
+                self.provider_key_linked_profiles =
+                    self.manager.list_profiles_using_key(&pid, &kid)?;
+                if self.provider_key_linked_profile_selected
+                    >= self.provider_key_linked_profiles.len()
+                    && !self.provider_key_linked_profiles.is_empty()
+                {
+                    self.provider_key_linked_profile_selected =
+                        self.provider_key_linked_profiles.len().saturating_sub(1);
+                }
+                if self.provider_key_linked_profiles.is_empty() {
+                    self.manager.remove_key(&pid, &kid)?;
+                    self.sync_shims();
+                    self.provider_keys_cache = self.manager.list_keys(&pid).unwrap_or_default();
+                    self.mode = return_mode;
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.force_remove_provider_key(&pid, &kid, return_mode)?;
+            }
+            _ if Self::is_cancel_key(code, modifiers) => {
+                self.mode = return_mode;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -5152,6 +6166,34 @@ impl App {
         self.provider_keys_cache
             .get(self.provider_key_selected)
             .or_else(|| self.provider_keys_cache.first())
+    }
+
+    fn move_provider_key_linked_profile_up(&mut self) {
+        if self.provider_key_linked_profiles.is_empty() {
+            return;
+        }
+        if self.provider_key_linked_profile_selected > 0 {
+            self.provider_key_linked_profile_selected -= 1;
+        } else {
+            self.provider_key_linked_profile_selected = self.provider_key_linked_profiles.len() - 1;
+        }
+    }
+
+    fn move_provider_key_linked_profile_down(&mut self) {
+        if self.provider_key_linked_profiles.is_empty() {
+            return;
+        }
+        if self.provider_key_linked_profile_selected + 1 < self.provider_key_linked_profiles.len() {
+            self.provider_key_linked_profile_selected += 1;
+        } else {
+            self.provider_key_linked_profile_selected = 0;
+        }
+    }
+
+    fn selected_provider_key_linked_profile(&self) -> Option<&Profile> {
+        self.provider_key_linked_profiles
+            .get(self.provider_key_linked_profile_selected)
+            .or_else(|| self.provider_key_linked_profiles.first())
     }
 
     // ── Provider renderers ───────────────────────────────────────────────────
@@ -5609,6 +6651,239 @@ impl App {
         f.render_widget(Paragraph::new(Text::from(lines)), block.inner(area));
     }
 
+    fn render_public_site_prompt_popup(&self, f: &mut Frame) {
+        let area = centered_rect(80, 10, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Public Site Quick Test ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let prompt_value = if self.public_site_prompt_buf.is_empty() {
+            "█".to_string()
+        } else {
+            display_with_cursor(&self.public_site_prompt_buf, self.cursor_pos)
+        };
+        let base_url_count = self
+            .public_site_targets
+            .iter()
+            .map(|target| normalize_base_url_key(&target.base_url))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(
+                    "  Non-official provider keys: {} across {} base URLs",
+                    self.public_site_targets.len(),
+                    base_url_count
+                ),
+                Style::default().fg(TEXT),
+            )),
+            Line::from(Span::styled(
+                "  One worker runs per base URL; keys on the same base URL are spaced out.",
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Prompt  ", Style::default().fg(ACCENT).bold()),
+                Span::styled(prompt_value, Style::default().fg(TEXT)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Enter starts the batch test. Esc/Ctrl+G exits.",
+                Style::default().fg(DIM),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    fn render_public_site_results_popup(&self, f: &mut Frame) {
+        let area = centered_rect(90, 24, f.area());
+        f.render_widget(Clear, area);
+        let running = matches!(self.mode, Mode::PublicSiteTesting);
+        let title = if running {
+            " Public Site Quick Test — Running "
+        } else {
+            " Public Site Quick Test — Results "
+        };
+        let accent = if running { ACCENT } else { SUCCESS };
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                title,
+                Style::default().fg(accent).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent))
+            .style(Style::default().bg(PANEL));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(6),
+                Constraint::Length(8),
+                Constraint::Length(4),
+            ])
+            .split(inner);
+
+        let summary = vec![
+            Line::from(Span::styled(
+                format!(
+                    "  Progress: {}/{}  Successful: {}",
+                    self.public_site_completed,
+                    self.public_site_total,
+                    self.public_site_results
+                        .iter()
+                        .filter(|result| result.is_success)
+                        .count()
+                ),
+                Style::default().fg(TEXT),
+            )),
+            Line::from(Span::styled(
+                format!("  {}", self.public_site_status),
+                Style::default().fg(DIM),
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(summary).wrap(Wrap { trim: false }),
+            sections[0],
+        );
+
+        let total = self.public_site_results.len();
+        let selected = self
+            .public_site_result_selected
+            .min(total.saturating_sub(1));
+        let (page_start, page_end) = visible_window(selected, total, PUBLIC_SITE_TEST_PAGE_SIZE);
+        let mut lines = Vec::new();
+        if total == 0 {
+            lines.push(Line::from(Span::styled(
+                if running {
+                    "  Waiting for the first result..."
+                } else {
+                    "  No results."
+                },
+                Style::default().fg(DIM),
+            )));
+        } else {
+            for (offset, result) in self.public_site_results[page_start..page_end]
+                .iter()
+                .enumerate()
+            {
+                let index = page_start + offset;
+                let selected_row = index == selected;
+                let row_color = if result.is_success { SUCCESS } else { DANGER };
+                let status = if result.is_success { "OK " } else { "ERR" };
+                let latency = result
+                    .latency_ms
+                    .map(|ms| format!("{ms}ms"))
+                    .unwrap_or_else(|| "n/a".into());
+                let first = result.first_char.as_deref().unwrap_or("—");
+                let location = ellipsize(&result.base_url, 24);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if selected_row { "▶ " } else { "  " },
+                        Style::default().fg(ACCENT).bold(),
+                    ),
+                    Span::styled(
+                        format!("[{status}] "),
+                        Style::default().fg(row_color).bold(),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} / {}  {}  first:{}  {}",
+                            ellipsize(&result.provider_name, 18),
+                            ellipsize(&result.key_name, 12),
+                            latency,
+                            first,
+                            location
+                        ),
+                        Style::default().fg(if selected_row { ACCENT } else { TEXT }),
+                    ),
+                ]));
+            }
+        }
+        f.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            sections[1],
+        );
+
+        let detail_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .split(sections[2]);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  Selected Result",
+                    Style::default().fg(ACCENT).bold(),
+                )),
+                Line::from(""),
+            ]),
+            detail_sections[0],
+        );
+        let detail_lines = if let Some(result) = self.public_site_results.get(selected) {
+            public_site_result_detail_lines(result)
+        } else {
+            vec!["No selected result.".to_string()]
+        };
+        let detail_scroll = self
+            .public_site_detail_scroll
+            .min(public_site_detail_scroll_limit(
+                &detail_lines,
+                detail_sections[1].width,
+                detail_sections[1].height,
+            ));
+        let detail_body = detail_lines
+            .into_iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    if line.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {line}")
+                    },
+                    Style::default().fg(TEXT),
+                ))
+            })
+            .collect::<Vec<_>>();
+        f.render_widget(
+            Paragraph::new(detail_body)
+                .wrap(Wrap { trim: false })
+                .scroll((detail_scroll, 0)),
+            detail_sections[1],
+        );
+
+        let footer = vec![
+            Line::from(Span::styled(
+                "  Failures show Error first. Ctrl+U/Ctrl+D scrolls detail.",
+                Style::default().fg(DIM),
+            )),
+            Line::from(Span::styled(
+                "  Sorted by success, latency, then first reply character.",
+                Style::default().fg(DIM),
+            )),
+            Line::from(Span::styled(
+                "  Ctrl+P/N moves within results. PgUp/PgDn jumps pages. Enter/Esc exits.",
+                Style::default().fg(DIM),
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(footer).wrap(Wrap { trim: false }),
+            sections[3],
+        );
+    }
+
     fn render_provider_key_add_popup(&self, f: &mut Frame, step: usize) {
         let area = centered_rect(60, 9, f.area());
         f.render_widget(Clear, area);
@@ -5865,19 +7140,27 @@ impl App {
     }
 
     fn render_provider_anthropic_outcome_popup(&self, f: &mut Frame) {
-        let (model, input_tokens, output_tokens, body, is_error) = match &self.mode {
+        let (model, endpoint_used, input_tokens, output_tokens, body, is_error) = match &self.mode {
             Mode::ProviderAnthropicOutcome {
                 model,
+                endpoint_used,
                 input_tokens,
                 output_tokens,
                 body,
                 is_error,
                 ..
-            } => (model, *input_tokens, *output_tokens, body, *is_error),
+            } => (
+                model,
+                endpoint_used.as_deref(),
+                *input_tokens,
+                *output_tokens,
+                body,
+                *is_error,
+            ),
             _ => return,
         };
 
-        let area = centered_rect(78, 16, f.area());
+        let area = centered_rect(78, 18, f.area());
         f.render_widget(Clear, area);
         let accent = if is_error { DANGER } else { SUCCESS };
         let block = Block::default()
@@ -5913,24 +7196,30 @@ impl App {
             (None, None) => "(no usage returned)".to_string(),
         };
 
-        let meta_lines = vec![
+        let mut meta_lines = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Model   ", Style::default().fg(DIM)),
                 Span::styled(model, Style::default().fg(TEXT).bold()),
             ]),
-            Line::from(vec![
-                Span::styled("  Usage   ", Style::default().fg(DIM)),
-                Span::styled(
-                    if is_error {
-                        "(request failed)".to_string()
-                    } else {
-                        usage
-                    },
-                    Style::default().fg(TEXT),
-                ),
-            ]),
         ];
+        if let Some(endpoint) = endpoint_used {
+            meta_lines.push(Line::from(vec![
+                Span::styled("  Endpoint ", Style::default().fg(DIM)),
+                Span::styled(endpoint, Style::default().fg(TEXT)),
+            ]));
+        }
+        meta_lines.push(Line::from(vec![
+            Span::styled("  Usage   ", Style::default().fg(DIM)),
+            Span::styled(
+                if is_error {
+                    "(request failed)".to_string()
+                } else {
+                    usage
+                },
+                Style::default().fg(TEXT),
+            ),
+        ]));
         f.render_widget(Paragraph::new(meta_lines), sections[0]);
 
         let reply_block = Block::default()
@@ -6029,6 +7318,63 @@ impl App {
             &format!("Delete key '{}'?", name),
             "This cannot be undone. Press 'y' to confirm.",
         );
+    }
+
+    fn render_provider_key_in_use_popup(&self, f: &mut Frame) {
+        let name = match &self.mode {
+            Mode::ProviderKeyInUse { name, .. } => name.clone(),
+            _ => return,
+        };
+        let area = centered_rect(70, 16, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                format!(" Key '{}' In Use ", name),
+                Style::default().fg(DANGER).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DANGER))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(block.clone(), area);
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Delete linked profiles one by one, or unlink them all and remove this key.",
+                Style::default().fg(TEXT),
+            )),
+            Line::from(""),
+        ];
+        if self.provider_key_linked_profiles.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No linked profiles remain.",
+                Style::default().fg(MUTED),
+            )));
+        } else {
+            for (idx, profile) in self.provider_key_linked_profiles.iter().enumerate() {
+                let selected = idx == self.provider_key_linked_profile_selected;
+                let prefix = if selected { "▶" } else { " " };
+                let alias = profile
+                    .alias
+                    .as_deref()
+                    .map(|a| format!(" [{}]", a))
+                    .unwrap_or_default();
+                lines.push(Line::from(Span::styled(
+                    format!("  {} {}{}", prefix, profile.name, alias),
+                    if selected {
+                        Style::default().fg(ACCENT).bold()
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Ctrl+P/N navigate  d/Delete removes selected profile  y unlinks all + deletes key  Esc/Ctrl+G cancel",
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     fn render_confirm_popup(&self, f: &mut Frame, title: &str, hint: &str) {
@@ -6443,17 +7789,46 @@ mod tests {
     use super::*;
     use crate::profile::ProfileManager;
     use std::env;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::ops::{Deref, DerefMut};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::thread;
     use tempfile::TempDir;
 
-    fn make_test_app() -> App {
+    struct TestApp {
+        app: App,
+        _tmp: TempDir,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Deref for TestApp {
+        type Target = App;
+
+        fn deref(&self) -> &Self::Target {
+            &self.app
+        }
+    }
+
+    impl DerefMut for TestApp {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.app
+        }
+    }
+
+    fn make_test_app() -> TestApp {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let old_home = env::var_os("USERPROFILE");
         let old_home_unix = env::var_os("HOME");
         unsafe {
             env::set_var("USERPROFILE", tmp.path());
             env::set_var("HOME", tmp.path());
+            env::set_var("CSWITCH_TEST_DISABLE_SHIM_SYNC", "1");
         }
-        let manager = ProfileManager::new().unwrap();
+        let manager = ProfileManager::new_for_test(&tmp.path().join(".claude-switch")).unwrap();
         let app = App::new(manager).unwrap();
         unsafe {
             match old_home {
@@ -6465,7 +7840,48 @@ mod tests {
                 None => env::remove_var("HOME"),
             }
         }
-        app
+        TestApp {
+            app,
+            _tmp: tmp,
+            _guard: guard,
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut header_end = None;
+        let mut body_len = 0usize;
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if header_end.is_none()
+                && let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                header_end = Some(pos + 4);
+                let headers = String::from_utf8_lossy(&request[..pos + 4]);
+                body_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+            }
+            if let Some(end) = header_end
+                && request.len() >= end + body_len
+            {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
     }
 
     #[test]
@@ -6726,6 +8142,752 @@ mod tests {
             provider_test_key_selection(&many),
             ProviderTestKeySelection::Multiple
         );
+    }
+
+    #[test]
+    fn collect_public_site_targets_include_shared_provider_key_profiles() {
+        let mut app = make_test_app();
+        let official = app
+            .manager
+            .add_provider_with_key_name(
+                "Official",
+                "https://api.anthropic.com",
+                "Default",
+                "sk-test-generated-key-official-1111111111111",
+            )
+            .unwrap();
+        let official_key = official.keys.values().next().unwrap().clone();
+        let relay = app
+            .manager
+            .add_provider_with_key_name(
+                "Relay",
+                "https://relay.example/api",
+                "Default",
+                "sk-test-generated-key-relay-2222222222222222",
+            )
+            .unwrap();
+        let relay_key = relay.keys.values().next().unwrap().clone();
+
+        let relay_default = app
+            .manager
+            .create_lightweight_profile(
+                "relay-default",
+                Some("relay-default"),
+                LightweightEnv {
+                    default_sonnet_model: Some("claude-default-sonnet".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.manager
+            .set_provider(&relay_default.id, &relay.id, &relay_key.id)
+            .unwrap();
+
+        let relay_explicit = app
+            .manager
+            .create_lightweight_profile(
+                "relay-explicit",
+                Some("relay-explicit"),
+                LightweightEnv {
+                    model: Some("relay-explicit-model".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.manager
+            .set_provider(&relay_explicit.id, &relay.id, &relay_key.id)
+            .unwrap();
+
+        let official_profile = app
+            .manager
+            .create_lightweight_profile(
+                "official-profile",
+                Some("official-profile"),
+                LightweightEnv {
+                    model: Some("official-model".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.manager
+            .set_provider(&official_profile.id, &official.id, &official_key.id)
+            .unwrap();
+
+        app.refresh().unwrap();
+
+        let targets = app.collect_public_site_targets().unwrap();
+        assert_eq!(targets.len(), 2);
+        let relay_targets: Vec<&PublicSiteTarget> = targets
+            .iter()
+            .filter(|target| target.provider_id == relay.id && target.key_id == relay_key.id)
+            .collect();
+        assert_eq!(relay_targets.len(), 2);
+        assert!(
+            relay_targets
+                .iter()
+                .any(|target| target.profile_name == "relay-default")
+        );
+        assert!(
+            relay_targets
+                .iter()
+                .any(|target| target.profile_name == "relay-explicit")
+        );
+        assert!(
+            relay_targets
+                .iter()
+                .any(|target| target.configured_model.as_deref() == Some("relay-explicit-model"))
+        );
+    }
+
+    #[test]
+    fn collect_public_site_targets_excludes_deepseek_and_includes_inline_profiles() {
+        let mut app = make_test_app();
+        let deepseek = app
+            .manager
+            .add_provider_with_key_name(
+                "DeepSeek",
+                "https://api.deepseek.com/anthropic",
+                "Default",
+                "sk-test-generated-key-deepseek-111111111111111",
+            )
+            .unwrap();
+        let deepseek_key = deepseek.keys.values().next().unwrap().clone();
+        let deepseek_profile = app
+            .manager
+            .create_lightweight_profile(
+                "deepseek-profile",
+                Some("deepseek-profile"),
+                LightweightEnv {
+                    model: Some("deepseek-chat".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.manager
+            .set_provider(&deepseek_profile.id, &deepseek.id, &deepseek_key.id)
+            .unwrap();
+
+        app.manager
+            .create_lightweight_profile(
+                "inline-relay",
+                Some("inline-relay"),
+                LightweightEnv {
+                    auth_token: Some("sk-inline-generated-222222222222222".into()),
+                    base_url: Some("https://relay.inline.example/api".into()),
+                    model: Some("inline-model".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        app.refresh().unwrap();
+
+        let targets = app.collect_public_site_targets().unwrap();
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        assert_eq!(target.profile_name, "inline-relay");
+        assert_eq!(target.provider_name, "Inline");
+        assert_eq!(target.key_name, "Inline");
+        assert_eq!(target.configured_model.as_deref(), Some("inline-model"));
+    }
+
+    #[test]
+    fn collect_public_site_targets_rechecks_provider_fallback_url_for_stale_links() {
+        let mut app = make_test_app();
+        let official = app
+            .manager
+            .add_provider_with_key_name(
+                "Official",
+                "https://api.anthropic.com",
+                "Default",
+                "sk-test-generated-key-official-1111111111111",
+            )
+            .unwrap();
+        let official_key_id = official.keys.keys().next().unwrap().clone();
+        let relay = app
+            .manager
+            .add_provider_with_key_name(
+                "Relay",
+                "https://relay.example/api",
+                "Default",
+                "sk-test-generated-key-relay-2222222222222222",
+            )
+            .unwrap();
+        let relay_key_id = relay.keys.keys().next().unwrap().clone();
+
+        let official_profile = app
+            .manager
+            .create_lightweight_profile(
+                "official-stale",
+                Some("official-stale"),
+                LightweightEnv::default(),
+            )
+            .unwrap();
+        app.manager
+            .set_provider(&official_profile.id, &official.id, &official_key_id)
+            .unwrap();
+        let relay_profile = app
+            .manager
+            .create_lightweight_profile(
+                "relay-stale",
+                Some("relay-stale"),
+                LightweightEnv::default(),
+            )
+            .unwrap();
+        app.manager
+            .set_provider(&relay_profile.id, &relay.id, &relay_key_id)
+            .unwrap();
+
+        app.refresh().unwrap();
+        for (profile_id, missing_key_id) in [
+            (official_profile.id.as_str(), "missing-official-key"),
+            (relay_profile.id.as_str(), "missing-relay-key"),
+        ] {
+            let profile = app
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == profile_id)
+                .unwrap();
+            profile.key_id = Some(missing_key_id.into());
+        }
+
+        let targets = app.collect_public_site_targets().unwrap();
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        assert_eq!(target.profile_name, "relay-stale");
+        assert_eq!(target.provider_id, relay.id);
+        assert_eq!(target.base_url, "https://relay.example/api");
+        assert!(
+            target.preflight_error.as_deref().is_some_and(|error| {
+                error.contains("references missing key 'missing-relay-key'")
+            })
+        );
+    }
+
+    #[test]
+    fn build_public_site_request_plans_reuses_identical_provider_key_model_prompt() {
+        let targets = vec![
+            PublicSiteTarget {
+                provider_id: "prov_shared".into(),
+                provider_name: "Relay".into(),
+                key_id: "key_shared".into(),
+                key_name: "Default".into(),
+                base_url: "https://relay.example/api".into(),
+                profile_id: "profile-a".into(),
+                profile_name: "profile-a".into(),
+                api_key: "sk-shared".into(),
+                preflight_error: None,
+                configured_model: Some("model-a".into()),
+                model_source: PublicSiteModelSource::ExplicitModel,
+            },
+            PublicSiteTarget {
+                provider_id: "prov_shared".into(),
+                provider_name: "Relay".into(),
+                key_id: "key_shared".into(),
+                key_name: "Default".into(),
+                base_url: "https://relay.example/api".into(),
+                profile_id: "profile-b".into(),
+                profile_name: "profile-b".into(),
+                api_key: "sk-shared".into(),
+                preflight_error: None,
+                configured_model: Some("model-a".into()),
+                model_source: PublicSiteModelSource::ExplicitModel,
+            },
+        ];
+
+        let plans = build_public_site_request_plans(&targets, "Hello");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].consumers.len(), 2);
+    }
+
+    #[test]
+    fn build_public_site_request_plans_split_on_model_and_key_identity() {
+        let same_key_diff_model = vec![
+            PublicSiteTarget {
+                provider_id: "prov_shared".into(),
+                provider_name: "Relay".into(),
+                key_id: "key_shared".into(),
+                key_name: "Default".into(),
+                base_url: "https://relay.example/api".into(),
+                profile_id: "profile-a".into(),
+                profile_name: "profile-a".into(),
+                api_key: "sk-shared".into(),
+                preflight_error: None,
+                configured_model: Some("model-a".into()),
+                model_source: PublicSiteModelSource::ExplicitModel,
+            },
+            PublicSiteTarget {
+                provider_id: "prov_shared".into(),
+                provider_name: "Relay".into(),
+                key_id: "key_shared".into(),
+                key_name: "Default".into(),
+                base_url: "https://relay.example/api".into(),
+                profile_id: "profile-b".into(),
+                profile_name: "profile-b".into(),
+                api_key: "sk-shared".into(),
+                preflight_error: None,
+                configured_model: Some("model-b".into()),
+                model_source: PublicSiteModelSource::ExplicitModel,
+            },
+        ];
+        assert_eq!(
+            build_public_site_request_plans(&same_key_diff_model, "Hello").len(),
+            2
+        );
+
+        let same_base_diff_key = vec![
+            PublicSiteTarget {
+                provider_id: "prov_shared".into(),
+                provider_name: "Relay".into(),
+                key_id: "key_one".into(),
+                key_name: "Key One".into(),
+                base_url: "https://relay.example/api".into(),
+                profile_id: "profile-a".into(),
+                profile_name: "profile-a".into(),
+                api_key: "sk-one".into(),
+                preflight_error: None,
+                configured_model: Some("model-a".into()),
+                model_source: PublicSiteModelSource::ExplicitModel,
+            },
+            PublicSiteTarget {
+                provider_id: "prov_shared".into(),
+                provider_name: "Relay".into(),
+                key_id: "key_two".into(),
+                key_name: "Key Two".into(),
+                base_url: "https://relay.example/api".into(),
+                profile_id: "profile-b".into(),
+                profile_name: "profile-b".into(),
+                api_key: "sk-two".into(),
+                preflight_error: None,
+                configured_model: Some("model-a".into()),
+                model_source: PublicSiteModelSource::ExplicitModel,
+            },
+        ];
+        assert_eq!(
+            build_public_site_request_plans(&same_base_diff_key, "Hello").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn public_site_model_from_profile_prefers_haiku_and_strips_1m_suffix() {
+        let profile = Profile {
+            id: "profile-generated".into(),
+            name: "profile-generated".into(),
+            alias: Some("profile-generated".into()),
+            added: chrono::Utc::now(),
+            last_used: None,
+            kind: ProfileKind::Lightweight,
+            env: Some(LightweightEnv {
+                model: Some("claude-3-7-sonnet[1m]".into()),
+                default_sonnet_model: Some("claude-default-sonnet[1m]".into()),
+                default_haiku_model: Some("claude-default-haiku[1m]".into()),
+                ..Default::default()
+            }),
+            launch_args: None,
+            provider_id: None,
+            key_id: None,
+        };
+
+        let (source, model) = public_site_model_from_profile(&profile);
+        assert_eq!(source, PublicSiteModelSource::DefaultHaiku);
+        assert_eq!(model.as_deref(), Some("claude-default-haiku"));
+    }
+
+    #[test]
+    fn public_site_model_from_profile_falls_back_to_explicit_model_when_haiku_missing() {
+        let profile = Profile {
+            id: "profile-generated".into(),
+            name: "profile-generated".into(),
+            alias: Some("profile-generated".into()),
+            added: chrono::Utc::now(),
+            last_used: None,
+            kind: ProfileKind::Lightweight,
+            env: Some(LightweightEnv {
+                model: Some("claude-3-7-sonnet[1m]".into()),
+                default_sonnet_model: Some("claude-default-sonnet[1m]".into()),
+                ..Default::default()
+            }),
+            launch_args: None,
+            provider_id: None,
+            key_id: None,
+        };
+
+        let (source, model) = public_site_model_from_profile(&profile);
+        assert_eq!(source, PublicSiteModelSource::ExplicitModel);
+        assert_eq!(model.as_deref(), Some("claude-3-7-sonnet"));
+    }
+
+    #[test]
+    fn public_site_result_detail_lines_split_multiline_fields() {
+        let result = PublicSiteTestResult {
+            provider_name: "Inline".into(),
+            key_name: "Inline".into(),
+            base_url: "https://relay.inline.example/api".into(),
+            profile_name: "inline-relay".into(),
+            model: "inline-model".into(),
+            first_char: Some("H".into()),
+            response_preview: Some("Hello world".into()),
+            endpoint_used: Some("https://relay.inline.example/v1/messages".into()),
+            latency_ms: Some(4321),
+            input_tokens: Some(4),
+            output_tokens: Some(8),
+            is_success: false,
+            error: Some("generated multiline error body".into()),
+        };
+
+        let lines = public_site_result_detail_lines(&result);
+        assert!(lines.len() > 3, "{lines:?}");
+        assert!(lines.iter().any(|line| line.contains("Provider: Inline")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Error: generated multiline error body"))
+        );
+    }
+
+    #[test]
+    fn public_site_result_detail_lines_prioritize_error_for_failures() {
+        let result = PublicSiteTestResult {
+            provider_name: "SZC".into(),
+            key_name: "Default".into(),
+            base_url: "https://api.szc.asia".into(),
+            profile_name: "szc-gpt".into(),
+            model: "gpt-5.5".into(),
+            first_char: None,
+            response_preview: None,
+            endpoint_used: None,
+            latency_ms: Some(466),
+            input_tokens: None,
+            output_tokens: None,
+            is_success: false,
+            error: Some("generated upstream unauthorized body".into()),
+        };
+
+        let lines = public_site_result_detail_lines(&result);
+        assert_eq!(lines[0], "Error: generated upstream unauthorized body");
+        assert_eq!(lines[1], "");
+        let provider_pos = lines
+            .iter()
+            .position(|line| line.starts_with("Provider: "))
+            .unwrap();
+        assert!(provider_pos > 1, "{lines:?}");
+    }
+
+    #[test]
+    fn public_site_detail_scroll_limit_counts_wrapped_error_lines() {
+        let lines = vec![
+            "Error: generated upstream unauthorized body with a very long detail string that should wrap across multiple visual rows in the popup body.".to_string(),
+            String::new(),
+            "Provider: SZC".to_string(),
+        ];
+
+        let limit = public_site_detail_scroll_limit(&lines, 24, 4);
+        assert!(
+            limit > 0,
+            "expected wrapped lines to require scrolling, got {limit}"
+        );
+    }
+
+    #[test]
+    fn public_site_results_sort_success_then_latency_then_first_char() {
+        let mut results = vec![
+            PublicSiteTestResult {
+                provider_name: "relay-c".into(),
+                key_name: "key-c".into(),
+                base_url: "https://relay-c.example".into(),
+                profile_name: "profile-c".into(),
+                model: "model-c".into(),
+                first_char: Some("B".into()),
+                response_preview: Some("Bravo".into()),
+                endpoint_used: Some("https://relay-c.example/v1/messages".into()),
+                latency_ms: Some(320),
+                input_tokens: Some(4),
+                output_tokens: Some(8),
+                is_success: true,
+                error: None,
+            },
+            PublicSiteTestResult {
+                provider_name: "relay-a".into(),
+                key_name: "key-a".into(),
+                base_url: "https://relay-a.example".into(),
+                profile_name: "profile-a".into(),
+                model: "model-a".into(),
+                first_char: Some("A".into()),
+                response_preview: Some("Alpha".into()),
+                endpoint_used: Some("https://relay-a.example/v1/messages".into()),
+                latency_ms: Some(320),
+                input_tokens: Some(4),
+                output_tokens: Some(8),
+                is_success: true,
+                error: None,
+            },
+            PublicSiteTestResult {
+                provider_name: "relay-z".into(),
+                key_name: "key-z".into(),
+                base_url: "https://relay-z.example".into(),
+                profile_name: "profile-z".into(),
+                model: "model-z".into(),
+                first_char: None,
+                response_preview: None,
+                endpoint_used: None,
+                latency_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                is_success: false,
+                error: Some("timeout".into()),
+            },
+            PublicSiteTestResult {
+                provider_name: "relay-b".into(),
+                key_name: "key-b".into(),
+                base_url: "https://relay-b.example".into(),
+                profile_name: "profile-b".into(),
+                model: "model-b".into(),
+                first_char: Some("Z".into()),
+                response_preview: Some("Zulu".into()),
+                endpoint_used: Some("https://relay-b.example/v1/messages".into()),
+                latency_ms: Some(810),
+                input_tokens: Some(4),
+                output_tokens: Some(8),
+                is_success: true,
+                error: None,
+            },
+        ];
+
+        sort_public_site_results(&mut results);
+
+        let ordered: Vec<&str> = results
+            .iter()
+            .map(|result| result.provider_name.as_str())
+            .collect();
+        assert_eq!(ordered, vec!["relay-a", "relay-c", "relay-b", "relay-z"]);
+    }
+
+    #[test]
+    fn public_site_request_timeout_is_16_seconds() {
+        assert_eq!(public_site_request_timeout(), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn public_site_batch_with_only_preflight_errors_finishes_immediately() {
+        let mut app = make_test_app();
+        app.public_site_prompt_buf = "Hello".into();
+        app.public_site_targets = vec![PublicSiteTarget {
+            provider_id: "prov".into(),
+            provider_name: "Relay".into(),
+            key_id: "key".into(),
+            key_name: "Default".into(),
+            base_url: "https://relay.example/api".into(),
+            profile_id: "profile".into(),
+            profile_name: "profile".into(),
+            api_key: String::new(),
+            preflight_error: Some("No resolved auth token/key for this profile.".into()),
+            configured_model: Some("claude-test".into()),
+            model_source: PublicSiteModelSource::ExplicitModel,
+        }];
+
+        app.start_public_site_batch_test();
+
+        assert_eq!(app.mode, Mode::PublicSiteResults);
+        assert_eq!(app.public_site_total, 1);
+        assert_eq!(app.public_site_completed, 1);
+        assert_eq!(app.public_site_results.len(), 1);
+        assert!(app.public_site_event_rx.is_none());
+        assert_eq!(app.public_site_status, "Finished 1 provider-key tests");
+    }
+
+    #[test]
+    fn public_site_result_detail_preserves_full_error_text() {
+        let result = PublicSiteTestResult {
+            provider_name: "relay-z".into(),
+            key_name: "key-z".into(),
+            base_url: "https://relay-z.example".into(),
+            profile_name: "profile-z".into(),
+            model: "model-z".into(),
+            first_char: None,
+            response_preview: None,
+            endpoint_used: None,
+            latency_ms: Some(1234),
+            input_tokens: None,
+            output_tokens: None,
+            is_success: false,
+            error: Some(
+                "Anthropic test failed with HTTP 401 at https://relay-z.example/v1/messages: generated unauthorized body with extra detail"
+                    .into(),
+            ),
+        };
+
+        let detail = public_site_result_detail(&result);
+        assert!(detail.contains("HTTP 401"));
+        assert!(detail.contains("generated unauthorized body with extra detail"));
+        assert!(!detail.contains("..."));
+    }
+
+    #[test]
+    fn public_site_results_ctrl_d_scrolls_detail_and_selection_change_resets_scroll() {
+        let mut app = make_test_app();
+        app.mode = Mode::PublicSiteResults;
+        app.public_site_results = vec![
+            PublicSiteTestResult {
+                provider_name: "SZC".into(),
+                key_name: "Default".into(),
+                base_url: "https://api.szc.asia".into(),
+                profile_name: "szc-gpt".into(),
+                model: "gpt-5.5".into(),
+                first_char: None,
+                response_preview: None,
+                endpoint_used: None,
+                latency_ms: Some(466),
+                input_tokens: None,
+                output_tokens: None,
+                is_success: false,
+                error: Some(
+                    "generated upstream unauthorized body with a long detail string that needs to scroll in the popup body"
+                        .into(),
+                ),
+            },
+            PublicSiteTestResult {
+                provider_name: "ABRDNS".into(),
+                key_name: "Custom".into(),
+                base_url: "https://new-api.abrdns.com".into(),
+                profile_name: "abrdns-gpt".into(),
+                model: "gpt-5.5".into(),
+                first_char: None,
+                response_preview: None,
+                endpoint_used: None,
+                latency_ms: Some(395),
+                input_tokens: None,
+                output_tokens: None,
+                is_success: false,
+                error: Some("generated rate-limit detail".into()),
+            },
+        ];
+
+        app.handle_public_site_results(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert!(app.public_site_detail_scroll > 0);
+
+        app.handle_public_site_results(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+        assert_eq!(app.public_site_result_selected, 1);
+        assert_eq!(app.public_site_detail_scroll, 0);
+    }
+
+    #[test]
+    fn execute_public_site_target_with_timeout_respects_custom_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request = read_http_request(&mut stream);
+            thread::sleep(Duration::from_millis(150));
+            let response_body = serde_json::json!({
+                "content": [
+                    { "type": "text", "text": "Hello from generated test server" }
+                ],
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 11
+                }
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+
+        let target = PublicSiteTarget {
+            provider_id: "prov_generated".into(),
+            provider_name: "Relay".into(),
+            key_id: "key_generated".into(),
+            key_name: "Default".into(),
+            base_url: format!("http://{}", addr),
+            profile_id: "profile_generated".into(),
+            profile_name: "relay-profile".into(),
+            api_key: "sk-test-generated-key-timeout-111111111111111".into(),
+            preflight_error: None,
+            configured_model: Some("claude-test-generated-model".into()),
+            model_source: PublicSiteModelSource::ExplicitModel,
+        };
+
+        let result =
+            execute_public_site_target_with_timeout(&target, "Hello", Duration::from_secs(1));
+        handle.join().unwrap();
+
+        assert!(result.is_success, "{result:?}");
+        assert_eq!(
+            result.response_preview.as_deref(),
+            Some("Hello from generated test server")
+        );
+    }
+
+    #[test]
+    fn execute_public_site_target_returns_preflight_error_without_network() {
+        let target = PublicSiteTarget {
+            provider_id: String::new(),
+            provider_name: "Inline".into(),
+            key_id: String::new(),
+            key_name: "Inline".into(),
+            base_url: String::new(),
+            profile_id: "profile_generated".into(),
+            profile_name: "inline-profile".into(),
+            api_key: String::new(),
+            preflight_error: Some("No resolved auth token/key for this profile.".into()),
+            configured_model: Some("inline-model".into()),
+            model_source: PublicSiteModelSource::ExplicitModel,
+        };
+
+        let result =
+            execute_public_site_target_with_timeout(&target, "Hello", Duration::from_secs(1));
+
+        assert!(!result.is_success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("No resolved auth token/key for this profile.")
+        );
+        assert_eq!(result.latency_ms, None);
+    }
+
+    #[test]
+    fn profile_manager_public_site_shortcut_opens_prompt() {
+        let mut app = make_test_app();
+        let relay = app
+            .manager
+            .add_provider_with_key_name(
+                "Relay",
+                "https://relay.example/api",
+                "Default",
+                "sk-test-generated-key-relay-3333333333333333",
+            )
+            .unwrap();
+        let relay_key = relay.keys.values().next().unwrap().clone();
+        let relay_profile = app
+            .manager
+            .create_lightweight_profile(
+                "relay-explicit",
+                Some("relay-explicit"),
+                LightweightEnv {
+                    model: Some("relay-explicit-model".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.manager
+            .set_provider(&relay_profile.id, &relay.id, &relay_key.id)
+            .unwrap();
+        app.refresh().unwrap();
+
+        app.handle_profile_page_key(KeyCode::Char('T'), KeyModifiers::SHIFT)
+            .unwrap();
+
+        assert_eq!(app.mode, Mode::PublicSitePrompt);
+        assert_eq!(app.public_site_prompt_buf, "Hello");
+        assert_eq!(app.public_site_targets.len(), 1);
+        assert_eq!(app.cursor_pos, app.public_site_prompt_buf.len());
     }
 
     #[test]
@@ -7221,6 +9383,223 @@ mod tests {
                 source: KeyEditSource::ProviderKeyList,
             }
         );
+    }
+
+    #[test]
+    fn confirm_delete_key_opens_linked_profile_popup_when_key_is_in_use() {
+        let mut app = make_test_app();
+        let provider = app
+            .manager
+            .add_provider_with_key_name(
+                "Example Provider",
+                "https://example.invalid",
+                "Default",
+                "sk-test-generated-key-888888888888888888888888",
+            )
+            .unwrap();
+        let key = provider.keys.values().next().unwrap().clone();
+        let profile = app
+            .manager
+            .create_lightweight_profile("linked-profile", Some("linked"), LightweightEnv::default())
+            .unwrap();
+        app.manager
+            .set_provider(&profile.id, &provider.id, &key.id)
+            .unwrap();
+        app.provider_keys_cache = app.manager.list_keys(&provider.id).unwrap();
+        app.page = Page::ProviderManager;
+        app.mode = Mode::ConfirmDeleteKey {
+            provider_id: provider.id.clone(),
+            key_id: key.id.clone(),
+            name: key.name.clone(),
+        };
+
+        app.handle_confirm_delete_key(KeyCode::Char('y')).unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::ProviderKeyInUse {
+                provider_id: provider.id.clone(),
+                key_id: key.id.clone(),
+                name: key.name.clone(),
+                return_mode: Box::new(Mode::ProviderKeyList {
+                    provider_id: provider.id.clone(),
+                }),
+            }
+        );
+        assert_eq!(app.provider_key_linked_profiles.len(), 1);
+        assert_eq!(app.provider_key_linked_profiles[0].name, "linked-profile");
+    }
+
+    #[test]
+    fn provider_edit_delete_key_opens_linked_profile_popup_when_key_is_in_use() {
+        let mut app = make_test_app();
+        let provider = app
+            .manager
+            .add_provider_with_key_name(
+                "Example Provider",
+                "https://example.invalid",
+                "Default",
+                "sk-test-generated-key-777777777777777777777777",
+            )
+            .unwrap();
+        let key = provider.keys.values().next().unwrap().clone();
+        let profile = app
+            .manager
+            .create_lightweight_profile(
+                "linked-provider-edit",
+                Some("linked-pe"),
+                LightweightEnv::default(),
+            )
+            .unwrap();
+        app.manager
+            .set_provider(&profile.id, &provider.id, &key.id)
+            .unwrap();
+        app.provider_keys_cache = app.manager.list_keys(&provider.id).unwrap();
+        app.page = Page::ProviderManager;
+        app.provider_name_buf = provider.name.clone();
+        app.provider_url_buf = provider.base_url.clone();
+        app.mode = Mode::ProviderEdit {
+            provider_id: provider.id.clone(),
+            step: 2,
+        };
+
+        app.handle_provider_edit(KeyCode::Char('d'), KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::ProviderKeyInUse {
+                provider_id: provider.id.clone(),
+                key_id: key.id.clone(),
+                name: key.name.clone(),
+                return_mode: Box::new(Mode::ProviderEdit {
+                    provider_id: provider.id.clone(),
+                    step: 2,
+                }),
+            }
+        );
+
+        app.handle_provider_key_in_use(KeyCode::Char('d'), KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::ProviderEdit {
+                provider_id: provider.id.clone(),
+                step: 2,
+            }
+        );
+        assert!(app.manager.get_profile(&profile.id).is_err());
+        assert!(app.manager.list_keys(&provider.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn provider_key_in_use_delete_last_profile_then_removes_key() {
+        let mut app = make_test_app();
+        let provider = app
+            .manager
+            .add_provider_with_key_name(
+                "Example Provider",
+                "https://example.invalid",
+                "Default",
+                "sk-test-generated-key-999999999999999999999999",
+            )
+            .unwrap();
+        let key = provider.keys.values().next().unwrap().clone();
+        let profile = app
+            .manager
+            .create_lightweight_profile("linked-profile", Some("linked"), LightweightEnv::default())
+            .unwrap();
+        app.manager
+            .set_provider(&profile.id, &provider.id, &key.id)
+            .unwrap();
+        app.provider_keys_cache = app.manager.list_keys(&provider.id).unwrap();
+        app.page = Page::ProviderManager;
+        app.mode = Mode::ProviderKeyInUse {
+            provider_id: provider.id.clone(),
+            key_id: key.id.clone(),
+            name: key.name.clone(),
+            return_mode: Box::new(Mode::ProviderKeyList {
+                provider_id: provider.id.clone(),
+            }),
+        };
+        app.provider_key_linked_profiles = app
+            .manager
+            .list_profiles_using_key(&provider.id, &key.id)
+            .unwrap();
+        app.provider_key_linked_profile_selected = 0;
+
+        app.handle_provider_key_in_use(KeyCode::Char('d'), KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::ProviderKeyList {
+                provider_id: provider.id.clone(),
+            }
+        );
+        assert!(app.manager.get_profile(&profile.id).is_err());
+        assert!(app.manager.list_keys(&provider.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn provider_key_in_use_y_unlinks_profiles_and_removes_key() {
+        let mut app = make_test_app();
+        let provider = app
+            .manager
+            .add_provider_with_key_name(
+                "Example Provider",
+                "https://example.invalid",
+                "Default",
+                "sk-test-generated-key-yyyyyyyyyyyyyyyyyyyyyyyy",
+            )
+            .unwrap();
+        let key = provider.keys.values().next().unwrap().clone();
+        let first = app
+            .manager
+            .create_lightweight_profile("linked-one", Some("linked-one"), LightweightEnv::default())
+            .unwrap();
+        let second = app
+            .manager
+            .create_lightweight_profile("linked-two", Some("linked-two"), LightweightEnv::default())
+            .unwrap();
+        app.manager
+            .set_provider(&first.id, &provider.id, &key.id)
+            .unwrap();
+        app.manager
+            .set_provider(&second.id, &provider.id, &key.id)
+            .unwrap();
+        app.provider_keys_cache = app.manager.list_keys(&provider.id).unwrap();
+        app.page = Page::ProviderManager;
+        app.mode = Mode::ProviderKeyInUse {
+            provider_id: provider.id.clone(),
+            key_id: key.id.clone(),
+            name: key.name.clone(),
+            return_mode: Box::new(Mode::ProviderKeyList {
+                provider_id: provider.id.clone(),
+            }),
+        };
+        app.provider_key_linked_profiles = app
+            .manager
+            .list_profiles_using_key(&provider.id, &key.id)
+            .unwrap();
+
+        app.handle_provider_key_in_use(KeyCode::Char('y'), KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(
+            app.mode,
+            Mode::ProviderKeyList {
+                provider_id: provider.id.clone(),
+            }
+        );
+        assert!(app.manager.list_keys(&provider.id).unwrap().is_empty());
+        for profile_id in [first.id, second.id] {
+            let profile = app.manager.get_profile(&profile_id).unwrap();
+            assert_eq!(profile.provider_id, None);
+            assert_eq!(profile.key_id, None);
+        }
+        assert!(app.provider_key_linked_profiles.is_empty());
     }
 
     #[test]
