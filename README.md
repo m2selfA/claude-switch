@@ -13,7 +13,7 @@ Two isolation modes:
 ### Cargo (requires Rust)
 
 ```bash
-cargo install cswitch --version 0.7.9
+cargo install cswitch --version 0.7.10
 ```
 
 ### Pre-built binaries

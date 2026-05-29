@@ -44,6 +44,23 @@ const NATIVE_FETCH_URLS: &[&str] = &[
     "https://api.anthropic.com",
 ];
 
+const ANYROUTER_URLS: &[&str] = &[
+    "https://a-ocnfniawgw.cn-shanghai.fcapp.run",
+    "https://anyrouter.top",
+];
+
+const ANYROUTER_TEST_BETA_CANDIDATES: &[&str] = &[
+    "claude-code-20250219",
+    "interleaved-thinking-2025-05-14",
+    "context-1m-2025-08-07",
+    "redact-thinking-2026-02-12",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
+    "fast-mode-2026-02-01",
+];
+
 fn url_matches(url: &str, known: &[&str]) -> bool {
     let Some(u) = canonical_url_for_match(url) else {
         return false;
@@ -7068,6 +7085,97 @@ pub struct AnthropicTestResult {
     pub output_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnthropicTestRequest {
+    body: serde_json::Value,
+    anthropic_beta: Option<String>,
+    anyrouter_non_haiku: bool,
+}
+
+fn is_anyrouter_url(base_url: &str) -> bool {
+    url_matches(base_url, ANYROUTER_URLS)
+}
+
+fn is_haiku_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("haiku")
+}
+
+fn anyrouter_beta_required_field(beta: &str) -> Option<&'static str> {
+    match beta {
+        "interleaved-thinking-2025-05-14"
+        | "context-1m-2025-08-07"
+        | "redact-thinking-2026-02-12" => Some("thinking"),
+        "context-management-2025-06-27" => Some("context_management"),
+        "effort-2025-11-24" => Some("output_config"),
+        _ => None,
+    }
+}
+
+fn anyrouter_body_has_truthy_field(body: &serde_json::Value, field: &str) -> bool {
+    match body.get(field) {
+        Some(serde_json::Value::Null) | None => false,
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn patch_anyrouter_beta_header(candidates: &[&str], body: &serde_json::Value) -> Option<String> {
+    let kept: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|flag| {
+            if *flag == "structured-outputs-2025-12-15" {
+                return false;
+            }
+            anyrouter_beta_required_field(flag)
+                .is_none_or(|field| anyrouter_body_has_truthy_field(body, field))
+        })
+        .collect();
+
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(","))
+    }
+}
+
+fn build_anthropic_test_request(base_url: &str, model: &str, prompt: &str) -> AnthropicTestRequest {
+    let anyrouter_non_haiku = is_anyrouter_url(base_url) && !is_haiku_model(model);
+    let max_tokens = if anyrouter_non_haiku { 1200 } else { 64 };
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+    });
+
+    if anyrouter_non_haiku && let Some(object) = body.as_object_mut() {
+        object.insert(
+            "thinking".into(),
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 1024,
+            }),
+        );
+    }
+
+    let anthropic_beta = if anyrouter_non_haiku {
+        patch_anyrouter_beta_header(ANYROUTER_TEST_BETA_CANDIDATES, &body)
+    } else {
+        None
+    };
+
+    AnthropicTestRequest {
+        body,
+        anthropic_beta,
+        anyrouter_non_haiku,
+    }
+}
+
 /// Send one non-streaming Anthropic-compatible /v1/messages request,
 /// trying multiple endpoint candidates derived from the base URL.
 pub fn test_anthropic_message_with_timeout(
@@ -7078,18 +7186,15 @@ pub fn test_anthropic_message_with_timeout(
     timeout: Duration,
 ) -> Result<AnthropicTestResult> {
     let candidates = build_message_candidates(base_url)?;
-    let body_json = serde_json::json!({
-        "model": model,
-        "max_tokens": 64,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-    });
+    let test_request = build_anthropic_test_request(base_url, model, prompt);
     let api_key_header = ureq::http::HeaderValue::from_bytes(auth_token.as_bytes())
         .context("Invalid API key for x-api-key header")?;
+    let beta_header = test_request
+        .anthropic_beta
+        .as_deref()
+        .map(ureq::http::HeaderValue::from_str)
+        .transpose()
+        .context("Invalid anthropic-beta header for AnyRouter test request")?;
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .build()
@@ -7097,15 +7202,19 @@ pub fn test_anthropic_message_with_timeout(
 
     let mut last_err: Option<String> = None;
     for url in &candidates {
-        let send_body =
-            ureq::SendBody::from_json(&body_json).context("Failed to encode request JSON")?;
-        let request = ureq::http::Request::builder()
+        let send_body = ureq::SendBody::from_json(&test_request.body)
+            .context("Failed to encode request JSON")?;
+        let mut request = ureq::http::Request::builder()
             .method(ureq::http::Method::POST)
             .uri(url.as_str())
             .header("content-type", "application/json; charset=utf-8")
             .header("x-api-key", api_key_header.clone())
             .header("Authorization", &format!("Bearer {}", auth_token))
-            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", "2023-06-01");
+        if let Some(value) = beta_header.as_ref() {
+            request = request.header("anthropic-beta", value.clone());
+        }
+        let request = request
             .body(send_body)
             .context("Failed to build Anthropic test request")?;
         let resp = request
@@ -7153,6 +7262,13 @@ pub fn test_anthropic_message_with_timeout(
                 body
             };
             last_err = Some(format!("HTTP {} at {url}: {body}", status.as_u16()));
+            continue;
+        }
+        if test_request.anyrouter_non_haiku && raw.trim().is_empty() {
+            last_err = Some(format!(
+                "HTTP {} at {url}: AnyRouter returned an empty success body",
+                status.as_u16()
+            ));
             continue;
         }
         return parse_anthropic_message_response(&raw, url);
@@ -8130,6 +8246,118 @@ mod tests {
                 .and_then(|entry| entry.as_str()),
             Some("sk-test-generated-key-777777777777777777777777")
         );
+    }
+
+    #[test]
+    fn anyrouter_test_request_for_non_haiku_injects_thinking_and_supported_betas() {
+        let request =
+            build_anthropic_test_request("HTTPS://ANYROUTER.TOP:443/", "claude-sonnet-4", "Hello");
+
+        assert!(request.anyrouter_non_haiku);
+        assert_eq!(
+            request.body.pointer("/max_tokens").and_then(|v| v.as_u64()),
+            Some(1200)
+        );
+        assert_eq!(
+            request
+                .body
+                .pointer("/thinking/type")
+                .and_then(|v| v.as_str()),
+            Some("enabled")
+        );
+        assert_eq!(
+            request
+                .body
+                .pointer("/thinking/budget_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(1024)
+        );
+        let beta = request.anthropic_beta.as_deref().unwrap_or_default();
+        assert!(beta.contains("claude-code-20250219"), "{beta}");
+        assert!(beta.contains("interleaved-thinking-2025-05-14"), "{beta}");
+        assert!(beta.contains("context-1m-2025-08-07"), "{beta}");
+        assert!(beta.contains("redact-thinking-2026-02-12"), "{beta}");
+        assert!(beta.contains("prompt-caching-scope-2026-01-05"), "{beta}");
+        assert!(beta.contains("advanced-tool-use-2025-11-20"), "{beta}");
+        assert!(beta.contains("fast-mode-2026-02-01"), "{beta}");
+        assert!(!beta.contains("context-management-2025-06-27"), "{beta}");
+        assert!(!beta.contains("effort-2025-11-24"), "{beta}");
+    }
+
+    #[test]
+    fn anyrouter_beta_patch_keeps_field_backed_flags() {
+        let body = serde_json::json!({
+            "messages": [],
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 1024
+            },
+            "context_management": {
+                "edits": []
+            },
+            "output_config": {
+                "effort": "medium"
+            }
+        });
+
+        let beta = patch_anyrouter_beta_header(
+            &[
+                "context-1m-2025-08-07",
+                "structured-outputs-2025-12-15",
+                "context-management-2025-06-27",
+                "effort-2025-11-24",
+            ],
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(
+            beta,
+            "context-1m-2025-08-07,context-management-2025-06-27,effort-2025-11-24"
+        );
+    }
+
+    #[test]
+    fn is_anyrouter_url_accepts_known_canonical_hosts() {
+        assert!(is_anyrouter_url(
+            "https://a-ocnfniawgw.cn-shanghai.fcapp.run/v1"
+        ));
+        assert!(is_anyrouter_url("HTTPS://ANYROUTER.TOP:443/api"));
+        assert!(!is_anyrouter_url("https://relay.example.invalid/api"));
+    }
+
+    #[test]
+    fn anyrouter_test_request_for_haiku_keeps_default_shape() {
+        let request = build_anthropic_test_request(
+            "https://anyrouter.top",
+            "claude-3-5-haiku-latest",
+            "Hello",
+        );
+
+        assert!(!request.anyrouter_non_haiku);
+        assert_eq!(
+            request.body.pointer("/max_tokens").and_then(|v| v.as_u64()),
+            Some(64)
+        );
+        assert!(request.body.get("thinking").is_none(), "{}", request.body);
+        assert!(request.anthropic_beta.is_none());
+    }
+
+    #[test]
+    fn regular_provider_test_request_keeps_default_shape_for_non_haiku() {
+        let request = build_anthropic_test_request(
+            "https://relay.example.invalid/api",
+            "claude-sonnet-4",
+            "Hello",
+        );
+
+        assert!(!request.anyrouter_non_haiku);
+        assert_eq!(
+            request.body.pointer("/max_tokens").and_then(|v| v.as_u64()),
+            Some(64)
+        );
+        assert!(request.body.get("thinking").is_none(), "{}", request.body);
+        assert!(request.anthropic_beta.is_none());
     }
 
     #[test]
