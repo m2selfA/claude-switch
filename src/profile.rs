@@ -732,6 +732,77 @@ pub enum ProfileKind {
     Full,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServer {
+    /// Auto-generated short ID (e.g. "mcp_a1b2").
+    pub id: String,
+    /// Claude Code MCP server name. This becomes the key under `mcpServers`.
+    pub name: String,
+    /// "stdio" (default), "http", "streamable-http", or "sse".
+    #[serde(default = "default_mcp_server_type", rename = "type")]
+    pub server_type: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub oauth: Option<serde_json::Value>,
+    #[serde(default, rename = "headersHelper")]
+    pub headers_helper: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(default, rename = "alwaysLoad")]
+    pub always_load: Option<bool>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+}
+
+fn default_mcp_server_type() -> String {
+    "stdio".to_string()
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct McpServerInput {
+    pub name: String,
+    pub server_type: String,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub cwd: Option<String>,
+    pub url: Option<String>,
+    pub headers: HashMap<String, String>,
+    pub oauth: Option<serde_json::Value>,
+    pub headers_helper: Option<String>,
+    pub timeout: Option<u64>,
+    pub always_load: Option<bool>,
+    pub disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct McpServerUpdate {
+    pub name: Option<String>,
+    pub server_type: Option<String>,
+    pub command: Option<Option<String>>,
+    pub args: Option<Vec<String>>,
+    pub env: Option<HashMap<String, String>>,
+    pub cwd: Option<Option<String>>,
+    pub url: Option<Option<String>>,
+    pub headers: Option<HashMap<String, String>>,
+    pub oauth: Option<Option<serde_json::Value>>,
+    pub headers_helper: Option<Option<String>>,
+    pub timeout: Option<Option<u64>>,
+    pub always_load: Option<Option<bool>>,
+    pub disabled: Option<Option<bool>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderKey {
     /// Auto-generated short ID (e.g. "key_a1b2")
@@ -796,6 +867,9 @@ pub struct Profile {
     /// Reference to a specific key within the provider.
     #[serde(default)]
     pub key_id: Option<String>,
+    /// Selected MCP servers for lightweight profiles. Stored as MCP server IDs.
+    #[serde(default)]
+    pub mcp_server_ids: Vec<String>,
 }
 
 impl Profile {
@@ -807,6 +881,9 @@ impl Profile {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Registry {
+    /// Keyed by MCP server `id`.
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServer>,
     /// Keyed by provider `id`.
     #[serde(default)]
     pub providers: HashMap<String, Provider>,
@@ -929,6 +1006,19 @@ impl ProfileManager {
                         .expect("profile id came from registry");
                     profile.provider_id = None;
                     profile.key_id = None;
+                    profile.mcp_server_ids.clear();
+                    changed = true;
+                }
+                if registry
+                    .profiles
+                    .get(&profile_id)
+                    .is_some_and(|profile| !profile.mcp_server_ids.is_empty())
+                {
+                    let profile = registry
+                        .profiles
+                        .get_mut(&profile_id)
+                        .expect("profile id came from registry");
+                    profile.mcp_server_ids.clear();
                     changed = true;
                 }
                 continue;
@@ -967,6 +1057,17 @@ impl ProfileManager {
                     profile.key_id = Some(only_key_id);
                     changed = true;
                 }
+            }
+
+            let known_mcp_ids = &registry.mcp_servers;
+            if let Some(profile) = registry.profiles.get_mut(&profile_id) {
+                let before = profile.mcp_server_ids.len();
+                profile
+                    .mcp_server_ids
+                    .retain(|mcp_id| known_mcp_ids.contains_key(mcp_id));
+                profile.mcp_server_ids.sort();
+                profile.mcp_server_ids.dedup();
+                changed |= before != profile.mcp_server_ids.len();
             }
         }
 
@@ -1112,6 +1213,110 @@ impl ProfileManager {
             );
         }
         Ok(())
+    }
+
+    fn normalize_mcp_server_type(server_type: &str) -> Result<String> {
+        let value = server_type.trim();
+        let normalized = if value.is_empty() { "stdio" } else { value }.to_ascii_lowercase();
+        match normalized.as_str() {
+            "stdio" | "http" | "streamable-http" | "sse" => Ok(normalized),
+            _ => bail!(
+                "MCP type '{}' is invalid. Use stdio, http, streamable-http, or sse.",
+                server_type
+            ),
+        }
+    }
+
+    fn normalize_optional_string(value: Option<String>) -> Option<String> {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn build_mcp_server(id: String, input: McpServerInput) -> Result<McpServer> {
+        let name = input.name.trim().to_string();
+        if name.is_empty() {
+            bail!("MCP name cannot be empty.");
+        }
+        let server_type = Self::normalize_mcp_server_type(&input.server_type)?;
+        let command = Self::normalize_optional_string(input.command);
+        let cwd = Self::normalize_optional_string(input.cwd);
+        let url = Self::normalize_optional_string(input.url);
+        let headers_helper = Self::normalize_optional_string(input.headers_helper);
+        match server_type.as_str() {
+            "stdio" if command.is_none() => {
+                bail!("MCP '{}' uses stdio and requires a command.", name);
+            }
+            "http" | "streamable-http" | "sse" if url.is_none() => {
+                bail!("MCP '{}' uses {} and requires a URL.", name, server_type);
+            }
+            _ => {}
+        }
+
+        Ok(McpServer {
+            id,
+            name,
+            server_type,
+            command,
+            args: input.args,
+            env: input.env,
+            cwd,
+            url,
+            headers: input.headers,
+            oauth: input.oauth,
+            headers_helper,
+            timeout: input.timeout,
+            always_load: input.always_load,
+            disabled: input.disabled,
+        })
+    }
+
+    fn check_mcp_name_unique_in_registry(
+        registry: &Registry,
+        exclude_id: &str,
+        name: &str,
+    ) -> Result<()> {
+        if registry
+            .mcp_servers
+            .values()
+            .any(|server| server.id != exclude_id && server.name == name)
+        {
+            bail!("MCP name '{}' is already in use.", name);
+        }
+        Ok(())
+    }
+
+    fn find_mcp_server_in_registry(
+        registry: &Registry,
+        query: &str,
+    ) -> Result<(String, McpServer)> {
+        let query = query.trim();
+        if query.is_empty() {
+            bail!("MCP query is empty.");
+        }
+        if let Some(server) = registry.mcp_servers.get(query) {
+            return Ok((query.to_string(), server.clone()));
+        }
+        let by_name: Vec<_> = registry
+            .mcp_servers
+            .iter()
+            .filter(|(_, server)| server.name == query)
+            .collect();
+        if by_name.len() == 1 {
+            return Ok((by_name[0].0.clone(), by_name[0].1.clone()));
+        }
+        if by_name.len() > 1 {
+            bail!(
+                "Multiple MCP servers match name '{}'. Use the full id to disambiguate.",
+                query
+            );
+        }
+        bail!("MCP '{}' not found. Add it with: cswitch mcp add", query)
+    }
+
+    pub fn find_mcp_server(&self, query: &str) -> Result<(String, McpServer)> {
+        let registry = self.load_registry()?;
+        Self::find_mcp_server_in_registry(&registry, query)
     }
 
     // ── Public CRUD ──────────────────────────────────────────────────────────
@@ -1282,6 +1487,178 @@ impl ProfileManager {
 
     pub fn profile_dir(&self, profile: &Profile) -> PathBuf {
         self.profiles_dir.join(profile.dir_name())
+    }
+
+    // ── MCP CRUD ────────────────────────────────────────────────────────────
+
+    pub fn list_mcp_servers(&self) -> Result<Vec<McpServer>> {
+        let registry = self.load_registry()?;
+        let mut servers: Vec<McpServer> = registry.mcp_servers.into_values().collect();
+        servers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        Ok(servers)
+    }
+
+    pub fn get_mcp_server(&self, query: &str) -> Result<McpServer> {
+        let (_, server) = self.find_mcp_server(query)?;
+        Ok(server)
+    }
+
+    pub fn add_mcp_server(&self, input: McpServerInput) -> Result<McpServer> {
+        let mut registry = self.load_registry()?;
+        let server =
+            Self::build_mcp_server(format!("mcp_{}", &Uuid::new_v4().to_string()[..8]), input)?;
+        Self::check_mcp_name_unique_in_registry(&registry, "", &server.name)?;
+        registry
+            .mcp_servers
+            .insert(server.id.clone(), server.clone());
+        self.save_registry(&registry)?;
+        Ok(server)
+    }
+
+    pub fn update_mcp_server(&self, query: &str, update: McpServerUpdate) -> Result<McpServer> {
+        let (id, existing) = self.find_mcp_server(query)?;
+        let mut registry = self.load_registry()?;
+        let input = McpServerInput {
+            name: update.name.unwrap_or(existing.name),
+            server_type: update.server_type.unwrap_or(existing.server_type),
+            command: update.command.unwrap_or(existing.command),
+            args: update.args.unwrap_or(existing.args),
+            env: update.env.unwrap_or(existing.env),
+            cwd: update.cwd.unwrap_or(existing.cwd),
+            url: update.url.unwrap_or(existing.url),
+            headers: update.headers.unwrap_or(existing.headers),
+            oauth: update.oauth.unwrap_or(existing.oauth),
+            headers_helper: update.headers_helper.unwrap_or(existing.headers_helper),
+            timeout: update.timeout.unwrap_or(existing.timeout),
+            always_load: update.always_load.unwrap_or(existing.always_load),
+            disabled: update.disabled.unwrap_or(existing.disabled),
+        };
+        let server = Self::build_mcp_server(id.clone(), input)?;
+        Self::check_mcp_name_unique_in_registry(&registry, &id, &server.name)?;
+        registry.mcp_servers.insert(id, server.clone());
+        self.save_registry(&registry)?;
+        Ok(server)
+    }
+
+    pub fn remove_mcp_server(&self, query: &str) -> Result<()> {
+        let (id, server) = self.find_mcp_server(query)?;
+        let registry = self.load_registry()?;
+        let refs: Vec<_> = registry
+            .profiles
+            .values()
+            .filter(|profile| profile.mcp_server_ids.iter().any(|mcp_id| mcp_id == &id))
+            .map(|profile| profile.name.clone())
+            .collect();
+        if !refs.is_empty() {
+            bail!(
+                "MCP '{}' is used by profiles: {}. Unlink it first.",
+                server.name,
+                refs.join(", ")
+            );
+        }
+        let mut registry = self.load_registry()?;
+        registry.mcp_servers.remove(&id);
+        self.save_registry(&registry)
+    }
+
+    pub fn list_profiles_using_mcp(&self, mcp_id: &str) -> Result<Vec<Profile>> {
+        let registry = self.load_registry()?;
+        if !registry.mcp_servers.contains_key(mcp_id) {
+            bail!("MCP '{}' not found.", mcp_id);
+        }
+        let mut profiles: Vec<Profile> = registry
+            .profiles
+            .values()
+            .filter(|profile| profile.mcp_server_ids.iter().any(|id| id == mcp_id))
+            .cloned()
+            .collect();
+        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(profiles)
+    }
+
+    pub fn set_profile_mcps(&self, query: &str, mcp_queries: &[String]) -> Result<Profile> {
+        let (profile_id, profile) = self.find_profile(query)?;
+        if profile.kind != ProfileKind::Lightweight {
+            bail!("MCP servers can only be linked to lightweight profiles.");
+        }
+        let mut registry = self.load_registry()?;
+        let mut mcp_ids = Vec::new();
+        for query in mcp_queries {
+            let (id, _) = Self::find_mcp_server_in_registry(&registry, query)?;
+            if !mcp_ids.contains(&id) {
+                mcp_ids.push(id);
+            }
+        }
+        let profile = registry
+            .profiles
+            .get_mut(&profile_id)
+            .with_context(|| format!("Profile '{}' not found.", query))?;
+        profile.mcp_server_ids = mcp_ids;
+        let profile = profile.clone();
+        self.save_registry(&registry)?;
+        Ok(profile)
+    }
+
+    pub fn add_profile_mcps(&self, query: &str, mcp_queries: &[String]) -> Result<Profile> {
+        let (profile_id, profile) = self.find_profile(query)?;
+        if profile.kind != ProfileKind::Lightweight {
+            bail!("MCP servers can only be linked to lightweight profiles.");
+        }
+        let mut registry = self.load_registry()?;
+        let mut additions = Vec::new();
+        for query in mcp_queries {
+            let (id, _) = Self::find_mcp_server_in_registry(&registry, query)?;
+            additions.push(id);
+        }
+        let profile = registry
+            .profiles
+            .get_mut(&profile_id)
+            .with_context(|| format!("Profile '{}' not found.", query))?;
+        for id in additions {
+            if !profile.mcp_server_ids.contains(&id) {
+                profile.mcp_server_ids.push(id);
+            }
+        }
+        let profile = profile.clone();
+        self.save_registry(&registry)?;
+        Ok(profile)
+    }
+
+    pub fn remove_profile_mcps(
+        &self,
+        query: &str,
+        mcp_queries: &[String],
+        remove_all: bool,
+    ) -> Result<Profile> {
+        let (profile_id, profile) = self.find_profile(query)?;
+        if profile.kind != ProfileKind::Lightweight {
+            bail!("MCP servers can only be unlinked from lightweight profiles.");
+        }
+        let mut registry = self.load_registry()?;
+        let remove_ids = if remove_all {
+            Vec::new()
+        } else {
+            let mut ids = Vec::new();
+            for query in mcp_queries {
+                let (id, _) = Self::find_mcp_server_in_registry(&registry, query)?;
+                ids.push(id);
+            }
+            ids
+        };
+        let profile = registry
+            .profiles
+            .get_mut(&profile_id)
+            .with_context(|| format!("Profile '{}' not found.", query))?;
+        if remove_all {
+            profile.mcp_server_ids.clear();
+        } else {
+            profile
+                .mcp_server_ids
+                .retain(|id| !remove_ids.iter().any(|remove_id| remove_id == id));
+        }
+        let profile = profile.clone();
+        self.save_registry(&registry)?;
+        Ok(profile)
     }
 
     // ── Provider resolution ─────────────────────────────────────────────────
@@ -1599,6 +1976,7 @@ impl ProfileManager {
             launch_args: None,
             provider_id: None,
             key_id: None,
+            mcp_server_ids: Vec::new(),
         };
         let mut registry = self.load_registry()?;
         registry
@@ -1636,6 +2014,7 @@ impl ProfileManager {
             launch_args: existing.launch_args.clone(),
             provider_id: existing.provider_id.clone(),
             key_id: existing.key_id.clone(),
+            mcp_server_ids: existing.mcp_server_ids.clone(),
         };
 
         let mut registry = self.load_registry()?;
@@ -1708,6 +2087,14 @@ impl ProfileManager {
                     cmd.arg(prompt_path);
                 } else {
                     cmd.arg(&artifacts.base_settings_json);
+                }
+
+                let mcp_servers = self.profile_mcp_servers(&profile)?;
+                if !mcp_servers.is_empty() {
+                    let plugin_root =
+                        self.upsert_local_profile_mcp_plugin(&profile, &mcp_servers)?;
+                    cmd.arg("--plugin-dir");
+                    cmd.arg(plugin_root);
                 }
             }
         } else {
@@ -1888,8 +2275,10 @@ impl ProfileManager {
         let mut desired_shims: Vec<(String, String)> = Vec::new();
         let mut desired_prompts: Vec<(String, String)> = Vec::new();
         let mut desired_plugins: Vec<(String, String)> = Vec::new();
+        let mut desired_mcps: Vec<(String, String)> = Vec::new();
         let mut desired_prompt_names = std::collections::HashSet::new();
         let mut desired_plugin_names = std::collections::HashSet::new();
+        let mut desired_mcp_names = std::collections::HashSet::new();
         for profile in &profiles {
             let alias_name = profile.alias.as_deref().unwrap_or(&profile.name);
             let Some(file_name) = Self::remote_shim_file_name(profile, remote_os) else {
@@ -1943,14 +2332,32 @@ impl ProfileManager {
                         ));
                     }
                 }
+
+                let mcp_servers = self.profile_mcp_servers(profile)?;
+                if !mcp_servers.is_empty() {
+                    let mcp_plugin_name = Self::profile_mcp_plugin_dir_name(profile);
+                    if desired_mcp_names.insert(mcp_plugin_name) {
+                        desired_mcps.push((
+                            Self::profile_mcp_manifest_relative_path(profile, remote_os),
+                            Self::profile_mcp_plugin_manifest(profile)?,
+                        ));
+                        let mcp_config = Self::profile_mcp_config(&mcp_servers)?;
+                        for config_path in
+                            Self::profile_mcp_config_relative_paths(profile, remote_os)
+                        {
+                            desired_mcps.push((config_path, mcp_config.clone()));
+                        }
+                    }
+                }
             }
         }
         if verbose {
             progress(&format!(
-                "[remote:{host}] building {} remote shim(s), {} TinyFish prompt file(s), {} TinyFish plugin file(s); skipping {} full profile(s)...",
+                "[remote:{host}] building {} remote shim(s), {} TinyFish prompt file(s), {} TinyFish plugin file(s), {} MCP plugin file(s); skipping {} full profile(s)...",
                 desired_shims.len(),
                 desired_prompts.len(),
                 desired_plugins.len(),
+                desired_mcps.len(),
                 skipped_full_profiles.len()
             ));
         }
@@ -1986,14 +2393,26 @@ impl ProfileManager {
             .collect();
         let ignored_plugins_count =
             existing_plugins_total.saturating_sub(managed_existing_plugins.len());
-        let ignored_count = ignored_shims_count + ignored_prompts_count + ignored_plugins_count;
+        let remote_mcps_dir = Self::join_remote_path(&remote_generated_root, remote_os, "mcps");
+        let existing_mcps = Self::list_remote_files_if_present(host, &remote_mcps_dir, remote_os)?;
+        let existing_mcps_total = existing_mcps.len();
+        let managed_existing_mcps: std::collections::HashSet<String> = existing_mcps
+            .into_iter()
+            .filter(|name| Self::is_managed_generated_mcp_dir_name(name))
+            .collect();
+        let ignored_mcps_count = existing_mcps_total.saturating_sub(managed_existing_mcps.len());
+        let ignored_count = ignored_shims_count
+            + ignored_prompts_count
+            + ignored_plugins_count
+            + ignored_mcps_count;
 
         if verbose {
             progress(&format!(
-                "[remote:{host}] found {} managed shim(s), {} managed prompt file(s), {} managed plugin dir(s); ignoring {} unrelated file(s)",
+                "[remote:{host}] found {} managed shim(s), {} managed prompt file(s), {} managed TinyFish plugin dir(s), {} managed MCP plugin dir(s); ignoring {} unrelated file(s)",
                 existing_shims_managed_count,
                 managed_existing_prompts.len(),
                 managed_existing_plugins.len(),
+                managed_existing_mcps.len(),
                 ignored_count
             ));
         }
@@ -2008,6 +2427,9 @@ impl ProfileManager {
         }
         if !desired_plugins.is_empty() || !managed_existing_plugins.is_empty() {
             Self::ensure_remote_dir(host, &remote_plugins_dir)?;
+        }
+        if !desired_mcps.is_empty() || !managed_existing_mcps.is_empty() {
+            Self::ensure_remote_dir(host, &remote_mcps_dir)?;
         }
 
         if verbose && !desired_shims.is_empty() {
@@ -2048,6 +2470,15 @@ impl ProfileManager {
                 &desired_plugins,
                 false,
             )?;
+        }
+        if verbose && !desired_mcps.is_empty() {
+            progress(&format!(
+                "[remote:{host}] uploading {} MCP plugin file(s)...",
+                desired_mcps.len()
+            ));
+        }
+        if !desired_mcps.is_empty() {
+            Self::upload_remote_files(host, &remote_mcps_dir, remote_os, &desired_mcps, false)?;
         }
 
         for (file_name, _) in &desired_shims {
@@ -2099,6 +2530,25 @@ impl ProfileManager {
             }
         }
 
+        for (file_name, _) in &desired_mcps {
+            let remote_path = Self::join_remote_path(&remote_mcps_dir, remote_os, file_name);
+            let plugin_dir_name = file_name
+                .split(['/', '\\'])
+                .next()
+                .expect("MCP plugin file path should include root dir");
+            if managed_existing_mcps.contains(plugin_dir_name) {
+                updated += 1;
+                if verbose {
+                    details.push(format!("  = {}:{}", host, remote_path));
+                }
+            } else {
+                added += 1;
+                if verbose {
+                    details.push(format!("  + {}:{}", host, remote_path));
+                }
+            }
+        }
+
         let desired_shim_names: std::collections::HashSet<&str> = desired_shims
             .iter()
             .map(|(name, _)| name.as_str())
@@ -2116,12 +2566,17 @@ impl ProfileManager {
             .iter()
             .filter(|name| !desired_plugin_names.contains(*name))
             .count();
+        let stale_mcp_count = managed_existing_mcps
+            .iter()
+            .filter(|name| !desired_mcp_names.contains(*name))
+            .count();
         if verbose {
             progress(&format!(
-                "[remote:{host}] checking {} stale shim(s), {} stale prompt file(s), {} stale plugin dir(s)...",
+                "[remote:{host}] checking {} stale shim(s), {} stale prompt file(s), {} stale TinyFish plugin dir(s), {} stale MCP plugin dir(s)...",
                 stale_shims.len(),
                 stale_prompt_count,
-                stale_plugin_count
+                stale_plugin_count,
+                stale_mcp_count
             ));
         }
         for stale in stale_shims {
@@ -2178,6 +2633,22 @@ impl ProfileManager {
                 details.push(format!("  - {}:{} (stale)", host, remote_path));
             }
             Self::remove_remote_plugin_dir(host, &remote_path, remote_os)?;
+            removed += 1;
+        }
+
+        for stale in managed_existing_mcps
+            .iter()
+            .filter(|name| !desired_mcp_names.contains(*name))
+        {
+            let remote_path = Self::join_remote_path(&remote_mcps_dir, remote_os, stale);
+            if verbose {
+                progress(&format!(
+                    "[remote:{host}] removing stale MCP plugin dir: {}",
+                    remote_path
+                ));
+                details.push(format!("  - {}:{} (stale)", host, remote_path));
+            }
+            Self::remove_remote_mcp_plugin_dir(host, &remote_path, remote_os)?;
             removed += 1;
         }
 
@@ -2239,6 +2710,66 @@ impl ProfileManager {
 
     fn generated_plugins_dir(&self) -> PathBuf {
         self.generated_root_dir().join("plugins")
+    }
+
+    fn generated_mcps_dir(&self) -> PathBuf {
+        self.generated_root_dir().join("mcps")
+    }
+
+    fn profile_mcp_plugin_dir_name(profile: &Profile) -> String {
+        let suffix: String = profile
+            .id
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .take(12)
+            .collect();
+        let suffix = if suffix.is_empty() {
+            "unknown".to_string()
+        } else {
+            suffix
+        };
+        format!("cswitch-mcp-profile-{suffix}")
+    }
+
+    fn local_profile_mcp_plugin_root(&self, profile: &Profile) -> PathBuf {
+        self.generated_mcps_dir()
+            .join(Self::profile_mcp_plugin_dir_name(profile))
+    }
+
+    fn home_relative_profile_mcp_plugin_root(profile: &Profile, target_os: RemoteOs) -> String {
+        let dir_name = Self::profile_mcp_plugin_dir_name(profile);
+        match target_os {
+            RemoteOs::Unix => format!("$HOME/.claude-switch/generated/mcps/{dir_name}"),
+            RemoteOs::Windows => {
+                format!("%USERPROFILE%\\.claude-switch\\generated\\mcps\\{dir_name}")
+            }
+        }
+    }
+
+    fn profile_mcp_manifest_relative_path(profile: &Profile, remote_os: RemoteOs) -> String {
+        let dir_name = Self::profile_mcp_plugin_dir_name(profile);
+        match remote_os {
+            RemoteOs::Unix => format!("{dir_name}/.claude-plugin/plugin.json"),
+            RemoteOs::Windows => format!("{dir_name}\\.claude-plugin\\plugin.json"),
+        }
+    }
+
+    fn profile_mcp_config_relative_paths(profile: &Profile, remote_os: RemoteOs) -> [String; 2] {
+        let dir_name = Self::profile_mcp_plugin_dir_name(profile);
+        match remote_os {
+            RemoteOs::Unix => [
+                format!("{dir_name}/.mcp.json"),
+                format!("{dir_name}/mcp.json"),
+            ],
+            RemoteOs::Windows => [
+                format!("{dir_name}\\.mcp.json"),
+                format!("{dir_name}\\mcp.json"),
+            ],
+        }
+    }
+
+    fn is_managed_generated_mcp_dir_name(file_name: &str) -> bool {
+        file_name.starts_with("cswitch-mcp-profile-")
     }
 
     fn tinyfish_plugin_dir_name(mode: TinyfishMode) -> Option<String> {
@@ -2379,6 +2910,144 @@ impl ProfileManager {
                 fs::create_dir_all(parent)?;
             }
             fs::write(path, content)?;
+        }
+        Ok(())
+    }
+
+    fn mcp_server_config_value(server: &McpServer) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "type".into(),
+            serde_json::Value::String(server.server_type.clone()),
+        );
+        if let Some(command) = &server.command {
+            object.insert("command".into(), serde_json::Value::String(command.clone()));
+        }
+        if !server.args.is_empty() {
+            object.insert("args".into(), serde_json::json!(server.args));
+        }
+        if !server.env.is_empty() {
+            object.insert("env".into(), serde_json::json!(server.env));
+        }
+        if let Some(cwd) = &server.cwd {
+            object.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+        }
+        if let Some(url) = &server.url {
+            object.insert("url".into(), serde_json::Value::String(url.clone()));
+        }
+        if !server.headers.is_empty() {
+            object.insert("headers".into(), serde_json::json!(server.headers));
+        }
+        if let Some(oauth) = &server.oauth {
+            object.insert("oauth".into(), oauth.clone());
+        }
+        if let Some(headers_helper) = &server.headers_helper {
+            object.insert(
+                "headersHelper".into(),
+                serde_json::Value::String(headers_helper.clone()),
+            );
+        }
+        if let Some(timeout) = server.timeout {
+            object.insert("timeout".into(), serde_json::json!(timeout));
+        }
+        if let Some(always_load) = server.always_load {
+            object.insert("alwaysLoad".into(), serde_json::json!(always_load));
+        }
+        if let Some(disabled) = server.disabled {
+            object.insert("disabled".into(), serde_json::json!(disabled));
+        }
+        serde_json::Value::Object(object)
+    }
+
+    fn profile_mcp_servers(&self, profile: &Profile) -> Result<Vec<McpServer>> {
+        if profile.mcp_server_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if profile.kind != ProfileKind::Lightweight {
+            bail!("MCP servers can only be linked to lightweight profiles.");
+        }
+        let registry = self.load_registry()?;
+        let mut servers = Vec::new();
+        for mcp_id in &profile.mcp_server_ids {
+            let server = registry.mcp_servers.get(mcp_id).with_context(|| {
+                format!(
+                    "Profile '{}' references missing MCP '{}'.",
+                    profile.name, mcp_id
+                )
+            })?;
+            servers.push(server.clone());
+        }
+        Ok(servers)
+    }
+
+    fn profile_mcp_plugin_manifest(profile: &Profile) -> Result<String> {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": Self::profile_mcp_plugin_dir_name(profile),
+            "displayName": format!("claude-switch MCPs for {}", profile.name),
+            "description": "Generated by claude-switch to attach selected MCP servers to this profile.",
+        }))
+        .context("Failed to serialize MCP plugin manifest JSON")
+    }
+
+    fn profile_mcp_config(servers: &[McpServer]) -> Result<String> {
+        let mut mcp_servers = serde_json::Map::new();
+        for server in servers {
+            if mcp_servers.contains_key(&server.name) {
+                bail!(
+                    "Duplicate MCP server name '{}' in profile selection.",
+                    server.name
+                );
+            }
+            mcp_servers.insert(server.name.clone(), Self::mcp_server_config_value(server));
+        }
+        let root = serde_json::json!({
+            "$schema": "https://json.schemastore.org/claude-code-settings.json",
+            "mcpServers": mcp_servers,
+        });
+        serde_json::to_string_pretty(&root).context("Failed to serialize MCP config JSON")
+    }
+
+    fn upsert_local_profile_mcp_plugin(
+        &self,
+        profile: &Profile,
+        servers: &[McpServer],
+    ) -> Result<PathBuf> {
+        let plugin_root = self.local_profile_mcp_plugin_root(profile);
+        let manifest_path = plugin_root.join(".claude-plugin").join("plugin.json");
+        let mcp_config = Self::profile_mcp_config(servers)?;
+        Self::write_if_changed(&manifest_path, &Self::profile_mcp_plugin_manifest(profile)?)?;
+        Self::write_if_changed(&plugin_root.join(".mcp.json"), &mcp_config)?;
+        Self::write_if_changed(&plugin_root.join("mcp.json"), &mcp_config)?;
+        Ok(plugin_root)
+    }
+
+    fn sync_local_mcp_artifacts(&self, profiles: &[Profile]) -> Result<()> {
+        let mut desired = std::collections::HashSet::new();
+        for profile in profiles {
+            if profile.kind != ProfileKind::Lightweight || profile.mcp_server_ids.is_empty() {
+                continue;
+            }
+            let servers = self.profile_mcp_servers(profile)?;
+            self.upsert_local_profile_mcp_plugin(profile, &servers)?;
+            desired.insert(Self::profile_mcp_plugin_dir_name(profile));
+        }
+
+        let mcps_dir = self.generated_mcps_dir();
+        if let Ok(entries) = fs::read_dir(&mcps_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(file_name) = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                else {
+                    continue;
+                };
+                if Self::is_managed_generated_mcp_dir_name(&file_name)
+                    && !desired.contains(&file_name)
+                {
+                    let _ = fs::remove_dir_all(path);
+                }
+            }
         }
         Ok(())
     }
@@ -2592,6 +3261,16 @@ impl ProfileManager {
         lines.push("goto loop".into());
         lines.push(":build_settings".into());
 
+        let mcp_servers = self.profile_mcp_servers(profile)?;
+        let mcp_plugin_enabled = !mcp_servers.is_empty();
+        if mcp_plugin_enabled {
+            lines.push(
+                "set \"_MCP_PLUGIN_DIR=".to_string()
+                    + &Self::home_relative_profile_mcp_plugin_root(profile, RemoteOs::Windows)
+                    + "\"",
+            );
+        }
+
         if let Some(runtime) = cmd_runtime.as_ref() {
             assign_cmd_json_var(&mut lines, "_SETTINGS", &runtime.base_settings_json);
             if tf_mode != TinyfishMode::None {
@@ -2627,26 +3306,33 @@ impl ProfileManager {
         } else {
             "claude"
         };
+        let mcp_plugin_part = if mcp_plugin_enabled {
+            " --plugin-dir \"%_MCP_PLUGIN_DIR%\""
+        } else {
+            ""
+        };
 
         if has_launch {
             if tf_mode != TinyfishMode::None {
                 lines.push(":launch_with_hooks_extras".into());
-                lines.push("claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\" --append-system-prompt-file \"%_TF_PROMPT_FILE%\" %_LAUNCH_ARGS% %_R%".into());
+                lines.push(format!("claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\" --append-system-prompt-file \"%_TF_PROMPT_FILE%\"{mcp_plugin_part} %_LAUNCH_ARGS% %_R%"));
                 lines.push("exit /b %errorlevel%".into());
             }
             lines.push(":launch_with_extras".into());
-            lines.push(format!("{settings_prefix} %_LAUNCH_ARGS% %_R%"));
+            lines.push(format!(
+                "{settings_prefix}{mcp_plugin_part} %_LAUNCH_ARGS% %_R%"
+            ));
             lines.push("exit /b %errorlevel%".into());
         }
 
         if tf_mode != TinyfishMode::None {
             lines.push(":launch_with_hooks_plain".into());
-            lines.push("claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\" --append-system-prompt-file \"%_TF_PROMPT_FILE%\" %_R%".into());
+            lines.push(format!("claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\" --append-system-prompt-file \"%_TF_PROMPT_FILE%\"{mcp_plugin_part} %_R%"));
             lines.push("exit /b %errorlevel%".into());
         }
 
         lines.push(":launch_plain".into());
-        lines.push(format!("{settings_prefix} %_R%"));
+        lines.push(format!("{settings_prefix}{mcp_plugin_part} %_R%"));
         lines.push("exit /b %errorlevel%".into());
 
         Ok(lines.join("\r\n") + "\r\n")
@@ -2659,6 +3345,7 @@ impl ProfileManager {
     pub fn sync_cmd_aliases(&self) -> Result<String> {
         let profiles = self.list_profiles()?;
         self.sync_local_tinyfish_artifacts(&profiles)?;
+        self.sync_local_mcp_artifacts(&profiles)?;
         let bin_dir = Self::cmd_bin_dir()?;
         fs::create_dir_all(&bin_dir)?;
 
@@ -2974,6 +3661,69 @@ impl ProfileManager {
         })
     }
 
+    fn remove_remote_mcp_plugin_dir(
+        host: &str,
+        remote_path: &str,
+        remote_os: RemoteOs,
+    ) -> Result<()> {
+        Self::remove_remote_mcp_plugin_dir_with_runner(host, remote_path, remote_os, |stdin| {
+            Self::run_remote_sftp_commands(host, stdin)
+        })
+    }
+
+    fn remove_remote_mcp_plugin_dir_with_runner<F>(
+        _host: &str,
+        remote_path: &str,
+        remote_os: RemoteOs,
+        mut run_sftp: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<String>,
+    {
+        let manifest_dir = Self::join_remote_path(remote_path, remote_os, ".claude-plugin");
+        let manifest_json = Self::join_remote_path(&manifest_dir, remote_os, "plugin.json");
+        let dot_mcp_json = Self::join_remote_path(remote_path, remote_os, ".mcp.json");
+        let mcp_json = Self::join_remote_path(remote_path, remote_os, "mcp.json");
+        let manifest_json_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            manifest_json.replace('\\', "/")
+        } else {
+            manifest_json
+        };
+        let manifest_dir_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            manifest_dir.replace('\\', "/")
+        } else {
+            manifest_dir
+        };
+        let dot_mcp_json_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            dot_mcp_json.replace('\\', "/")
+        } else {
+            dot_mcp_json
+        };
+        let mcp_json_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            mcp_json.replace('\\', "/")
+        } else {
+            mcp_json
+        };
+        let plugin_dir_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            remote_path.replace('\\', "/")
+        } else {
+            remote_path.to_string()
+        };
+        let cmds = format!(
+            "rm {}\nrm {}\nrm {}\nrmdir {}\nrmdir {}\n",
+            Self::sftp_quote(&manifest_json_sftp),
+            Self::sftp_quote(&dot_mcp_json_sftp),
+            Self::sftp_quote(&mcp_json_sftp),
+            Self::sftp_quote(&manifest_dir_sftp),
+            Self::sftp_quote(&plugin_dir_sftp),
+        );
+        match run_sftp(&cmds) {
+            Ok(_) => Ok(()),
+            Err(error) if Self::is_benign_sftp_missing_error(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn remove_remote_plugin_dir_with_runner<F>(
         _host: &str,
         remote_path: &str,
@@ -3244,6 +3994,16 @@ impl ProfileManager {
             lines.push("TF_SP_ARGS=()".into());
         }
 
+        let mcp_servers = self.profile_mcp_servers(profile)?;
+        if !mcp_servers.is_empty() {
+            lines.push(format!(
+                "MCP_PLUGIN_ARGS=(--plugin-dir \"{}\")",
+                Self::home_relative_profile_mcp_plugin_root(profile, RemoteOs::Unix)
+            ));
+        } else {
+            lines.push("MCP_PLUGIN_ARGS=()".into());
+        }
+
         lines.push(String::new());
         lines.push("EXTRA=true".into());
         lines.push("ARGS=()".into());
@@ -3268,12 +4028,12 @@ impl ProfileManager {
 
         if has_launch {
             lines.push(format!(
-                "if $EXTRA; then exec claude{0}{1} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{TF_SP_ARGS[@]}}\" \"${{ARGS[@]}}\"; else exec claude{0} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{TF_SP_ARGS[@]}}\" \"${{ARGS[@]}}\"; fi",
+                "if $EXTRA; then exec claude{0}{1} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{TF_SP_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; else exec claude{0} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{TF_SP_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; fi",
                 settings_part, launch_part
             ));
         } else {
             lines.push(format!(
-                "exec claude{0} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{TF_SP_ARGS[@]}}\" \"${{ARGS[@]}}\"",
+                "exec claude{0} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{TF_SP_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"",
                 settings_part
             ));
         }
@@ -3286,6 +4046,7 @@ impl ProfileManager {
     pub fn sync_sh_scripts(&self) -> Result<String> {
         let profiles = self.list_profiles()?;
         self.sync_local_tinyfish_artifacts(&profiles)?;
+        self.sync_local_mcp_artifacts(&profiles)?;
         let bin_dir = Self::sh_bin_dir()?;
         // Only operate if the directory already exists (opt-in)
         if !bin_dir.exists() || !bin_dir.is_dir() {
@@ -3365,6 +4126,7 @@ impl ProfileManager {
             launch_args: None,
             provider_id: None,
             key_id: None,
+            mcp_server_ids: Vec::new(),
         })
     }
 
@@ -4089,6 +4851,7 @@ mod tests {
                 launch_args: None,
                 provider_id: None,
                 key_id: None,
+                mcp_server_ids: Vec::new(),
             },
         );
         mgr.save_registry(&reg).unwrap();
@@ -4585,6 +5348,7 @@ mod tests {
                 launch_args: None,
                 provider_id: Some(provider_id.clone()),
                 key_id: None,
+                mcp_server_ids: Vec::new(),
             },
         );
         mgr.save_registry(&reg).unwrap();
@@ -5630,6 +6394,135 @@ mod tests {
         assert!(!ProfileManager::is_managed_generated_plugin_dir_name(
             "tinyfish-custom"
         ));
+    }
+
+    #[test]
+    fn mcp_server_crud_links_only_lightweight_profiles() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "codex-sessions".into(),
+                server_type: "stdio".into(),
+                command: Some("codex-sessions-mcp".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let lite = mgr
+            .create_lightweight_profile("lite", Some("lite-mcp"), LightweightEnv::default())
+            .unwrap();
+        let full_src = make_claude_dir(&tmp.path().join("fake-claude-mcp"));
+        let full = mgr
+            .add_profile_from("full", Some("full-mcp"), &full_src)
+            .unwrap();
+
+        let linked = mgr
+            .set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+            .unwrap();
+        assert_eq!(linked.mcp_server_ids, vec![server.id.clone()]);
+        assert!(
+            mgr.set_profile_mcps(&full.id, std::slice::from_ref(&server.id))
+                .unwrap_err()
+                .to_string()
+                .contains("lightweight")
+        );
+        assert!(
+            mgr.remove_mcp_server(&server.id)
+                .unwrap_err()
+                .to_string()
+                .contains("used by profiles")
+        );
+        let refs = mgr.list_profiles_using_mcp(&server.id).unwrap();
+        assert_eq!(refs[0].name, "lite");
+    }
+
+    #[test]
+    fn mcp_plugin_generation_writes_mcp_json_and_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let mut env = HashMap::new();
+        env.insert("GITHUB_TOKEN".into(), "${GITHUB_TOKEN}".into());
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "github".into(),
+                server_type: "stdio".into(),
+                command: Some("npx".into()),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                env,
+                always_load: Some(false),
+                disabled: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        let lite = mgr
+            .create_lightweight_profile("lite", Some("lite-mcp-json"), LightweightEnv::default())
+            .unwrap();
+        let linked = mgr
+            .set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+            .unwrap();
+        let servers = mgr.profile_mcp_servers(&linked).unwrap();
+        let plugin_root = mgr
+            .upsert_local_profile_mcp_plugin(&linked, &servers)
+            .unwrap();
+        assert!(
+            plugin_root
+                .join(".claude-plugin")
+                .join("plugin.json")
+                .exists()
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(plugin_root.join(".mcp.json")).unwrap())
+                .unwrap();
+        let compat_config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(plugin_root.join("mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(config, compat_config);
+        assert_eq!(
+            config["$schema"].as_str(),
+            Some("https://json.schemastore.org/claude-code-settings.json")
+        );
+        assert_eq!(
+            config["mcpServers"]["github"]["command"].as_str(),
+            Some("npx")
+        );
+        assert_eq!(
+            config["mcpServers"]["github"]["env"]["GITHUB_TOKEN"].as_str(),
+            Some("${GITHUB_TOKEN}")
+        );
+        assert_eq!(
+            config["mcpServers"]["github"]["alwaysLoad"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn generated_launchers_include_mcp_plugin_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "codex-sessions".into(),
+                server_type: "stdio".into(),
+                command: Some("codex-sessions-mcp".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let lite = mgr
+            .create_lightweight_profile("lite", Some("lmcp"), LightweightEnv::default())
+            .unwrap();
+        let linked = mgr
+            .set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+            .unwrap();
+
+        let cmd = mgr.generate_cmd_content(&linked).unwrap();
+        assert!(
+            cmd.contains("%USERPROFILE%\\.claude-switch\\generated\\mcps\\cswitch-mcp-profile-")
+        );
+        assert!(cmd.contains("--plugin-dir \"%_MCP_PLUGIN_DIR%\""));
+
+        let sh = mgr.generate_sh_content(&linked).unwrap();
+        assert!(sh.contains("$HOME/.claude-switch/generated/mcps/cswitch-mcp-profile-"));
+        assert!(sh.contains("MCP_PLUGIN_ARGS=(--plugin-dir"));
     }
 
     #[test]

@@ -22,9 +22,10 @@ use std::{
 use crate::cli_args::all_flag_names;
 use crate::env_vars::all_var_names;
 use crate::profile::{
-    LightweightEnv, ModelDiscoverySuccess, Profile, ProfileKind, ProfileManager, Provider,
-    ProviderKey, discover_models, discover_models_with_timeout, fetch_models,
-    test_anthropic_message, test_anthropic_message_with_timeout,
+    LightweightEnv, McpServer, McpServerInput, McpServerUpdate, ModelDiscoverySuccess, Profile,
+    ProfileKind, ProfileManager, Provider, ProviderKey, discover_models,
+    discover_models_with_timeout, fetch_models, test_anthropic_message,
+    test_anthropic_message_with_timeout,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -151,6 +152,21 @@ enum Mode {
         name: String,
         return_mode: Box<Mode>,
     },
+    McpAdd {
+        step: usize,
+    },
+    McpEdit {
+        mcp_id: String,
+        step: usize,
+    },
+    McpProfilePicker {
+        profile_id: String,
+    },
+    McpSmartPaste,
+    ConfirmDeleteMcp {
+        mcp_id: String,
+        name: String,
+    },
     PublicSitePrompt,
     PublicSiteTesting,
     PublicSiteResults,
@@ -158,8 +174,9 @@ enum Mode {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Page {
-    ProfileManager,
-    ProviderManager,
+    Profile,
+    Provider,
+    Mcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -195,6 +212,8 @@ const PUBLIC_SITE_TEST_TIMEOUT_SECS: u64 = 16;
 const PUBLIC_SITE_TEST_PAGE_SIZE: usize = 5;
 const PUBLIC_SITE_EVENT_POLL_MS: u64 = 100;
 const PUBLIC_SITE_DETAIL_SCROLL_STEP: u16 = 3;
+const MCP_TYPES: &[&str] = &["stdio", "http", "streamable-http", "sse"];
+const MCP_EDITOR_STEPS: usize = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PublicSiteModelSource {
@@ -913,6 +932,25 @@ pub struct App {
     provider_key_selected: usize,
     provider_key_linked_profiles: Vec<Profile>,
     provider_key_linked_profile_selected: usize,
+    mcps_cache: Vec<McpServer>,
+    mcp_list_state: ListState,
+    mcp_list_scroll: ScrollbarState,
+    mcp_profile_links_cache: Vec<Profile>,
+    mcp_selected_ids: Vec<String>,
+    mcp_filter_buf: String,
+    mcp_name_buf: String,
+    mcp_type_idx: usize,
+    mcp_command_buf: String,
+    mcp_args: Vec<String>,
+    mcp_env: Vec<String>,
+    mcp_cwd_buf: String,
+    mcp_url_buf: String,
+    mcp_headers: Vec<String>,
+    mcp_oauth_buf: String,
+    mcp_headers_helper_buf: String,
+    mcp_timeout_buf: String,
+    mcp_always_load: Option<bool>,
+    mcp_disabled: Option<bool>,
     public_site_prompt_buf: String,
     public_site_targets: Vec<PublicSiteTarget>,
     public_site_results: Vec<PublicSiteTestResult>,
@@ -952,7 +990,7 @@ impl App {
             list_state,
             list_scroll: ScrollbarState::default(),
             mode,
-            page: Page::ProfileManager,
+            page: Page::Profile,
             input_buffer,
             cursor_pos: 0,
             search_query: String::new(),
@@ -989,6 +1027,25 @@ impl App {
             provider_key_selected: 0,
             provider_key_linked_profiles: Vec::new(),
             provider_key_linked_profile_selected: 0,
+            mcps_cache: Vec::new(),
+            mcp_list_state: ListState::default(),
+            mcp_list_scroll: ScrollbarState::default(),
+            mcp_profile_links_cache: Vec::new(),
+            mcp_selected_ids: Vec::new(),
+            mcp_filter_buf: String::new(),
+            mcp_name_buf: String::new(),
+            mcp_type_idx: 0,
+            mcp_command_buf: String::new(),
+            mcp_args: Vec::new(),
+            mcp_env: Vec::new(),
+            mcp_cwd_buf: String::new(),
+            mcp_url_buf: String::new(),
+            mcp_headers: Vec::new(),
+            mcp_oauth_buf: String::new(),
+            mcp_headers_helper_buf: String::new(),
+            mcp_timeout_buf: String::new(),
+            mcp_always_load: None,
+            mcp_disabled: None,
             public_site_prompt_buf: PUBLIC_SITE_TEST_DEFAULT_PROMPT.to_string(),
             public_site_targets: Vec::new(),
             public_site_results: Vec::new(),
@@ -1124,17 +1181,26 @@ impl App {
 
     fn switch_manager_page(&mut self) -> Result<()> {
         self.page = match self.page {
-            Page::ProfileManager => {
+            Page::Profile => {
                 self.providers_cache = self.manager.list_providers().unwrap_or_default();
                 self.provider_list_state = ListState::default();
                 if !self.providers_cache.is_empty() {
                     self.provider_list_state.select(Some(0));
                 }
-                Page::ProviderManager
+                Page::Provider
             }
-            Page::ProviderManager => {
+            Page::Provider => {
+                self.mcps_cache = self.manager.list_mcp_servers().unwrap_or_default();
+                self.mcp_list_state = ListState::default();
+                if !self.mcps_cache.is_empty() {
+                    self.mcp_list_state.select(Some(0));
+                }
+                self.refresh_mcp_profile_links();
+                Page::Mcp
+            }
+            Page::Mcp => {
                 self.refresh()?;
-                Page::ProfileManager
+                Page::Profile
             }
         };
         self.mode = Mode::Normal;
@@ -1601,6 +1667,18 @@ impl App {
                         Mode::ProviderKeyInUse { .. } => {
                             self.handle_provider_key_in_use(key.code, key.modifiers)?;
                         }
+                        Mode::McpAdd { .. } | Mode::McpEdit { .. } => {
+                            self.handle_mcp_editor(key.code, key.modifiers)?;
+                        }
+                        Mode::McpProfilePicker { .. } => {
+                            self.handle_mcp_profile_picker(key.code, key.modifiers)?;
+                        }
+                        Mode::McpSmartPaste => {
+                            self.handle_mcp_smart_paste(key.code, key.modifiers)?;
+                        }
+                        Mode::ConfirmDeleteMcp { .. } => {
+                            self.handle_confirm_delete_mcp(key.code)?;
+                        }
                         Mode::PublicSitePrompt => {
                             self.handle_public_site_prompt(key.code, key.modifiers)?;
                         }
@@ -1676,6 +1754,15 @@ impl App {
                     text,
                 );
             }
+            Mode::McpAdd { .. } | Mode::McpEdit { .. } => {
+                self.paste_into_mcp_editor(text);
+            }
+            Mode::McpProfilePicker { .. } => {
+                insert_str_at_cursor(&mut self.mcp_filter_buf, &mut self.cursor_pos, text);
+            }
+            Mode::McpSmartPaste => {
+                insert_str_at_cursor(&mut self.mcp_oauth_buf, &mut self.cursor_pos, text);
+            }
             Mode::ProviderAnthropicTest { field, .. } => {
                 if field == 0 {
                     insert_str_at_cursor(
@@ -1748,8 +1835,9 @@ impl App {
         }
 
         match self.page {
-            Page::ProfileManager => self.handle_profile_page_key(code, modifiers),
-            Page::ProviderManager => self.handle_provider_page_normal_key(code, modifiers),
+            Page::Profile => self.handle_profile_page_key(code, modifiers),
+            Page::Provider => self.handle_provider_page_normal_key(code, modifiers),
+            Page::Mcp => self.handle_mcp_page_normal_key(code, modifiers),
         }
     }
 
@@ -1798,6 +1886,10 @@ impl App {
 
             KeyCode::Char('T') => {
                 self.start_public_site_prompt()?;
+            }
+
+            KeyCode::Char('M') => {
+                self.start_selected_profile_mcp_picker()?;
             }
 
             KeyCode::Char('a') => {
@@ -2020,6 +2112,54 @@ impl App {
                 self.mode = Mode::Help;
             }
 
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_mcp_page_normal_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<bool> {
+        match code {
+            _ if Self::is_prev_list_key(code, modifiers) => self.move_mcp_up(),
+            _ if Self::is_next_list_key(code, modifiers) => self.move_mcp_down(),
+            KeyCode::Char('a') => {
+                self.reset_mcp_editor();
+                self.mode = Mode::McpAdd { step: 0 };
+            }
+            KeyCode::Char('e') => {
+                if let Some(mcp) = self.selected_mcp().cloned() {
+                    self.load_mcp_editor(&mcp);
+                    self.mode = Mode::McpEdit {
+                        mcp_id: mcp.id,
+                        step: 0,
+                    };
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(mcp) = self.selected_mcp() {
+                    self.mode = Mode::ConfirmDeleteMcp {
+                        mcp_id: mcp.id.clone(),
+                        name: mcp.name.clone(),
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                self.refresh_mcp_profile_links();
+                self.show_message(
+                    format!("{} linked profile(s)", self.mcp_profile_links_cache.len()),
+                    false,
+                    Some(Mode::Normal),
+                );
+            }
+            KeyCode::Char('y') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_mcp_smart_paste();
+            }
+            KeyCode::Char('?') => {
+                self.mode = Mode::Help;
+            }
             _ => {}
         }
         Ok(false)
@@ -2944,13 +3084,17 @@ impl App {
             .split(layout[1]);
 
         match self.page {
-            Page::ProfileManager => {
+            Page::Profile => {
                 self.render_profile_list(f, cols[0]);
                 self.render_detail_panel(f, cols[1]);
             }
-            Page::ProviderManager => {
+            Page::Provider => {
                 self.render_provider_list_page(f, cols[0]);
                 self.render_provider_detail_page(f, cols[1]);
+            }
+            Page::Mcp => {
+                self.render_mcp_list_page(f, cols[0]);
+                self.render_mcp_detail_page(f, cols[1]);
             }
         }
         self.render_footer(f, layout[2]);
@@ -2987,6 +3131,12 @@ impl App {
             Mode::ConfirmDeleteProvider { .. } => self.render_confirm_delete_provider_popup(f),
             Mode::ConfirmDeleteKey { .. } => self.render_confirm_delete_key_popup(f),
             Mode::ProviderKeyInUse { .. } => self.render_provider_key_in_use_popup(f),
+            Mode::McpAdd { step } | Mode::McpEdit { step, .. } => {
+                self.render_mcp_editor_popup(f, *step)
+            }
+            Mode::McpProfilePicker { .. } => self.render_mcp_profile_picker_popup(f),
+            Mode::McpSmartPaste => self.render_mcp_smart_paste_popup(f),
+            Mode::ConfirmDeleteMcp { .. } => self.render_confirm_delete_mcp_popup(f),
             Mode::PublicSitePrompt => self.render_public_site_prompt_popup(f),
             Mode::PublicSiteTesting | Mode::PublicSiteResults => {
                 self.render_public_site_results_popup(f)
@@ -3074,8 +3224,9 @@ impl App {
                 Span::styled("claude-switch", Style::default().fg(TEXT).bold()),
                 Span::styled(
                     match self.page {
-                        Page::ProfileManager => "  profile manager",
-                        Page::ProviderManager => "  provider manager",
+                        Page::Profile => "  profile manager",
+                        Page::Provider => "  provider manager",
+                        Page::Mcp => "  mcp manager",
                     },
                     Style::default().fg(DIM),
                 ),
@@ -3085,12 +3236,14 @@ impl App {
         );
 
         let (count, total) = match self.page {
-            Page::ProfileManager => (self.filtered_indices.len(), self.profiles.len()),
-            Page::ProviderManager => (self.providers_cache.len(), self.providers_cache.len()),
+            Page::Profile => (self.filtered_indices.len(), self.profiles.len()),
+            Page::Provider => (self.providers_cache.len(), self.providers_cache.len()),
+            Page::Mcp => (self.mcps_cache.len(), self.mcps_cache.len()),
         };
         let item_name = match self.page {
-            Page::ProfileManager => "profile",
-            Page::ProviderManager => "provider",
+            Page::Profile => "profile",
+            Page::Provider => "provider",
+            Page::Mcp => "mcp",
         };
         let label = if count == total {
             format!(
@@ -3391,6 +3544,28 @@ impl App {
                 ]));
             }
 
+            if !profile.mcp_server_ids.is_empty() {
+                let mcp_names = self
+                    .manager
+                    .list_mcp_servers()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|mcp| profile.mcp_server_ids.iter().any(|id| id == &mcp.id))
+                    .map(|mcp| mcp.name)
+                    .collect::<Vec<_>>();
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  ─── MCP Servers ───────────────────────",
+                    Style::default().fg(BORDER),
+                )));
+                for name in mcp_names {
+                    lines.push(Line::from(vec![
+                        Span::styled("  MCP          ", Style::default().fg(DIM)),
+                        Span::styled(name, Style::default().fg(ACCENT)),
+                    ]));
+                }
+            }
+
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  ─── Options ─────────────────────────────",
@@ -3569,6 +3744,184 @@ impl App {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
+    fn render_mcp_list_page(&mut self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " MCP Servers ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL));
+
+        if self.mcps_cache.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  No MCP servers yet. Press 'a' to add or Ctrl+Y to import.",
+                    Style::default().fg(DIM),
+                )))
+                .block(block),
+                area,
+            );
+            return;
+        }
+
+        let items: Vec<ListItem> = self
+            .mcps_cache
+            .iter()
+            .map(|mcp| {
+                let target = mcp.command.as_deref().or(mcp.url.as_deref()).unwrap_or("");
+                let disabled = if mcp.disabled.unwrap_or(false) {
+                    " disabled"
+                } else {
+                    ""
+                };
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(" ", Style::default()),
+                        Span::styled(display_pad(&mcp.name, 24), Style::default().fg(TEXT).bold()),
+                        Span::styled(
+                            format!(" {}", display_pad(&mcp.server_type, 15)),
+                            Style::default().fg(DIM),
+                        ),
+                        Span::styled(disabled, Style::default().fg(DANGER)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  id: ", Style::default().fg(MUTED)),
+                        Span::styled(display_pad(&mcp.id, 14), Style::default().fg(MUTED)),
+                        Span::styled(display_ellipsize(target, 36), Style::default().fg(DIM)),
+                    ]),
+                ])
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(35, 35, 45))
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        f.render_stateful_widget(list, area, &mut self.mcp_list_state);
+
+        let count = self.mcps_cache.len();
+        if count > 1 {
+            let selected = self.mcp_list_state.selected().unwrap_or(0);
+            let scrollbar = Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(ACCENT))
+                .track_style(Style::default().fg(BORDER));
+            let mut sb = ScrollbarState::new(count).position(selected);
+            f.render_stateful_widget(scrollbar, area, &mut sb);
+        }
+    }
+
+    fn render_mcp_detail_page(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " MCP Detail ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let Some(mcp) = self.selected_mcp() else {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  No MCP selected.",
+                    Style::default().fg(DIM),
+                ))),
+                inner,
+            );
+            return;
+        };
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Name         ", Style::default().fg(DIM)),
+                Span::styled(mcp.name.clone(), Style::default().fg(ACCENT).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("  ID           ", Style::default().fg(DIM)),
+                Span::styled(mcp.id.clone(), Style::default().fg(MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Type         ", Style::default().fg(DIM)),
+                Span::styled(mcp.server_type.clone(), Style::default().fg(TEXT)),
+            ]),
+        ];
+        if let Some(command) = &mcp.command {
+            lines.push(Line::from(vec![
+                Span::styled("  Command      ", Style::default().fg(DIM)),
+                Span::styled(command.clone(), Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(url) = &mcp.url {
+            lines.push(Line::from(vec![
+                Span::styled("  URL          ", Style::default().fg(DIM)),
+                Span::styled(url.clone(), Style::default().fg(TEXT)),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  Args         ", Style::default().fg(DIM)),
+            Span::styled(mcp.args.len().to_string(), Style::default().fg(TEXT)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Env          ", Style::default().fg(DIM)),
+            Span::styled(mcp.env.len().to_string(), Style::default().fg(TEXT)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Headers      ", Style::default().fg(DIM)),
+            Span::styled(mcp.headers.len().to_string(), Style::default().fg(TEXT)),
+        ]));
+        if let Some(timeout) = mcp.timeout {
+            lines.push(Line::from(vec![
+                Span::styled("  Timeout      ", Style::default().fg(DIM)),
+                Span::styled(timeout.to_string(), Style::default().fg(TEXT)),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  Always load  ", Style::default().fg(DIM)),
+            Span::styled(
+                optional_bool_label(mcp.always_load),
+                Style::default().fg(TEXT),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Disabled     ", Style::default().fg(DIM)),
+            Span::styled(optional_bool_label(mcp.disabled), Style::default().fg(TEXT)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Linked lightweight profiles",
+            Style::default().fg(DIM),
+        )));
+        for profile in self.mcp_profile_links_cache.iter().take(8) {
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(profile.name.clone(), Style::default().fg(TEXT)),
+            ]));
+        }
+        if self.mcp_profile_links_cache.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    none",
+                Style::default().fg(MUTED),
+            )));
+        }
+
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -3625,13 +3978,14 @@ impl App {
             ]
         } else {
             match self.page {
-                Page::ProfileManager => vec![
+                Page::Profile => vec![
                     ("Ctrl+P/N", "nav"),
                     ("enter", "launch"),
                     ("Shift+Enter", "w/o args"),
                     ("/", "search"),
                     ("t", "lite"),
                     ("T", "public test"),
+                    ("M", "mcps"),
                     ("a", "add"),
                     ("e", "edit"),
                     ("m", "[1m]"),
@@ -3641,7 +3995,7 @@ impl App {
                     ("Shift+Tab", "providers"),
                     ("q", "quit"),
                 ],
-                Page::ProviderManager => vec![
+                Page::Provider => vec![
                     ("Ctrl+P/N", "nav"),
                     ("enter", "keys"),
                     ("a", "add"),
@@ -3649,6 +4003,17 @@ impl App {
                     ("Ctrl+Y", "smart input"),
                     ("e", "edit"),
                     ("d", "delete"),
+                    ("?", "help"),
+                    ("Shift+Tab", "mcps"),
+                    ("q", "quit"),
+                ],
+                Page::Mcp => vec![
+                    ("Ctrl+P/N", "nav"),
+                    ("a", "add"),
+                    ("e", "edit"),
+                    ("d", "delete"),
+                    ("Ctrl+Y", "import"),
+                    ("enter", "links"),
                     ("?", "help"),
                     ("Shift+Tab", "profiles"),
                     ("q", "quit"),
@@ -3694,7 +4059,9 @@ impl App {
             ("/", "Search profiles by name or alias"),
             ("t", "Add lightweight profile from provider/key"),
             ("T", "Batch test non-official provider keys"),
+            ("M", "Select MCP servers for a lightweight profile"),
             ("Ctrl+Y", "Smart input provider from clipboard"),
+            ("MCP: Ctrl+Y", "Import MCP JSON from clipboard"),
             (
                 "Provider: t",
                 "Discover models from compatible endpoints; manual entry still works on failure",
@@ -3705,7 +4072,7 @@ impl App {
             ("Ctrl+A/E/B/F", "Move cursor in text fields"),
             ("Ctrl+H/D/K/U/W", "Edit text in Emacs style"),
             ("Ctrl+G / Esc", "Cancel or go back"),
-            ("Shift+Tab", "Switch profile/provider manager"),
+            ("Shift+Tab", "Cycle profile/provider/MCP managers"),
             ("r", "Refresh — re-copy ~/.claude into selected"),
             ("d / Del", "Delete selected profile"),
             ("?", "Toggle this help dialog"),
@@ -4598,7 +4965,7 @@ impl App {
 
         match code {
             _ if Self::is_cancel_key(code, modifiers) => {
-                if self.page == Page::ProviderManager {
+                if self.page == Page::Provider {
                     self.mode = Mode::Normal;
                 } else {
                     self.mode = Mode::ProviderList;
@@ -4660,7 +5027,7 @@ impl App {
                             self.sync_shims();
                             self.providers_cache =
                                 self.manager.list_providers().unwrap_or_default();
-                            if self.page == Page::ProviderManager {
+                            if self.page == Page::Provider {
                                 self.mode = Mode::Normal;
                             } else {
                                 self.mode = Mode::ProviderList;
@@ -4702,7 +5069,7 @@ impl App {
     ) -> Result<()> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             self.reset_provider_smart_input();
-            self.mode = if self.page == Page::ProviderManager {
+            self.mode = if self.page == Page::Provider {
                 Mode::Normal
             } else {
                 Mode::ProviderList
@@ -4713,7 +5080,7 @@ impl App {
         match code {
             _ if Self::is_cancel_key(code, modifiers) => {
                 self.reset_provider_smart_input();
-                self.mode = if self.page == Page::ProviderManager {
+                self.mode = if self.page == Page::Provider {
                     Mode::Normal
                 } else {
                     Mode::ProviderList
@@ -5342,7 +5709,7 @@ impl App {
         match code {
             _ if Self::is_cancel_key(code, modifiers) => {
                 self.providers_cache = self.manager.list_providers().unwrap_or_default();
-                if self.page == Page::ProviderManager {
+                if self.page == Page::Provider {
                     self.mode = Mode::Normal;
                 } else {
                     self.mode = Mode::ProviderList;
@@ -5358,7 +5725,7 @@ impl App {
                     }
                     self.sync_shims();
                     self.providers_cache = self.manager.list_providers().unwrap_or_default();
-                    if self.page == Page::ProviderManager {
+                    if self.page == Page::Provider {
                         self.mode = Mode::Normal;
                     } else {
                         self.mode = Mode::ProviderList;
@@ -5561,7 +5928,7 @@ impl App {
         match code {
             _ if Self::is_cancel_key(code, modifiers) => {
                 self.providers_cache = self.manager.list_providers().unwrap_or_default();
-                if self.page == Page::ProviderManager {
+                if self.page == Page::Provider {
                     self.mode = Mode::Normal;
                 } else {
                     self.mode = Mode::ProviderList;
@@ -5957,7 +6324,7 @@ impl App {
                     Ok(_) => {
                         self.sync_shims();
                         self.providers_cache = self.manager.list_providers().unwrap_or_default();
-                        if self.page == Page::ProviderManager {
+                        if self.page == Page::Provider {
                             self.mode = Mode::Normal;
                         } else {
                             self.mode = Mode::ProviderList;
@@ -5967,7 +6334,7 @@ impl App {
                 }
             }
             _ => {
-                if self.page == Page::ProviderManager {
+                if self.page == Page::Provider {
                     self.mode = Mode::Normal;
                 } else {
                     self.mode = Mode::ProviderList;
@@ -6114,6 +6481,376 @@ impl App {
         Ok(())
     }
 
+    fn handle_mcp_editor(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        let (is_edit, step) = match &self.mode {
+            Mode::McpAdd { step } => (false, *step),
+            Mode::McpEdit { step, .. } => (true, *step),
+            _ => return Ok(()),
+        };
+
+        match code {
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
+            _ if Self::is_next_field_key(code, modifiers) => {
+                let next = (step + 1) % MCP_EDITOR_STEPS;
+                self.cursor_pos = self.mcp_editor_cursor_pos(next);
+                self.mode = match &self.mode {
+                    Mode::McpEdit { mcp_id, .. } => Mode::McpEdit {
+                        mcp_id: mcp_id.clone(),
+                        step: next,
+                    },
+                    _ => Mode::McpAdd { step: next },
+                };
+            }
+            _ if Self::is_prev_field_key(code, modifiers) => {
+                let next = (step + MCP_EDITOR_STEPS - 1) % MCP_EDITOR_STEPS;
+                self.cursor_pos = self.mcp_editor_cursor_pos(next);
+                self.mode = match &self.mode {
+                    Mode::McpEdit { mcp_id, .. } => Mode::McpEdit {
+                        mcp_id: mcp_id.clone(),
+                        step: next,
+                    },
+                    _ => Mode::McpAdd { step: next },
+                };
+            }
+            KeyCode::Tab => match step {
+                1 => {
+                    self.mcp_type_idx = (self.mcp_type_idx + 1) % MCP_TYPES.len();
+                }
+                11 => {
+                    self.mcp_always_load = next_optional_bool(self.mcp_always_load);
+                }
+                12 => {
+                    self.mcp_disabled = next_optional_bool(self.mcp_disabled);
+                }
+                _ => {
+                    let next = (step + 1) % MCP_EDITOR_STEPS;
+                    self.cursor_pos = self.mcp_editor_cursor_pos(next);
+                    self.mode = match &self.mode {
+                        Mode::McpEdit { mcp_id, .. } => Mode::McpEdit {
+                            mcp_id: mcp_id.clone(),
+                            step: next,
+                        },
+                        _ => Mode::McpAdd { step: next },
+                    };
+                }
+            },
+            KeyCode::Enter => match step {
+                3 => {
+                    let value = self.input_buffer.trim().to_string();
+                    if !value.is_empty() {
+                        self.mcp_args.push(value);
+                        self.input_buffer.clear();
+                        self.cursor_pos = 0;
+                    }
+                }
+                4 => {
+                    let value = self.input_buffer.trim().to_string();
+                    if value.contains('=') {
+                        self.mcp_env.push(value);
+                        self.input_buffer.clear();
+                        self.cursor_pos = 0;
+                    }
+                }
+                7 => {
+                    let value = self.input_buffer.trim().to_string();
+                    if value.contains('=') {
+                        self.mcp_headers.push(value);
+                        self.input_buffer.clear();
+                        self.cursor_pos = 0;
+                    }
+                }
+                _ => {
+                    let input = self.current_mcp_input()?;
+                    let result = if is_edit {
+                        let mcp_id = match &self.mode {
+                            Mode::McpEdit { mcp_id, .. } => mcp_id.clone(),
+                            _ => return Ok(()),
+                        };
+                        self.manager.update_mcp_server(
+                            &mcp_id,
+                            McpServerUpdate {
+                                name: Some(input.name),
+                                server_type: Some(input.server_type),
+                                command: Some(input.command),
+                                args: Some(input.args),
+                                env: Some(input.env),
+                                cwd: Some(input.cwd),
+                                url: Some(input.url),
+                                headers: Some(input.headers),
+                                oauth: Some(input.oauth),
+                                headers_helper: Some(input.headers_helper),
+                                timeout: Some(input.timeout),
+                                always_load: Some(input.always_load),
+                                disabled: Some(input.disabled),
+                            },
+                        )
+                    } else {
+                        self.manager.add_mcp_server(input)
+                    };
+                    match result {
+                        Ok(server) => {
+                            self.sync_shims();
+                            self.mcps_cache = self.manager.list_mcp_servers().unwrap_or_default();
+                            if let Some(idx) =
+                                self.mcps_cache.iter().position(|m| m.id == server.id)
+                            {
+                                self.mcp_list_state.select(Some(idx));
+                            }
+                            self.refresh_mcp_profile_links();
+                            self.mode =
+                                Mode::Message(format!("MCP '{}' saved.", server.name), false);
+                        }
+                        Err(error) => self.mode = Mode::Message(error.to_string(), true),
+                    }
+                }
+            },
+            KeyCode::Backspace => match step {
+                3 if self.input_buffer.is_empty() => {
+                    self.mcp_args.pop();
+                }
+                4 if self.input_buffer.is_empty() => {
+                    self.mcp_env.pop();
+                }
+                7 if self.input_buffer.is_empty() => {
+                    self.mcp_headers.pop();
+                }
+                _ => self.edit_mcp_text_field(code, modifiers, step),
+            },
+            _ => self.edit_mcp_text_field(code, modifiers, step),
+        }
+        Ok(())
+    }
+
+    fn edit_mcp_text_field(&mut self, code: KeyCode, modifiers: KeyModifiers, step: usize) {
+        match step {
+            0 => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_name_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+            2 => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_command_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+            3 | 4 | 7 => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.input_buffer,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+            5 => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_cwd_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+            6 => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_url_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+            8 => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_oauth_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+            9 => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_headers_helper_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+            10 => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_timeout_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn filtered_mcp_indices(&self) -> Vec<usize> {
+        let q = self.mcp_filter_buf.to_lowercase();
+        self.mcps_cache
+            .iter()
+            .enumerate()
+            .filter(|(_, mcp)| {
+                q.is_empty()
+                    || mcp.name.to_lowercase().contains(&q)
+                    || mcp.id.to_lowercase().contains(&q)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn handle_mcp_profile_picker(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        let profile_id = match &self.mode {
+            Mode::McpProfilePicker { profile_id } => profile_id.clone(),
+            _ => return Ok(()),
+        };
+        let filtered = self.filtered_mcp_indices();
+        match code {
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
+            _ if Self::is_prev_list_key(code, modifiers) && !filtered.is_empty() => {
+                let current = self.mcp_list_state.selected().unwrap_or(0);
+                let pos = filtered.iter().position(|idx| *idx == current).unwrap_or(0);
+                let next = if pos == 0 {
+                    filtered.len() - 1
+                } else {
+                    pos - 1
+                };
+                self.mcp_list_state.select(Some(filtered[next]));
+            }
+            _ if Self::is_next_list_key(code, modifiers) && !filtered.is_empty() => {
+                let current = self.mcp_list_state.selected().unwrap_or(0);
+                let pos = filtered.iter().position(|idx| *idx == current).unwrap_or(0);
+                self.mcp_list_state
+                    .select(Some(filtered[(pos + 1) % filtered.len()]));
+            }
+            KeyCode::Char(' ') => {
+                if let Some(idx) = self.mcp_list_state.selected()
+                    && let Some(mcp) = self.mcps_cache.get(idx)
+                {
+                    if self.mcp_selected_ids.iter().any(|id| id == &mcp.id) {
+                        self.mcp_selected_ids.retain(|id| id != &mcp.id);
+                    } else {
+                        self.mcp_selected_ids.push(mcp.id.clone());
+                    }
+                }
+            }
+            KeyCode::Tab => {
+                if let Some(idx) = filtered.first()
+                    && let Some(mcp) = self.mcps_cache.get(*idx)
+                {
+                    self.mcp_filter_buf = mcp.name.clone();
+                    self.cursor_pos = self.mcp_filter_buf.len();
+                    self.mcp_list_state.select(Some(*idx));
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self.mcp_selected_ids.clone();
+                match self.manager.set_profile_mcps(&profile_id, &selected) {
+                    Ok(profile) => {
+                        self.sync_shims();
+                        self.refresh()?;
+                        self.select_by_id(&profile.id);
+                        self.mode = Mode::Message(
+                            format!(
+                                "Profile '{}' now has {} MCP server(s).",
+                                profile.name,
+                                profile.mcp_server_ids.len()
+                            ),
+                            false,
+                        );
+                    }
+                    Err(error) => self.mode = Mode::Message(error.to_string(), true),
+                }
+            }
+            _ => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_filter_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+                if let Some(idx) = self.filtered_mcp_indices().first() {
+                    self.mcp_list_state.select(Some(*idx));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_mcp_smart_paste(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        match code {
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
+            KeyCode::Enter => match parse_mcp_smart_paste(&self.mcp_oauth_buf) {
+                Ok(input) => match self.manager.add_mcp_server(input) {
+                    Ok(server) => {
+                        self.sync_shims();
+                        self.mcps_cache = self.manager.list_mcp_servers().unwrap_or_default();
+                        if let Some(idx) = self.mcps_cache.iter().position(|m| m.id == server.id) {
+                            self.mcp_list_state.select(Some(idx));
+                        }
+                        self.refresh_mcp_profile_links();
+                        self.mode =
+                            Mode::Message(format!("MCP '{}' imported.", server.name), false);
+                    }
+                    Err(error) => self.mode = Mode::Message(error.to_string(), true),
+                },
+                Err(error) => self.mode = Mode::Message(error.to_string(), true),
+            },
+            _ => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.mcp_oauth_buf,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_confirm_delete_mcp(&mut self, code: KeyCode) -> Result<()> {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let mcp_id = match &self.mode {
+                    Mode::ConfirmDeleteMcp { mcp_id, .. } => mcp_id.clone(),
+                    _ => return Ok(()),
+                };
+                match self.manager.remove_mcp_server(&mcp_id) {
+                    Ok(_) => {
+                        self.sync_shims();
+                        self.mcps_cache = self.manager.list_mcp_servers().unwrap_or_default();
+                        if self.mcp_list_state.selected().unwrap_or(0) >= self.mcps_cache.len()
+                            && !self.mcps_cache.is_empty()
+                        {
+                            self.mcp_list_state.select(Some(self.mcps_cache.len() - 1));
+                        }
+                        self.refresh_mcp_profile_links();
+                        self.mode = Mode::Normal;
+                    }
+                    Err(error) => self.mode = Mode::Message(error.to_string(), true),
+                }
+            }
+            _ => self.mode = Mode::Normal,
+        }
+        Ok(())
+    }
+
     // ── Provider helpers ─────────────────────────────────────────────────────
 
     fn move_provider_up(&mut self) {
@@ -6194,6 +6931,203 @@ impl App {
         self.provider_key_linked_profiles
             .get(self.provider_key_linked_profile_selected)
             .or_else(|| self.provider_key_linked_profiles.first())
+    }
+
+    // ── MCP helpers ─────────────────────────────────────────────────────────
+
+    fn selected_mcp(&self) -> Option<&McpServer> {
+        self.mcp_list_state
+            .selected()
+            .and_then(|idx| self.mcps_cache.get(idx))
+            .or_else(|| self.mcps_cache.first())
+    }
+
+    fn move_mcp_up(&mut self) {
+        if self.mcps_cache.is_empty() {
+            return;
+        }
+        let i = match self.mcp_list_state.selected() {
+            Some(0) | None => self.mcps_cache.len() - 1,
+            Some(i) => i - 1,
+        };
+        self.mcp_list_state.select(Some(i));
+        self.mcp_list_scroll = self.mcp_list_scroll.position(i);
+        self.refresh_mcp_profile_links();
+    }
+
+    fn move_mcp_down(&mut self) {
+        if self.mcps_cache.is_empty() {
+            return;
+        }
+        let i = match self.mcp_list_state.selected() {
+            Some(i) => (i + 1) % self.mcps_cache.len(),
+            None => 0,
+        };
+        self.mcp_list_state.select(Some(i));
+        self.mcp_list_scroll = self.mcp_list_scroll.position(i);
+        self.refresh_mcp_profile_links();
+    }
+
+    fn refresh_mcp_profile_links(&mut self) {
+        self.mcp_profile_links_cache = self
+            .selected_mcp()
+            .and_then(|mcp| self.manager.list_profiles_using_mcp(&mcp.id).ok())
+            .unwrap_or_default();
+    }
+
+    fn reset_mcp_editor(&mut self) {
+        self.mcp_name_buf.clear();
+        self.mcp_type_idx = 0;
+        self.mcp_command_buf.clear();
+        self.mcp_args.clear();
+        self.mcp_env.clear();
+        self.mcp_cwd_buf.clear();
+        self.mcp_url_buf.clear();
+        self.mcp_headers.clear();
+        self.mcp_oauth_buf.clear();
+        self.mcp_headers_helper_buf.clear();
+        self.mcp_timeout_buf.clear();
+        self.mcp_always_load = None;
+        self.mcp_disabled = None;
+        self.input_buffer.clear();
+        self.cursor_pos = 0;
+    }
+
+    fn load_mcp_editor(&mut self, server: &McpServer) {
+        self.mcp_name_buf = server.name.clone();
+        self.mcp_type_idx = mcp_type_index(&server.server_type);
+        self.mcp_command_buf = server.command.clone().unwrap_or_default();
+        self.mcp_args = server.args.clone();
+        self.mcp_env = map_to_entries(&server.env);
+        self.mcp_cwd_buf = server.cwd.clone().unwrap_or_default();
+        self.mcp_url_buf = server.url.clone().unwrap_or_default();
+        self.mcp_headers = map_to_entries(&server.headers);
+        self.mcp_oauth_buf = server
+            .oauth
+            .as_ref()
+            .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
+            .unwrap_or_default();
+        self.mcp_headers_helper_buf = server.headers_helper.clone().unwrap_or_default();
+        self.mcp_timeout_buf = server
+            .timeout
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        self.mcp_always_load = server.always_load;
+        self.mcp_disabled = server.disabled;
+        self.input_buffer.clear();
+        self.cursor_pos = self.mcp_name_buf.len();
+    }
+
+    fn mcp_editor_cursor_pos(&self, step: usize) -> usize {
+        match step {
+            0 => self.mcp_name_buf.len(),
+            2 => self.mcp_command_buf.len(),
+            3 | 4 | 7 => self.input_buffer.len(),
+            5 => self.mcp_cwd_buf.len(),
+            6 => self.mcp_url_buf.len(),
+            8 => self.mcp_oauth_buf.len(),
+            9 => self.mcp_headers_helper_buf.len(),
+            10 => self.mcp_timeout_buf.len(),
+            _ => 0,
+        }
+    }
+
+    fn paste_into_mcp_editor(&mut self, text: &str) {
+        let step = match &self.mode {
+            Mode::McpAdd { step } | Mode::McpEdit { step, .. } => *step,
+            _ => return,
+        };
+        match step {
+            0 => insert_str_at_cursor(&mut self.mcp_name_buf, &mut self.cursor_pos, text),
+            2 => insert_str_at_cursor(&mut self.mcp_command_buf, &mut self.cursor_pos, text),
+            3 | 4 | 7 => insert_str_at_cursor(&mut self.input_buffer, &mut self.cursor_pos, text),
+            5 => insert_str_at_cursor(&mut self.mcp_cwd_buf, &mut self.cursor_pos, text),
+            6 => insert_str_at_cursor(&mut self.mcp_url_buf, &mut self.cursor_pos, text),
+            8 => insert_str_at_cursor(&mut self.mcp_oauth_buf, &mut self.cursor_pos, text),
+            9 => insert_str_at_cursor(&mut self.mcp_headers_helper_buf, &mut self.cursor_pos, text),
+            10 => insert_str_at_cursor(&mut self.mcp_timeout_buf, &mut self.cursor_pos, text),
+            _ => {}
+        }
+    }
+
+    fn current_mcp_input(&self) -> Result<McpServerInput> {
+        let oauth = if self.mcp_oauth_buf.trim().is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(self.mcp_oauth_buf.trim())
+                    .map_err(|err| anyhow::anyhow!("OAuth JSON is invalid: {}", err))?,
+            )
+        };
+        let timeout = if self.mcp_timeout_buf.trim().is_empty() {
+            None
+        } else {
+            Some(
+                self.mcp_timeout_buf
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|err| anyhow::anyhow!("Timeout must be a number: {}", err))?,
+            )
+        };
+        Ok(McpServerInput {
+            name: self.mcp_name_buf.trim().to_string(),
+            server_type: MCP_TYPES[self.mcp_type_idx % MCP_TYPES.len()].to_string(),
+            command: optional_non_empty(self.mcp_command_buf.trim()),
+            args: self.mcp_args.clone(),
+            env: entries_to_map(&self.mcp_env, "env")?,
+            cwd: optional_non_empty(self.mcp_cwd_buf.trim()),
+            url: optional_non_empty(self.mcp_url_buf.trim()),
+            headers: entries_to_map(&self.mcp_headers, "headers")?,
+            oauth,
+            headers_helper: optional_non_empty(self.mcp_headers_helper_buf.trim()),
+            timeout,
+            always_load: self.mcp_always_load,
+            disabled: self.mcp_disabled,
+        })
+    }
+
+    fn start_selected_profile_mcp_picker(&mut self) -> Result<()> {
+        let Some(profile) = self.selected_profile().cloned() else {
+            return Ok(());
+        };
+        if profile.kind != ProfileKind::Lightweight {
+            self.show_message(
+                "MCP servers can only be linked to lightweight profiles.".into(),
+                true,
+                None,
+            );
+            return Ok(());
+        }
+        self.mcps_cache = self.manager.list_mcp_servers().unwrap_or_default();
+        if self.mcps_cache.is_empty() {
+            self.show_message(
+                "No MCP servers found. Add one in MCP Manager first.".into(),
+                true,
+                None,
+            );
+            return Ok(());
+        }
+        self.mcp_selected_ids = profile.mcp_server_ids.clone();
+        self.mcp_filter_buf.clear();
+        self.cursor_pos = 0;
+        self.mcp_list_state = ListState::default();
+        self.mcp_list_state.select(Some(0));
+        self.mode = Mode::McpProfilePicker {
+            profile_id: profile.id,
+        };
+        Ok(())
+    }
+
+    fn start_mcp_smart_paste(&mut self) {
+        self.reset_mcp_editor();
+        match Clipboard::new().and_then(|mut clip| clip.get_text()) {
+            Ok(text) if !text.trim().is_empty() => {
+                self.mcp_oauth_buf = text;
+                self.cursor_pos = self.mcp_oauth_buf.len();
+            }
+            _ => {}
+        }
+        self.mode = Mode::McpSmartPaste;
     }
 
     // ── Provider renderers ───────────────────────────────────────────────────
@@ -7252,6 +8186,277 @@ impl App {
         );
     }
 
+    fn render_mcp_editor_popup(&self, f: &mut Frame, step: usize) {
+        let area = centered_rect(86, 34, f.area());
+        f.render_widget(Clear, area);
+        let is_edit = matches!(self.mode, Mode::McpEdit { .. });
+        let title = if is_edit {
+            " Edit MCP Server "
+        } else {
+            " Add MCP Server "
+        };
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                title,
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        let mut lines = vec![Line::from("")];
+        let field_line = |current_step: usize, label: &str, value: String| -> Line {
+            let prefix = if step == current_step { "▶ " } else { "  " };
+            let style = if step == current_step {
+                Style::default().fg(TEXT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            };
+            Line::from(vec![
+                Span::styled(prefix, Style::default().fg(ACCENT).bold()),
+                Span::styled(display_pad(label, 15), Style::default().fg(DIM)),
+                Span::styled(value, style),
+            ])
+        };
+
+        lines.push(field_line(
+            0,
+            "Name",
+            if step == 0 {
+                display_with_cursor(&self.mcp_name_buf, self.cursor_pos)
+            } else {
+                empty_label(&self.mcp_name_buf)
+            },
+        ));
+        lines.push(field_line(
+            1,
+            "Type",
+            MCP_TYPES[self.mcp_type_idx % MCP_TYPES.len()].to_string(),
+        ));
+        lines.push(field_line(
+            2,
+            "Command",
+            if step == 2 {
+                display_with_cursor(&self.mcp_command_buf, self.cursor_pos)
+            } else {
+                empty_label(&self.mcp_command_buf)
+            },
+        ));
+        lines.push(field_line(
+            3,
+            "Args",
+            format!("{} entrie(s)", self.mcp_args.len()),
+        ));
+        if step == 3 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {}",
+                    display_with_cursor(&self.input_buffer, self.cursor_pos)
+                ),
+                Style::default().fg(TEXT),
+            )));
+        }
+        lines.push(field_line(
+            4,
+            "Env",
+            format!("{} entrie(s)", self.mcp_env.len()),
+        ));
+        if step == 4 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {}",
+                    display_with_cursor(&self.input_buffer, self.cursor_pos)
+                ),
+                Style::default().fg(TEXT),
+            )));
+        }
+        lines.push(field_line(
+            5,
+            "Cwd",
+            if step == 5 {
+                display_with_cursor(&self.mcp_cwd_buf, self.cursor_pos)
+            } else {
+                empty_label(&self.mcp_cwd_buf)
+            },
+        ));
+        lines.push(field_line(
+            6,
+            "Url",
+            if step == 6 {
+                display_with_cursor(&self.mcp_url_buf, self.cursor_pos)
+            } else {
+                empty_label(&self.mcp_url_buf)
+            },
+        ));
+        lines.push(field_line(
+            7,
+            "Headers",
+            format!("{} entrie(s)", self.mcp_headers.len()),
+        ));
+        if step == 7 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {}",
+                    display_with_cursor(&self.input_buffer, self.cursor_pos)
+                ),
+                Style::default().fg(TEXT),
+            )));
+        }
+        lines.push(field_line(
+            8,
+            "OAuth JSON",
+            if step == 8 {
+                display_ellipsize(
+                    &display_with_cursor(&self.mcp_oauth_buf, self.cursor_pos),
+                    56,
+                )
+            } else {
+                empty_label(&display_ellipsize(&self.mcp_oauth_buf, 56))
+            },
+        ));
+        lines.push(field_line(
+            9,
+            "Headers helper",
+            if step == 9 {
+                display_with_cursor(&self.mcp_headers_helper_buf, self.cursor_pos)
+            } else {
+                empty_label(&self.mcp_headers_helper_buf)
+            },
+        ));
+        lines.push(field_line(
+            10,
+            "Timeout ms",
+            if step == 10 {
+                display_with_cursor(&self.mcp_timeout_buf, self.cursor_pos)
+            } else {
+                empty_label(&self.mcp_timeout_buf)
+            },
+        ));
+        lines.push(field_line(
+            11,
+            "Always load",
+            optional_bool_label(self.mcp_always_load),
+        ));
+        lines.push(field_line(
+            12,
+            "Disabled",
+            optional_bool_label(self.mcp_disabled),
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Ctrl+P/N fields  Tab cycle type/bool  Enter add list item or save  Backspace removes last list item",
+            Style::default().fg(DIM),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  stdio requires Command; http/streamable-http/sse require Url; Env/Headers use KEY=VALUE",
+            Style::default().fg(DIM),
+        )));
+
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_mcp_profile_picker_popup(&self, f: &mut Frame) {
+        let area = centered_rect(78, 24, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Select MCP Servers ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let filtered = self.filtered_mcp_indices();
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("  Filter: ", Style::default().fg(DIM)),
+                Span::styled(
+                    display_with_cursor(&self.mcp_filter_buf, self.cursor_pos),
+                    Style::default().fg(TEXT).bold(),
+                ),
+            ]),
+            Line::from(""),
+        ];
+        for idx in filtered.into_iter().take(14) {
+            let mcp = &self.mcps_cache[idx];
+            let selected = self.mcp_selected_ids.iter().any(|id| id == &mcp.id);
+            let cursor = self.mcp_list_state.selected() == Some(idx);
+            let marker = if selected { "[x]" } else { "[ ]" };
+            let prefix = if cursor { "▶" } else { " " };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} {}", prefix, marker),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    format!(" {}", display_pad(&mcp.name, 24)),
+                    Style::default().fg(TEXT),
+                ),
+                Span::styled(format!(" {}", mcp.server_type), Style::default().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Space toggle  Tab complete filter  Enter save  Esc/Ctrl+G cancel",
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(
+            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
+
+    fn render_mcp_smart_paste_popup(&self, f: &mut Frame) {
+        let area = centered_rect(80, 14, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Import MCP JSON ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let preview = display_ellipsize(
+            &display_with_cursor(&self.mcp_oauth_buf, self.cursor_pos),
+            72,
+        );
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Paste a single server object, or an object with mcpServers containing one server.",
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {}", preview),
+                Style::default().fg(TEXT),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Enter import  Esc/Ctrl+G cancel",
+                Style::default().fg(DIM),
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
     fn render_confirm_delete_provider_popup(&self, f: &mut Frame) {
         let name = match &self.mode {
             Mode::ConfirmDeleteProvider { name, .. } => name.clone(),
@@ -7316,6 +8521,18 @@ impl App {
         self.render_confirm_popup(
             f,
             &format!("Delete key '{}'?", name),
+            "This cannot be undone. Press 'y' to confirm.",
+        );
+    }
+
+    fn render_confirm_delete_mcp_popup(&self, f: &mut Frame) {
+        let name = match &self.mode {
+            Mode::ConfirmDeleteMcp { name, .. } => name.clone(),
+            _ => return,
+        };
+        self.render_confirm_popup(
+            f,
+            &format!("Delete MCP '{}'?", name),
             "This cannot be undone. Press 'y' to confirm.",
         );
     }
@@ -7417,6 +8634,151 @@ fn launch_args_from_str(s: &str) -> Option<Vec<String>> {
     } else {
         Some(trimmed.split_whitespace().map(String::from).collect())
     }
+}
+
+fn optional_non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn optional_bool_label(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
+        None => "(default)".to_string(),
+    }
+}
+
+fn next_optional_bool(value: Option<bool>) -> Option<bool> {
+    match value {
+        None => Some(true),
+        Some(true) => Some(false),
+        Some(false) => None,
+    }
+}
+
+fn empty_label(value: &str) -> String {
+    if value.is_empty() {
+        "(empty)".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn mcp_type_index(value: &str) -> usize {
+    MCP_TYPES
+        .iter()
+        .position(|server_type| *server_type == value)
+        .unwrap_or(0)
+}
+
+fn map_to_entries(map: &HashMap<String, String>) -> Vec<String> {
+    let mut entries: Vec<_> = map
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn entries_to_map(entries: &[String], field: &str) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for entry in entries {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("MCP {} entry must be KEY=VALUE: {}", field, entry))?;
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("MCP {} entry has an empty key.", field);
+        }
+        map.insert(key.to_string(), value.trim().to_string());
+    }
+    Ok(map)
+}
+
+fn parse_mcp_smart_paste(raw: &str) -> Result<McpServerInput> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim())?;
+    if let Some(servers) = value.get("mcpServers").and_then(|value| value.as_object()) {
+        if servers.len() != 1 {
+            bail!("Import expects exactly one mcpServers entry.");
+        }
+        let (name, config) = servers.iter().next().expect("len checked above");
+        return mcp_input_from_json(name, config);
+    }
+    let name = value
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("imported-mcp");
+    mcp_input_from_json(name, &value)
+}
+
+fn mcp_input_from_json(name: &str, value: &serde_json::Value) -> Result<McpServerInput> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("MCP JSON must be an object."))?;
+    let server_type = object
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("stdio")
+        .to_string();
+    let args = object
+        .get("args")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(McpServerInput {
+        name: name.to_string(),
+        server_type,
+        command: object
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        args,
+        env: json_string_map(object.get("env"))?,
+        cwd: object
+            .get("cwd")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        url: object
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        headers: json_string_map(object.get("headers"))?,
+        oauth: object.get("oauth").cloned(),
+        headers_helper: object
+            .get("headersHelper")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        timeout: object.get("timeout").and_then(|value| value.as_u64()),
+        always_load: object.get("alwaysLoad").and_then(|value| value.as_bool()),
+        disabled: object.get("disabled").and_then(|value| value.as_bool()),
+    })
+}
+
+fn json_string_map(value: Option<&serde_json::Value>) -> Result<HashMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Expected an object with string values."))?;
+    let mut map = HashMap::new();
+    for (key, value) in object {
+        let Some(value) = value.as_str() else {
+            bail!("Value for '{}' must be a string.", key);
+        };
+        map.insert(key.clone(), value.to_string());
+    }
+    Ok(map)
 }
 
 /// Replace the last whitespace-delimited word in `s` with `replacement`.
@@ -8487,6 +9849,7 @@ mod tests {
             launch_args: None,
             provider_id: None,
             key_id: None,
+            mcp_server_ids: Vec::new(),
         };
 
         let (source, model) = public_site_model_from_profile(&profile);
@@ -8511,6 +9874,7 @@ mod tests {
             launch_args: None,
             provider_id: None,
             key_id: None,
+            mcp_server_ids: Vec::new(),
         };
 
         let (source, model) = public_site_model_from_profile(&profile);
@@ -9201,13 +10565,13 @@ mod tests {
     fn shift_tab_switches_manager_in_allowed_modes() {
         let mut app = make_test_app();
         app.mode = Mode::Normal;
-        app.page = Page::ProfileManager;
+        app.page = Page::Profile;
 
         assert!(
             app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
                 .unwrap()
         );
-        assert_eq!(app.page, Page::ProviderManager);
+        assert_eq!(app.page, Page::Provider);
         assert_eq!(app.mode, Mode::Normal);
 
         app.mode = Mode::Search;
@@ -9215,7 +10579,14 @@ mod tests {
             app.handle_manager_switch_key(KeyCode::Tab, KeyModifiers::SHIFT)
                 .unwrap()
         );
-        assert_eq!(app.page, Page::ProfileManager);
+        assert_eq!(app.page, Page::Mcp);
+        assert_eq!(app.mode, Mode::Normal);
+
+        assert!(
+            app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
+                .unwrap()
+        );
+        assert_eq!(app.page, Page::Profile);
         assert_eq!(app.mode, Mode::Normal);
     }
 
@@ -9226,13 +10597,13 @@ mod tests {
             profile_id: "profile-generated".into(),
             step: 1,
         };
-        app.page = Page::ProfileManager;
+        app.page = Page::Profile;
 
         assert!(
             !app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
                 .unwrap()
         );
-        assert_eq!(app.page, Page::ProfileManager);
+        assert_eq!(app.page, Page::Profile);
         assert_eq!(
             app.mode,
             Mode::EditProfile {
@@ -9243,9 +10614,56 @@ mod tests {
     }
 
     #[test]
+    fn mcp_profile_picker_saves_selected_mcps_for_lightweight_profile() {
+        let mut app = make_test_app();
+        let mcp = app
+            .manager
+            .add_mcp_server(McpServerInput {
+                name: "codex-sessions".into(),
+                server_type: "stdio".into(),
+                command: Some("codex-sessions-mcp".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let profile = app
+            .manager
+            .create_lightweight_profile("lite", Some("lite-mcp-tui"), LightweightEnv::default())
+            .unwrap();
+        app.refresh().unwrap();
+        app.select_by_id(&profile.id);
+
+        app.start_selected_profile_mcp_picker().unwrap();
+        assert!(matches!(app.mode, Mode::McpProfilePicker { .. }));
+        app.handle_mcp_profile_picker(KeyCode::Char(' '), KeyModifiers::empty())
+            .unwrap();
+        app.handle_mcp_profile_picker(KeyCode::Enter, KeyModifiers::empty())
+            .unwrap();
+
+        let updated = app.manager.get_profile(&profile.id).unwrap();
+        assert_eq!(updated.mcp_server_ids, vec![mcp.id]);
+    }
+
+    #[test]
+    fn mcp_editor_adds_stdio_server() {
+        let mut app = make_test_app();
+        app.reset_mcp_editor();
+        app.mode = Mode::McpAdd { step: 0 };
+        app.mcp_name_buf = "codex-sessions".into();
+        app.mcp_command_buf = "codex-sessions-mcp".into();
+
+        app.handle_mcp_editor(KeyCode::Enter, KeyModifiers::empty())
+            .unwrap();
+
+        let servers = app.manager.list_mcp_servers().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "codex-sessions");
+        assert_eq!(servers[0].command.as_deref(), Some("codex-sessions-mcp"));
+    }
+
+    #[test]
     fn provider_edit_tab_only_advances_fields() {
         let mut app = make_test_app();
-        app.page = Page::ProviderManager;
+        app.page = Page::Provider;
         app.provider_name_buf = "Provider Name".into();
         app.provider_url_buf = "https://example.invalid".into();
         app.mode = Mode::ProviderEdit {
@@ -9305,7 +10723,7 @@ mod tests {
             )
             .unwrap();
         app.providers_cache = app.manager.list_providers().unwrap();
-        app.page = Page::ProviderManager;
+        app.page = Page::Provider;
         app.provider_name_buf = "Changed Provider".into();
         app.provider_url_buf = "https://changed.invalid".into();
         app.mode = Mode::ProviderEdit {
@@ -9406,7 +10824,7 @@ mod tests {
             .set_provider(&profile.id, &provider.id, &key.id)
             .unwrap();
         app.provider_keys_cache = app.manager.list_keys(&provider.id).unwrap();
-        app.page = Page::ProviderManager;
+        app.page = Page::Provider;
         app.mode = Mode::ConfirmDeleteKey {
             provider_id: provider.id.clone(),
             key_id: key.id.clone(),
@@ -9455,7 +10873,7 @@ mod tests {
             .set_provider(&profile.id, &provider.id, &key.id)
             .unwrap();
         app.provider_keys_cache = app.manager.list_keys(&provider.id).unwrap();
-        app.page = Page::ProviderManager;
+        app.page = Page::Provider;
         app.provider_name_buf = provider.name.clone();
         app.provider_url_buf = provider.base_url.clone();
         app.mode = Mode::ProviderEdit {
@@ -9514,7 +10932,7 @@ mod tests {
             .set_provider(&profile.id, &provider.id, &key.id)
             .unwrap();
         app.provider_keys_cache = app.manager.list_keys(&provider.id).unwrap();
-        app.page = Page::ProviderManager;
+        app.page = Page::Provider;
         app.mode = Mode::ProviderKeyInUse {
             provider_id: provider.id.clone(),
             key_id: key.id.clone(),
@@ -9570,7 +10988,7 @@ mod tests {
             .set_provider(&second.id, &provider.id, &key.id)
             .unwrap();
         app.provider_keys_cache = app.manager.list_keys(&provider.id).unwrap();
-        app.page = Page::ProviderManager;
+        app.page = Page::Provider;
         app.mode = Mode::ProviderKeyInUse {
             provider_id: provider.id.clone(),
             key_id: key.id.clone(),

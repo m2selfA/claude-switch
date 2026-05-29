@@ -6,7 +6,7 @@ mod tui;
 use anyhow::Result;
 use anyhow::bail;
 use clap::{Parser, Subcommand};
-use profile::{LightweightEnv, ProfileManager, fetch_models};
+use profile::{LightweightEnv, McpServerInput, McpServerUpdate, ProfileManager, fetch_models};
 use std::io::{self, Write};
 
 #[derive(Parser)]
@@ -94,6 +94,12 @@ enum Commands {
     Provider {
         #[command(subcommand)]
         command: ProviderCommands,
+    },
+
+    /// Manage MCP servers and lightweight-profile MCP links
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
     },
 }
 
@@ -188,6 +194,142 @@ enum ProviderCommands {
     Unlink {
         /// Profile name or alias to unlink
         profile: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommands {
+    /// List all MCP servers
+    List,
+
+    /// Show one MCP server
+    Show {
+        /// MCP id or name
+        query: String,
+    },
+
+    /// Add an MCP server
+    Add {
+        /// MCP server name
+        name: String,
+        /// MCP type: stdio, http, streamable-http, or sse
+        #[arg(long = "type", default_value = "stdio")]
+        server_type: String,
+        /// stdio command
+        #[arg(long)]
+        command: Option<String>,
+        /// stdio argument; repeatable
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Environment entry KEY=VALUE; repeatable
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// stdio working directory
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Remote MCP URL
+        #[arg(long)]
+        url: Option<String>,
+        /// HTTP header KEY=VALUE; repeatable
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// OAuth object as JSON
+        #[arg(long = "oauth-json")]
+        oauth_json: Option<String>,
+        /// Command that returns dynamic headers JSON
+        #[arg(long = "headers-helper")]
+        headers_helper: Option<String>,
+        /// MCP call timeout in milliseconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Whether Claude loads tools at startup
+        #[arg(long = "always-load")]
+        always_load: Option<bool>,
+        /// Temporarily disable this server
+        #[arg(long)]
+        disabled: Option<bool>,
+    },
+
+    /// Edit an MCP server
+    Edit {
+        /// MCP id or name
+        query: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long = "type")]
+        server_type: Option<String>,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long = "clear-command")]
+        clear_command: bool,
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        #[arg(long = "clear-args")]
+        clear_args: bool,
+        #[arg(long = "env")]
+        env: Vec<String>,
+        #[arg(long = "clear-env")]
+        clear_env: bool,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long = "clear-cwd")]
+        clear_cwd: bool,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long = "clear-url")]
+        clear_url: bool,
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        #[arg(long = "clear-headers")]
+        clear_headers: bool,
+        #[arg(long = "oauth-json")]
+        oauth_json: Option<String>,
+        #[arg(long = "clear-oauth")]
+        clear_oauth: bool,
+        #[arg(long = "headers-helper")]
+        headers_helper: Option<String>,
+        #[arg(long = "clear-headers-helper")]
+        clear_headers_helper: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long = "clear-timeout")]
+        clear_timeout: bool,
+        #[arg(long = "always-load")]
+        always_load: Option<bool>,
+        #[arg(long = "clear-always-load")]
+        clear_always_load: bool,
+        #[arg(long)]
+        disabled: Option<bool>,
+        #[arg(long = "clear-disabled")]
+        clear_disabled: bool,
+    },
+
+    /// Remove an MCP server
+    Remove {
+        /// MCP id or name
+        query: String,
+    },
+
+    /// Link MCP servers to a lightweight profile
+    Link {
+        /// Profile name, alias, or id
+        profile: String,
+        /// MCP ids or names
+        mcps: Vec<String>,
+        /// Replace the profile MCP selection instead of appending
+        #[arg(long)]
+        replace: bool,
+    },
+
+    /// Unlink MCP servers from a lightweight profile
+    Unlink {
+        /// Profile name, alias, or id
+        profile: String,
+        /// MCP ids or names
+        mcps: Vec<String>,
+        /// Remove all selected MCP servers
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -550,6 +692,208 @@ fn main() -> Result<()> {
                 sync_shims(&manager);
             }
         },
+
+        Some(Commands::Mcp { command }) => match command {
+            McpCommands::List => {
+                let servers = manager.list_mcp_servers()?;
+                if servers.is_empty() {
+                    println!("No MCP servers found.");
+                    println!("Add one with: cswitch mcp add <name> --command <cmd>");
+                    return Ok(());
+                }
+                println!(
+                    "{:<14} {:<24} {:<16} {:<8} TARGET",
+                    "ID", "NAME", "TYPE", "DISABLED"
+                );
+                println!("{}", "─".repeat(96));
+                for server in servers {
+                    let target = server
+                        .command
+                        .as_deref()
+                        .or(server.url.as_deref())
+                        .unwrap_or("—");
+                    println!(
+                        "{:<14} {:<24} {:<16} {:<8} {}",
+                        server.id,
+                        server.name,
+                        server.server_type,
+                        server.disabled.unwrap_or(false),
+                        target
+                    );
+                }
+            }
+            McpCommands::Show { query } => {
+                let server = manager.get_mcp_server(&query)?;
+                println!("Id:             {}", server.id);
+                println!("Name:           {}", server.name);
+                println!("Type:           {}", server.server_type);
+                if let Some(command) = server.command {
+                    println!("Command:        {}", command);
+                }
+                if !server.args.is_empty() {
+                    println!("Args:           {}", server.args.join(" "));
+                }
+                if !server.env.is_empty() {
+                    println!("Env:            {} entrie(s)", server.env.len());
+                }
+                if let Some(cwd) = server.cwd {
+                    println!("Cwd:            {}", cwd);
+                }
+                if let Some(url) = server.url {
+                    println!("Url:            {}", url);
+                }
+                if !server.headers.is_empty() {
+                    println!("Headers:        {} entrie(s)", server.headers.len());
+                }
+                if server.oauth.is_some() {
+                    println!("OAuth:          configured");
+                }
+                if let Some(headers_helper) = server.headers_helper {
+                    println!("Headers helper: {}", headers_helper);
+                }
+                if let Some(timeout) = server.timeout {
+                    println!("Timeout:        {}", timeout);
+                }
+                if let Some(always_load) = server.always_load {
+                    println!("Always load:    {}", always_load);
+                }
+                if let Some(disabled) = server.disabled {
+                    println!("Disabled:       {}", disabled);
+                }
+            }
+            McpCommands::Add {
+                name,
+                server_type,
+                command,
+                args,
+                env,
+                cwd,
+                url,
+                headers,
+                oauth_json,
+                headers_helper,
+                timeout,
+                always_load,
+                disabled,
+            } => {
+                let server = manager.add_mcp_server(McpServerInput {
+                    name,
+                    server_type,
+                    command,
+                    args,
+                    env: parse_key_values(&env, "--env")?,
+                    cwd,
+                    url,
+                    headers: parse_key_values(&headers, "--header")?,
+                    oauth: parse_optional_json(oauth_json.as_deref(), "--oauth-json")?,
+                    headers_helper,
+                    timeout,
+                    always_load,
+                    disabled,
+                })?;
+                println!("MCP '{}' ({}) added.", server.name, server.id);
+                sync_shims(&manager);
+            }
+            McpCommands::Edit {
+                query,
+                name,
+                server_type,
+                command,
+                clear_command,
+                args,
+                clear_args,
+                env,
+                clear_env,
+                cwd,
+                clear_cwd,
+                url,
+                clear_url,
+                headers,
+                clear_headers,
+                oauth_json,
+                clear_oauth,
+                headers_helper,
+                clear_headers_helper,
+                timeout,
+                clear_timeout,
+                always_load,
+                clear_always_load,
+                disabled,
+                clear_disabled,
+            } => {
+                let update = McpServerUpdate {
+                    name,
+                    server_type,
+                    command: optional_field(command, clear_command),
+                    args: if clear_args || !args.is_empty() {
+                        Some(args)
+                    } else {
+                        None
+                    },
+                    env: if clear_env || !env.is_empty() {
+                        Some(parse_key_values(&env, "--env")?)
+                    } else {
+                        None
+                    },
+                    cwd: optional_field(cwd, clear_cwd),
+                    url: optional_field(url, clear_url),
+                    headers: if clear_headers || !headers.is_empty() {
+                        Some(parse_key_values(&headers, "--header")?)
+                    } else {
+                        None
+                    },
+                    oauth: if clear_oauth || oauth_json.is_some() {
+                        Some(parse_optional_json(oauth_json.as_deref(), "--oauth-json")?)
+                    } else {
+                        None
+                    },
+                    headers_helper: optional_field(headers_helper, clear_headers_helper),
+                    timeout: optional_field(timeout, clear_timeout),
+                    always_load: optional_field(always_load, clear_always_load),
+                    disabled: optional_field(disabled, clear_disabled),
+                };
+                let server = manager.update_mcp_server(&query, update)?;
+                println!("MCP '{}' ({}) updated.", server.name, server.id);
+                sync_shims(&manager);
+            }
+            McpCommands::Remove { query } => {
+                manager.remove_mcp_server(&query)?;
+                println!("MCP '{}' removed.", query);
+                sync_shims(&manager);
+            }
+            McpCommands::Link {
+                profile,
+                mcps,
+                replace,
+            } => {
+                if mcps.is_empty() {
+                    bail!("Provide at least one MCP id or name.");
+                }
+                let updated = if replace {
+                    manager.set_profile_mcps(&profile, &mcps)?
+                } else {
+                    manager.add_profile_mcps(&profile, &mcps)?
+                };
+                println!(
+                    "Profile '{}' now has {} MCP server(s).",
+                    updated.name,
+                    updated.mcp_server_ids.len()
+                );
+                sync_shims(&manager);
+            }
+            McpCommands::Unlink { profile, mcps, all } => {
+                if !all && mcps.is_empty() {
+                    bail!("Provide MCP ids/names or use --all.");
+                }
+                let updated = manager.remove_profile_mcps(&profile, &mcps, all)?;
+                println!(
+                    "Profile '{}' now has {} MCP server(s).",
+                    updated.name,
+                    updated.mcp_server_ids.len()
+                );
+                sync_shims(&manager);
+            }
+        },
     }
 
     Ok(())
@@ -704,6 +1048,37 @@ fn handle_add(
         }
         Ok(())
     }
+}
+
+fn parse_key_values(
+    entries: &[String],
+    flag_name: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for entry in entries {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("{} expects KEY=VALUE, got '{}'.", flag_name, entry))?;
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("{} entry has an empty key.", flag_name);
+        }
+        map.insert(key.to_string(), value.trim().to_string());
+    }
+    Ok(map)
+}
+
+fn parse_optional_json(input: Option<&str>, flag_name: &str) -> Result<Option<serde_json::Value>> {
+    input
+        .map(|raw| {
+            serde_json::from_str(raw)
+                .map_err(|err| anyhow::anyhow!("{} must be valid JSON: {}", flag_name, err))
+        })
+        .transpose()
+}
+
+fn optional_field<T>(value: Option<T>, clear: bool) -> Option<Option<T>> {
+    if clear { Some(None) } else { value.map(Some) }
 }
 
 #[cfg(target_os = "windows")]
@@ -865,6 +1240,82 @@ mod tests {
                 assert!(verbose);
             }
             _ => panic!("unexpected aliases parse result"),
+        }
+    }
+
+    #[test]
+    fn parses_nested_mcp_add_command() {
+        let cli = Cli::try_parse_from([
+            "cswitch",
+            "mcp",
+            "add",
+            "github",
+            "--type",
+            "stdio",
+            "--command",
+            "npx",
+            "--arg",
+            "-y",
+            "--arg",
+            "@modelcontextprotocol/server-github",
+            "--env",
+            "GITHUB_TOKEN=${GITHUB_TOKEN}",
+            "--always-load",
+            "false",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Mcp {
+                command:
+                    McpCommands::Add {
+                        name,
+                        server_type,
+                        command,
+                        args,
+                        env,
+                        always_load,
+                        ..
+                    },
+            }) => {
+                assert_eq!(name, "github");
+                assert_eq!(server_type, "stdio");
+                assert_eq!(command.as_deref(), Some("npx"));
+                assert_eq!(args, vec!["-y", "@modelcontextprotocol/server-github"]);
+                assert_eq!(env, vec!["GITHUB_TOKEN=${GITHUB_TOKEN}"]);
+                assert_eq!(always_load, Some(false));
+            }
+            _ => panic!("unexpected mcp add parse result"),
+        }
+    }
+
+    #[test]
+    fn parses_nested_mcp_link_command() {
+        let cli = Cli::try_parse_from([
+            "cswitch",
+            "mcp",
+            "link",
+            "work",
+            "github",
+            "filesystem",
+            "--replace",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Mcp {
+                command:
+                    McpCommands::Link {
+                        profile,
+                        mcps,
+                        replace,
+                    },
+            }) => {
+                assert_eq!(profile, "work");
+                assert_eq!(mcps, vec!["github", "filesystem"]);
+                assert!(replace);
+            }
+            _ => panic!("unexpected mcp link parse result"),
         }
     }
 }

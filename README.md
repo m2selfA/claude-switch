@@ -58,6 +58,10 @@ cswitch use work
 cswitch provider add openrouter --url https://openrouter.ai/api --key sk-...
 cswitch provider link mykey --provider prov_12345678 --key key_12345678
 
+# Add an MCP server and attach it to a lightweight profile
+cswitch mcp add filesystem --command npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg '${CLAUDE_PROJECT_DIR:-.}'
+cswitch mcp link mykey filesystem
+
 # Or open the interactive TUI
 cswitch
 ```
@@ -86,6 +90,11 @@ cswitch
 | `cswitch provider remove-key <provider-id> <key-id>` | Remove a key from a provider |
 | `cswitch provider link <profile> --provider <provider-id> --key <key-id>` | Link a lightweight profile to a provider key |
 | `cswitch provider unlink <profile>` | Remove provider/key association from a profile |
+| `cswitch mcp list` | List saved MCP servers |
+| `cswitch mcp add <name> --command <cmd> [--arg <arg>]...` | Add a stdio MCP server |
+| `cswitch mcp add <name> --type http --url <url> [--header KEY=VALUE]...` | Add a remote MCP server |
+| `cswitch mcp link <profile> <mcp>... [--replace]` | Select MCP servers for a lightweight profile |
+| `cswitch mcp unlink <profile> <mcp>...` | Remove selected MCP servers from a lightweight profile |
 | `cswitch --help` | Full CLI help |
 
 ## Interactive TUI
@@ -103,7 +112,10 @@ Run `cswitch` with no arguments to open the TUI.
 | `/` | Search profiles by name or alias |
 | `t` | Add lightweight profile from provider/key |
 | `T` | Batch-test all non-official provider keys from Profile Manager using one editable Anthropic prompt, with per-base-URL spacing and sorted results |
+| `M` | Select MCP servers for the highlighted lightweight profile |
 | `Ctrl+Y` | Smart input provider/key from clipboard in Provider Manager |
+| `MCP Manager: Ctrl+Y` | Smart input/import MCP JSON from clipboard |
+| `MCP Manager: a/e/d` | Add, edit, or delete MCP servers |
 | `Provider Manager: t` | Discover models from provider-aware candidate endpoints; tries multiple URL patterns (e.g. `/v1`, `/api`, `/compatible-mode/v1`, `/anthropic` suffixes) and falls back to the root; failure does not prove the provider is unusable, and manual model names may still work |
 | `a` | Add full profile (directory isolation) |
 | `e` | Edit profile (name/alias/flags, or full model editor for lite) |
@@ -113,7 +125,7 @@ Run `cswitch` with no arguments to open the TUI.
 | `Ctrl+A/E/B/F` | Move cursor in text fields |
 | `Ctrl+H/D/K/U/W` | Edit text in Emacs style |
 | `Ctrl+G` | Cancel or go back |
-| `Shift+Tab` | Switch between profile and provider managers |
+| `Shift+Tab` | Switch between Profile Manager, Provider Manager, and MCP Manager |
 | `r` | Refresh — re-copy ~/.claude into selected |
 | `d` | Delete selected profile |
 | `?` | Help overlay |
@@ -143,9 +155,9 @@ claude-work       # launch with the "work" profile
 claude-personal   # launch with the "personal" profile
 ```
 
-On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs generated `.cmd` launchers into `~/.local/bin` (`%USERPROFILE%\.local\bin`). For ordinary lightweight profiles the `.cmd` stays self-contained; for TinyFish-enhanced profiles `cswitch` also maintains companion prompt/plugin files under `~/.claude-switch/generated/`. Each generated plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. The launchers support `--no-extras`, and all generated files are added, updated, and cleaned up automatically when profiles change.
+On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs generated `.cmd` launchers into `~/.local/bin` (`%USERPROFILE%\.local\bin`). For ordinary lightweight profiles the `.cmd` stays self-contained; for TinyFish-enhanced profiles `cswitch` also maintains companion prompt/plugin files under `~/.claude-switch/generated/`. Profiles with selected MCP servers receive generated Claude plugin directories under `~/.claude-switch/generated/mcps/`, and the launcher passes them through `--plugin-dir` so MCP selections can combine cleanly with TinyFish plugins. Each generated TinyFish plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. The launchers support `--no-extras`, and all generated files are added, updated, and cleaned up automatically when profiles change.
 
-On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs generated bash launchers there instead of printing aliases. Non-TinyFish lightweight profiles remain self-contained; TinyFish-enhanced profiles also use managed companion prompt/plugin files under `~/.claude-switch/generated/`. Each generated plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. Each script is executable, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
+On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs generated bash launchers there instead of printing aliases. Non-TinyFish lightweight profiles remain self-contained; TinyFish-enhanced profiles also use managed companion prompt/plugin files under `~/.claude-switch/generated/`. Profiles with selected MCP servers receive generated Claude plugin directories under `~/.claude-switch/generated/mcps/`, and the launcher passes them through `--plugin-dir` so MCP selections can combine cleanly with TinyFish plugins. Each generated TinyFish plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. Each script is executable, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
 
 You can also sync shims to remote machines with:
 
@@ -163,6 +175,7 @@ cswitch aliases --local --remote my-host
 This uses your existing local `sftp` command. Without `--local` or `--remote`, aliases are generated locally as before. `--remote` is repeatable for batch syncing multiple hosts. Remote sync currently supports lightweight profiles only and skips full directory-isolated profiles. It probes the remote OS first and syncs both the launchers and any required TinyFish prompt/plugin companion files; add `--verbose` to see per-stage and per-file sync details:
 - remote Unix-like hosts receive shell shims in `~/.varusers/bin`
 - remote Windows hosts receive `.cmd` shims in `%USERPROFILE%\.local\bin`
+- remote hosts also receive any required generated MCP plugin directories for profiles that selected MCP servers
 
 Only managed shim files with the generated `claude-` prefix are considered for stale cleanup.
 
@@ -175,10 +188,13 @@ Profiles are tracked in `~/.claude-switch/registry.json`, keyed by UUID. Each pr
 - `kind` — `full` or `lightweight`
 - `launch_args` — optional CLI flags passed to claude on launch (e.g. `--dangerously-skip-permissions`)
 - `provider_id` / `key_id` — optional shared provider/key reference for lightweight profiles
+- `mcp_server_ids` — selected MCP servers for lightweight profiles
 
 Shared providers are tracked in the same registry. A provider stores a base URL and one or more named API keys; lightweight profiles can link to a specific key while keeping their model and extra env-var settings separate.
 
 Clipboard-driven provider import is also available in the TUI Provider Manager via `Ctrl+Y`.
+
+Shared MCP servers are tracked in the same registry under `mcp_servers`. They support stdio, http, streamable-http, and sse entries with Claude-compatible fields such as `command`, `args`, `env`, `cwd`, `url`, `headers`, `oauth`, `headersHelper`, `timeout`, `alwaysLoad`, and `disabled`. Lightweight profiles can select one or more MCP servers; full profiles keep their own isolated Claude directory and do not use registry MCP selections.
 
 ### Full profiles
 
@@ -186,7 +202,7 @@ Stored in `~/.claude-switch/profiles/<alias-or-name>/`. Launch sets `CLAUDE_CONF
 
 ### Lightweight profiles
 
-No dedicated profile directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` on launch. For ordinary profiles this remains an inline settings payload; for TinyFish-enhanced profiles `cswitch` also materializes managed prompt/plugin files under `~/.claude-switch/generated/`, with plugins written as standard Claude plugin directories containing `.claude-plugin/plugin.json` and `hooks/hooks.json`, while TinyFish-specific permissions remain inline in `--settings`. Token and base URL can also come from a linked shared provider/key.
+No dedicated profile directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` on launch. For ordinary profiles this remains an inline settings payload; for TinyFish-enhanced profiles `cswitch` also materializes managed prompt/plugin files under `~/.claude-switch/generated/`, with plugins written as standard Claude plugin directories containing `.claude-plugin/plugin.json` and `hooks/hooks.json`, while TinyFish-specific permissions remain inline in `--settings`. If a lightweight profile selects MCP servers, `cswitch` generates a separate profile-scoped plugin under `~/.claude-switch/generated/mcps/` containing `.mcp.json` plus a compatibility `mcp.json`, then passes it to Claude with `--plugin-dir`. Token and base URL can also come from a linked shared provider/key.
 
 `extras` may also include the reserved control entry `CLAUDE_SWITCH_TINYFISH=off` to keep a profile on the normal inline-settings path even when its `base_url` would otherwise trigger TinyFish plugin generation.
 
