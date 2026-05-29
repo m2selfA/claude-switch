@@ -13,7 +13,7 @@ Two isolation modes:
 ### Cargo (requires Rust)
 
 ```bash
-cargo install cswitch --version 0.7.8
+cargo install cswitch --version 0.7.9
 ```
 
 ### Pre-built binaries
@@ -62,6 +62,11 @@ cswitch provider link mykey --provider prov_12345678 --key key_12345678
 cswitch mcp add filesystem --command npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg '${CLAUDE_PROJECT_DIR:-.}'
 cswitch mcp link mykey filesystem
 
+# Diagnose the local registry and generated files
+cswitch doctor
+cswitch config inspect
+cswitch statusline --dir .
+
 # Or open the interactive TUI
 cswitch
 ```
@@ -80,6 +85,15 @@ cswitch
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
 | `cswitch aliases [--local] [--remote <host>]... [--verbose]` | Generate/sync local shell aliases and launchers, and/or sync remote launchers plus any required TinyFish prompt/plugin companion files via sftp (`--remote` is repeatable) |
+| `cswitch doctor [--json] [--strict]` | Diagnose registry links, generated artifacts, MCP entries, and local runtime availability |
+| `cswitch config inspect [--json]` | Show registry paths, generated artifact paths, and object counts |
+| `cswitch config export [--profile <profile>]... [-o <file>] [--include-secrets]` | Export a portable config bundle; secrets are redacted unless explicitly included |
+| `cswitch config import <file> [--replace] [--dry-run] [--json]` | Import a portable config bundle, or preview the add/update plan without writing |
+| `cswitch config validate <file> [--json] [--strict]` | Validate a config bundle before importing it |
+| `cswitch config recover-shims <shim-dir> [--write] [--replace] [--json]` | Recover registry profiles/providers from generated `claude-*` shim files |
+| `cswitch statusline [--profile <profile>] [--dir <path>] [--json]` | Print a compact current-profile summary for prompts/status bars |
+| `cswitch shell hook [--shell <auto\|powershell\|bash\|zsh\|fish>]` | Print a shell wrapper that auto-selects project profiles from marker files |
+| `cswitch shell current [--dir <path>]` | Resolve the project profile selected by `.cswitch-profile` or `.claudeprofile` |
 | `cswitch provider list` | List shared API providers |
 | `cswitch provider add <name> --url <url> --key <key>` | Add a shared provider with an initial key |
 | `cswitch provider keys <provider-id>` | List keys for a provider |
@@ -95,6 +109,9 @@ cswitch
 | `cswitch mcp add <name> --type http --url <url> [--header KEY=VALUE]...` | Add a remote MCP server |
 | `cswitch mcp link <profile> <mcp>... [--replace]` | Select MCP servers for a lightweight profile |
 | `cswitch mcp unlink <profile> <mcp>...` | Remove selected MCP servers from a lightweight profile |
+| `cswitch mcp export [<mcp>...] [--all] [-o <file>]` | Export saved MCP servers as Claude-compatible `mcp.json` content |
+| `cswitch mcp import <file> [--replace]` | Import MCP servers from a Claude-compatible `mcp.json` / `.mcp.json` file |
+| `cswitch mcp validate [<mcp>...] [--all] [--strict]` | Validate saved MCP server entries and report missing commands, stale fields, deprecated SSE, and disabled servers |
 | `cswitch --help` | Full CLI help |
 
 ## Interactive TUI
@@ -158,6 +175,70 @@ claude-personal   # launch with the "personal" profile
 On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs generated `.cmd` launchers into `~/.local/bin` (`%USERPROFILE%\.local\bin`). For ordinary lightweight profiles the `.cmd` stays self-contained; for TinyFish-enhanced profiles `cswitch` also maintains companion prompt/plugin files under `~/.claude-switch/generated/`. Profiles with selected MCP servers receive generated Claude plugin directories under `~/.claude-switch/generated/mcps/`, and the launcher passes them through `--plugin-dir` so MCP selections can combine cleanly with TinyFish plugins. Each generated TinyFish plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. The launchers support `--no-extras`, and all generated files are added, updated, and cleaned up automatically when profiles change.
 
 On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs generated bash launchers there instead of printing aliases. Non-TinyFish lightweight profiles remain self-contained; TinyFish-enhanced profiles also use managed companion prompt/plugin files under `~/.claude-switch/generated/`. Profiles with selected MCP servers receive generated Claude plugin directories under `~/.claude-switch/generated/mcps/`, and the launcher passes them through `--plugin-dir` so MCP selections can combine cleanly with TinyFish plugins. Each generated TinyFish plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. Each script is executable, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
+
+## Project auto-switch
+
+`cswitch shell hook` prints a shell wrapper for `claude` that looks upward from the current directory for `.cswitch-profile` or `.claudeprofile`. The first non-empty, non-comment line is treated as a profile name, alias, or id. When a marker is found, the wrapper launches `cswitch use <profile> -- ...`; otherwise it falls back to the normal `claude` executable.
+
+```bash
+# bash/zsh
+eval "$(cswitch shell hook --shell bash)"
+printf '%s\n' mykey > .cswitch-profile
+claude
+```
+
+```powershell
+# PowerShell
+cswitch shell hook --shell powershell | Add-Content $PROFILE
+"mykey" | Set-Content .cswitch-profile
+claude
+```
+
+Use `cswitch shell current --dir <path>` to debug which profile a project marker resolves to.
+
+`cswitch statusline --dir <path>` uses the same marker resolution and prints a compact prompt/status-bar string. Use `--profile <name-or-alias>` to force a specific profile, or `--json` for prompt engines that prefer structured output.
+
+## Diagnostics
+
+`cswitch doctor` checks the registry, provider/key references, profile directories, MCP links, generated MCP plugin folders, and whether `claude` is on `PATH`. It reports warnings without failing by default; add `--strict` to make warnings or errors return a non-zero exit code. `cswitch config inspect --json` is intended for scripts that need the exact storage paths and object counts.
+
+For automation or smoke tests, set `CLAUDE_SWITCH_HOME` to an isolated user-home root. `cswitch` will read/write `$CLAUDE_SWITCH_HOME/.claude-switch` and place generated local shims under that same root, instead of touching the real home directory.
+
+## Config bundles
+
+`cswitch config export` writes profiles, providers, and saved MCP servers into a portable bundle. Profile API tokens, provider keys, and likely MCP secrets in `env`, `headers`, and `oauth` are redacted by default; use `--include-secrets` only for trusted local backups. Add one or more `--profile <name-or-alias>` options to export only selected profiles plus their referenced provider keys and MCP servers.
+
+```bash
+cswitch config export -o cswitch-bundle.json
+cswitch config export --profile mg-ds --profile mykey -o selected-profiles.json
+cswitch config validate selected-profiles.json --strict
+cswitch config import selected-profiles.json --dry-run
+cswitch config export --include-secrets -o cswitch-private-backup.json
+cswitch config import cswitch-bundle.json --replace
+```
+
+`config import --dry-run` prints the exact add/update plan without writing `registry.json`; add `--json` for automation. On a real import, `--json` prints the applied import summary instead of the human-readable report.
+
+Full profile directories are not copied by config bundles; they only contain the registry metadata. Use shell/remote shim sync or normal file backup tools for full isolated `~/.claude` profile directories.
+
+`config recover-shims` is a fallback for rebuilding registry entries from previously generated `claude-*` launchers. It previews by default and redacts recovered tokens from output; add `--write` to update `registry.json`. Written recoveries create a timestamped `registry.json.bak-*` first, synthesize providers and keys from recovered base URLs and tokens, and link recovered lightweight profiles to those keys.
+
+```bash
+cswitch config recover-shims ./shims
+cswitch config recover-shims ./shims --write --replace
+```
+
+## MCP import/export
+
+`cswitch mcp export` writes a Claude-compatible JSON document with `$schema` and `mcpServers`. With no MCP names it exports all saved servers; pass specific ids/names to export a subset, or `-o mcp.json` to write a file.
+
+```bash
+cswitch mcp export github filesystem -o .mcp.json
+cswitch mcp import .mcp.json --replace
+cswitch mcp validate --all
+```
+
+Imported server names become the keys under `mcpServers`, matching Claude Code conventions. `--replace` updates existing same-name registry entries; without it, duplicate names fail fast.
 
 You can also sync shims to remote machines with:
 

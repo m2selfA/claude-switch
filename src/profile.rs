@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +29,7 @@ const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
 ];
 
 const API_TEST_TIMEOUT_SECS: u64 = 8;
+const CLAUDE_SWITCH_HOME_ENV: &str = "CLAUDE_SWITCH_HOME";
 
 const NATIVE_SEARCH_URLS: &[&str] = &[
     "https://api.deepseek.com/anthropic", // DeepSeek: has search, lacks fetch
@@ -803,6 +805,202 @@ pub struct McpServerUpdate {
     pub disabled: Option<Option<bool>>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticLevel {
+    Ok,
+    Warn,
+    Error,
+}
+
+impl DiagnosticLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiagnosticLevel::Ok => "ok",
+            DiagnosticLevel::Warn => "warn",
+            DiagnosticLevel::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticItem {
+    pub level: DiagnosticLevel,
+    pub area: String,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DoctorReport {
+    pub items: Vec<DiagnosticItem>,
+}
+
+impl DoctorReport {
+    pub fn error_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.level == DiagnosticLevel::Error)
+            .count()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.level == DiagnosticLevel::Warn)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigInspection {
+    pub base_dir: PathBuf,
+    pub registry_path: PathBuf,
+    pub profiles_dir: PathBuf,
+    pub generated_root: PathBuf,
+    pub profiles: usize,
+    pub lightweight_profiles: usize,
+    pub full_profiles: usize,
+    pub providers: usize,
+    pub provider_keys: usize,
+    pub mcp_servers: usize,
+    pub linked_mcp_refs: usize,
+    pub generated_mcp_plugins: usize,
+    pub generated_tinyfish_plugins: usize,
+    pub generated_prompts: usize,
+    pub cmd_shims_dir: Option<PathBuf>,
+    pub shell_shims_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpValidationIssue {
+    pub level: DiagnosticLevel,
+    pub server_id: String,
+    pub server_name: String,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatuslineInfo {
+    pub profile_id: Option<String>,
+    pub profile_name: Option<String>,
+    pub profile_alias: Option<String>,
+    pub kind: Option<ProfileKind>,
+    pub provider_name: Option<String>,
+    pub provider_id: Option<String>,
+    pub key_name: Option<String>,
+    pub key_id: Option<String>,
+    pub mcp_servers: usize,
+    pub mcp_names: Vec<String>,
+    pub project_marker: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigBundle {
+    pub schema: String,
+    pub exported_at: DateTime<Utc>,
+    pub profiles: Vec<Profile>,
+    pub providers: Vec<Provider>,
+    pub mcp_servers: Vec<McpServer>,
+    pub secrets_included: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigImportSummary {
+    pub profiles_added: usize,
+    pub profiles_updated: usize,
+    pub profiles_conflicted: usize,
+    pub providers_added: usize,
+    pub providers_updated: usize,
+    pub providers_conflicted: usize,
+    pub mcp_servers_added: usize,
+    pub mcp_servers_updated: usize,
+    pub mcp_servers_conflicted: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigImportPlan {
+    pub summary: ConfigImportSummary,
+    pub profiles_add: Vec<String>,
+    pub profiles_update: Vec<String>,
+    pub profiles_conflict: Vec<String>,
+    pub providers_add: Vec<String>,
+    pub providers_update: Vec<String>,
+    pub providers_conflict: Vec<String>,
+    pub mcp_servers_add: Vec<String>,
+    pub mcp_servers_update: Vec<String>,
+    pub mcp_servers_conflict: Vec<String>,
+    pub secrets_included: bool,
+}
+
+impl ConfigImportPlan {
+    pub fn conflict_count(&self) -> usize {
+        self.summary.profiles_conflicted
+            + self.summary.providers_conflicted
+            + self.summary.mcp_servers_conflicted
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigBundleValidation {
+    pub schema: String,
+    pub profiles: usize,
+    pub providers: usize,
+    pub mcp_servers: usize,
+    pub secrets_included: bool,
+    pub issues: Vec<DiagnosticItem>,
+}
+
+impl ConfigBundleValidation {
+    pub fn error_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|item| item.level == DiagnosticLevel::Error)
+            .count()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|item| item.level == DiagnosticLevel::Warn)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ShimRecoveryPlan {
+    pub shim_dir: PathBuf,
+    pub files_scanned: usize,
+    pub files_recoverable: usize,
+    pub files_skipped: usize,
+    pub profiles_added: usize,
+    pub profiles_updated: usize,
+    pub profiles_conflicted: usize,
+    pub providers_added: usize,
+    pub provider_keys_added: usize,
+    pub provider_keys_reused: usize,
+    pub profiles_add: Vec<String>,
+    pub profiles_update: Vec<String>,
+    pub profiles_conflict: Vec<String>,
+    pub providers_add: Vec<String>,
+    pub provider_keys_add: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl ShimRecoveryPlan {
+    pub fn conflict_count(&self) -> usize {
+        self.profiles_conflicted
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShimRecoverySummary {
+    #[serde(flatten)]
+    pub plan: ShimRecoveryPlan,
+    pub backup_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderKey {
     /// Auto-generated short ID (e.g. "key_a1b2")
@@ -879,7 +1077,7 @@ impl Profile {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Registry {
     /// Keyed by MCP server `id`.
     #[serde(default)]
@@ -889,6 +1087,21 @@ pub struct Registry {
     pub providers: HashMap<String, Provider>,
     /// Keyed by profile `id` (UUID).
     pub profiles: HashMap<String, Profile>,
+}
+
+struct RecoveredShimProfile {
+    file_name: String,
+    name: String,
+    alias: String,
+    token: String,
+    base_url: String,
+    env: LightweightEnv,
+    launch_args: Option<Vec<String>>,
+}
+
+struct ShimRecoveryState {
+    plan: ShimRecoveryPlan,
+    registry: Registry,
 }
 
 // ── ProfileManager ────────────────────────────────────────────────────────────
@@ -903,7 +1116,11 @@ pub struct ProfileManager {
 
 impl ProfileManager {
     pub fn new() -> Result<Self> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
+        let home = Self::home_dir()?;
+        Self::new_in_home_dir(&home)
+    }
+
+    fn new_in_home_dir(home: &Path) -> Result<Self> {
         let base_dir = home.join(".claude-switch");
         Self::new_in_base_dir(&base_dir)
     }
@@ -921,6 +1138,16 @@ impl ProfileManager {
     #[cfg(test)]
     pub(crate) fn new_for_test(base_dir: &Path) -> Result<Self> {
         Self::new_in_base_dir(base_dir)
+    }
+
+    fn home_dir() -> Result<PathBuf> {
+        if let Some(value) = env::var_os(CLAUDE_SWITCH_HOME_ENV) {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() {
+                return Ok(path);
+            }
+        }
+        dirs::home_dir().context("Cannot determine home directory")
     }
 
     // ── Registry I/O ─────────────────────────────────────────────────────────
@@ -1137,6 +1364,10 @@ impl ProfileManager {
     /// Returns `(id, profile)`.
     pub fn find_profile(&self, query: &str) -> Result<(String, Profile)> {
         let registry = self.load_registry()?;
+        Self::find_profile_in_registry(&registry, query)
+    }
+
+    fn find_profile_in_registry(registry: &Registry, query: &str) -> Result<(String, Profile)> {
         if query.is_empty() {
             bail!("Profile query is empty.");
         }
@@ -1186,6 +1417,15 @@ impl ProfileManager {
     /// `exclude_id` — the profile being edited (don't check against itself).
     pub fn check_unique(&self, exclude_id: &str, name: &str, alias: Option<&str>) -> Result<()> {
         let registry = self.load_registry()?;
+        Self::check_profile_unique_in_registry(&registry, exclude_id, name, alias)
+    }
+
+    fn check_profile_unique_in_registry(
+        registry: &Registry,
+        exclude_id: &str,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<()> {
         for (id, p) in &registry.profiles {
             if id == exclude_id {
                 continue;
@@ -1233,6 +1473,137 @@ impl ProfileManager {
             .filter(|value| !value.is_empty())
     }
 
+    fn json_object_field<'a>(
+        object: &'a serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Option<&'a serde_json::Map<String, serde_json::Value>>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Object(value)) => Ok(Some(value)),
+            Some(_) => bail!("MCP '{}' field '{}' must be an object.", mcp_name, field),
+        }
+    }
+
+    fn json_string_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Option<String>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => {
+                Ok(Self::normalize_optional_string(Some(value.clone())))
+            }
+            Some(_) => bail!("MCP '{}' field '{}' must be a string.", mcp_name, field),
+        }
+    }
+
+    fn json_string_vec_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Vec<String>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .map(|value| match value {
+                    serde_json::Value::String(value) => Ok(value.clone()),
+                    _ => bail!("MCP '{}' field '{}' must contain strings.", mcp_name, field),
+                })
+                .collect(),
+            Some(_) => bail!("MCP '{}' field '{}' must be an array.", mcp_name, field),
+        }
+    }
+
+    fn json_string_map_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<HashMap<String, String>> {
+        let mut map = HashMap::new();
+        let Some(values) = Self::json_object_field(object, field, mcp_name)? else {
+            return Ok(map);
+        };
+        for (key, value) in values {
+            if key.trim().is_empty() {
+                bail!("MCP '{}' field '{}' has an empty key.", mcp_name, field);
+            }
+            let serde_json::Value::String(value) = value else {
+                bail!(
+                    "MCP '{}' field '{}' values must be strings.",
+                    mcp_name,
+                    field
+                );
+            };
+            map.insert(key.clone(), value.clone());
+        }
+        Ok(map)
+    }
+
+    fn json_bool_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Option<bool>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+            Some(_) => bail!("MCP '{}' field '{}' must be a boolean.", mcp_name, field),
+        }
+    }
+
+    fn json_u64_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Option<u64>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Number(value)) => value
+                .as_u64()
+                .with_context(|| {
+                    format!(
+                        "MCP '{}' field '{}' must be a non-negative integer.",
+                        mcp_name, field
+                    )
+                })
+                .map(Some),
+            Some(_) => bail!("MCP '{}' field '{}' must be a number.", mcp_name, field),
+        }
+    }
+
+    fn mcp_server_input_from_config(
+        name: &str,
+        value: &serde_json::Value,
+    ) -> Result<McpServerInput> {
+        let Some(object) = value.as_object() else {
+            bail!("MCP '{}' must be an object.", name);
+        };
+        let server_type =
+            Self::json_string_field(object, "type", name)?.unwrap_or_else(default_mcp_server_type);
+        let oauth = match object.get("oauth") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.clone()),
+        };
+        Ok(McpServerInput {
+            name: name.to_string(),
+            server_type,
+            command: Self::json_string_field(object, "command", name)?,
+            args: Self::json_string_vec_field(object, "args", name)?,
+            env: Self::json_string_map_field(object, "env", name)?,
+            cwd: Self::json_string_field(object, "cwd", name)?,
+            url: Self::json_string_field(object, "url", name)?,
+            headers: Self::json_string_map_field(object, "headers", name)?,
+            oauth,
+            headers_helper: Self::json_string_field(object, "headersHelper", name)?,
+            timeout: Self::json_u64_field(object, "timeout", name)?,
+            always_load: Self::json_bool_field(object, "alwaysLoad", name)?,
+            disabled: Self::json_bool_field(object, "disabled", name)?,
+        })
+    }
+
     fn build_mcp_server(id: String, input: McpServerInput) -> Result<McpServer> {
         let name = input.name.trim().to_string();
         if name.is_empty() {
@@ -1269,6 +1640,218 @@ impl ProfileManager {
             always_load: input.always_load,
             disabled: input.disabled,
         })
+    }
+
+    fn mcp_secret_key_likely(key: &str) -> bool {
+        let normalized: String = key
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        normalized.contains("api_key")
+            || normalized.contains("apikey")
+            || normalized.contains("access_token")
+            || normalized.contains("refresh_token")
+            || normalized.contains("auth_token")
+            || normalized.contains("personal_access_token")
+            || normalized == "token"
+            || normalized.starts_with("token_")
+            || normalized.ends_with("_token")
+            || normalized.contains("_token_")
+            || normalized.contains("secret")
+            || normalized.contains("password")
+            || normalized.contains("passwd")
+            || normalized.contains("private_key")
+            || normalized.contains("authorization")
+            || normalized.contains("credential")
+            || normalized.contains("bearer")
+    }
+
+    fn mcp_value_likely_secret(value: &str) -> bool {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("bearer ")
+            || lower.starts_with("basic ")
+            || lower.starts_with("token ")
+            || lower.starts_with("sk-")
+        {
+            return true;
+        }
+        (lower.contains("${") || lower.contains('%'))
+            && [
+                "api_key",
+                "apikey",
+                "token",
+                "secret",
+                "password",
+                "passwd",
+                "private_key",
+                "authorization",
+                "credential",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    }
+
+    fn redact_mcp_string_map_secrets(map: &mut HashMap<String, String>) {
+        for (key, value) in map {
+            if Self::mcp_secret_key_likely(key) || Self::mcp_value_likely_secret(value) {
+                value.clear();
+            }
+        }
+    }
+
+    fn mcp_string_map_has_secrets(map: &HashMap<String, String>) -> bool {
+        map.iter().any(|(key, value)| {
+            !value.is_empty()
+                && (Self::mcp_secret_key_likely(key) || Self::mcp_value_likely_secret(value))
+        })
+    }
+
+    fn redact_mcp_json_secrets(value: &mut serde_json::Value, inherited_secret: bool) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    Self::redact_mcp_json_secrets(
+                        child,
+                        inherited_secret || Self::mcp_secret_key_likely(key),
+                    );
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    Self::redact_mcp_json_secrets(child, inherited_secret);
+                }
+            }
+            serde_json::Value::String(text)
+                if inherited_secret || Self::mcp_value_likely_secret(text) =>
+            {
+                text.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn mcp_json_has_secrets(value: &serde_json::Value, inherited_secret: bool) -> bool {
+        match value {
+            serde_json::Value::Object(object) => object.iter().any(|(key, child)| {
+                Self::mcp_json_has_secrets(
+                    child,
+                    inherited_secret || Self::mcp_secret_key_likely(key),
+                )
+            }),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .any(|child| Self::mcp_json_has_secrets(child, inherited_secret)),
+            serde_json::Value::String(text) => {
+                !text.is_empty() && (inherited_secret || Self::mcp_value_likely_secret(text))
+            }
+            _ => false,
+        }
+    }
+
+    fn mcp_json_value_is_redacted(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Null => true,
+            serde_json::Value::String(text) => text.is_empty(),
+            serde_json::Value::Array(items) => items.iter().all(Self::mcp_json_value_is_redacted),
+            serde_json::Value::Object(object) => {
+                object.values().all(Self::mcp_json_value_is_redacted)
+            }
+            _ => false,
+        }
+    }
+
+    fn preserve_mcp_json_secrets(
+        incoming: &mut serde_json::Value,
+        existing: &serde_json::Value,
+        inherited_secret: bool,
+    ) {
+        match (incoming, existing) {
+            (serde_json::Value::Object(incoming_map), serde_json::Value::Object(existing_map)) => {
+                for (key, existing_value) in existing_map {
+                    let key_is_secret = inherited_secret || Self::mcp_secret_key_likely(key);
+                    if let Some(incoming_value) = incoming_map.get_mut(key) {
+                        if key_is_secret && Self::mcp_json_value_is_redacted(incoming_value) {
+                            *incoming_value = existing_value.clone();
+                        } else {
+                            Self::preserve_mcp_json_secrets(
+                                incoming_value,
+                                existing_value,
+                                key_is_secret,
+                            );
+                        }
+                    } else if key_is_secret {
+                        incoming_map.insert(key.clone(), existing_value.clone());
+                    }
+                }
+            }
+            (
+                serde_json::Value::Array(incoming_items),
+                serde_json::Value::Array(existing_items),
+            ) => {
+                for (incoming_value, existing_value) in
+                    incoming_items.iter_mut().zip(existing_items.iter())
+                {
+                    Self::preserve_mcp_json_secrets(
+                        incoming_value,
+                        existing_value,
+                        inherited_secret,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn redact_mcp_server_secrets(server: &mut McpServer) {
+        Self::redact_mcp_string_map_secrets(&mut server.env);
+        Self::redact_mcp_string_map_secrets(&mut server.headers);
+        if let Some(oauth) = &mut server.oauth {
+            Self::redact_mcp_json_secrets(oauth, false);
+        }
+    }
+
+    fn mcp_server_has_secrets(server: &McpServer) -> bool {
+        Self::mcp_string_map_has_secrets(&server.env)
+            || Self::mcp_string_map_has_secrets(&server.headers)
+            || server
+                .oauth
+                .as_ref()
+                .is_some_and(|oauth| Self::mcp_json_has_secrets(oauth, false))
+    }
+
+    fn preserve_mcp_server_secrets(incoming: &mut McpServer, existing: &McpServer) {
+        for (key, existing_value) in &existing.env {
+            if let Some(incoming_value) = incoming.env.get_mut(key)
+                && incoming_value.is_empty()
+                && (Self::mcp_secret_key_likely(key)
+                    || Self::mcp_value_likely_secret(existing_value))
+            {
+                *incoming_value = existing_value.clone();
+            }
+        }
+        for (key, existing_value) in &existing.headers {
+            if let Some(incoming_value) = incoming.headers.get_mut(key)
+                && incoming_value.is_empty()
+                && (Self::mcp_secret_key_likely(key)
+                    || Self::mcp_value_likely_secret(existing_value))
+            {
+                *incoming_value = existing_value.clone();
+            }
+        }
+        if let (Some(incoming_oauth), Some(existing_oauth)) = (&mut incoming.oauth, &existing.oauth)
+        {
+            Self::preserve_mcp_json_secrets(incoming_oauth, existing_oauth, false);
+        }
     }
 
     fn check_mcp_name_unique_in_registry(
@@ -1659,6 +2242,1189 @@ impl ProfileManager {
         let profile = profile.clone();
         self.save_registry(&registry)?;
         Ok(profile)
+    }
+
+    pub fn export_mcp_config(&self, queries: &[String], all: bool) -> Result<String> {
+        let registry = self.load_registry()?;
+        let servers = Self::selected_mcp_servers_in_registry(&registry, queries, all)?;
+        Self::profile_mcp_config(&servers)
+    }
+
+    pub fn import_mcp_config(&self, content: &str, replace: bool) -> Result<Vec<McpServer>> {
+        let root: serde_json::Value =
+            serde_json::from_str(content).context("Failed to parse MCP JSON")?;
+        let mcp_servers = root
+            .get("mcpServers")
+            .and_then(|value| value.as_object())
+            .context("MCP JSON must contain an object field named 'mcpServers'.")?;
+        let mut registry = self.load_registry()?;
+        let mut imported = Vec::new();
+
+        for (name, value) in mcp_servers {
+            let input = Self::mcp_server_input_from_config(name, value)?;
+            let existing_id = registry
+                .mcp_servers
+                .iter()
+                .find(|(_, server)| server.name == input.name)
+                .map(|(id, _)| id.clone());
+            let id = if let Some(id) = existing_id {
+                if !replace {
+                    bail!(
+                        "MCP name '{}' already exists. Use --replace to update it.",
+                        input.name
+                    );
+                }
+                id
+            } else {
+                loop {
+                    let id = format!("mcp_{}", &Uuid::new_v4().to_string()[..8]);
+                    if !registry.mcp_servers.contains_key(&id) {
+                        break id;
+                    }
+                }
+            };
+
+            let server = Self::build_mcp_server(id.clone(), input)?;
+            Self::check_mcp_name_unique_in_registry(&registry, &id, &server.name)?;
+            registry.mcp_servers.insert(id, server.clone());
+            imported.push(server);
+        }
+
+        self.save_registry(&registry)?;
+        imported.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        Ok(imported)
+    }
+
+    pub fn validate_mcp_servers(
+        &self,
+        queries: &[String],
+        all: bool,
+    ) -> Result<Vec<McpValidationIssue>> {
+        let registry = self.load_registry()?;
+        let servers = Self::selected_mcp_servers_in_registry(&registry, queries, all)?;
+        let mut issues = Vec::new();
+        for server in &servers {
+            issues.extend(Self::validate_mcp_server_config(server));
+        }
+        Ok(issues)
+    }
+
+    pub fn inspect_config(&self) -> Result<ConfigInspection> {
+        let registry = self.load_registry()?;
+        let profiles = registry.profiles.values().collect::<Vec<_>>();
+        let lightweight_profiles = profiles
+            .iter()
+            .filter(|profile| profile.kind == ProfileKind::Lightweight)
+            .count();
+        let full_profiles = profiles
+            .iter()
+            .filter(|profile| profile.kind == ProfileKind::Full)
+            .count();
+        let provider_keys = registry
+            .providers
+            .values()
+            .map(|provider| provider.keys.len())
+            .sum();
+        let linked_mcp_refs = profiles
+            .iter()
+            .map(|profile| profile.mcp_server_ids.len())
+            .sum();
+
+        #[cfg(target_os = "windows")]
+        let cmd_shims_dir = Self::cmd_bin_dir().ok();
+        #[cfg(not(target_os = "windows"))]
+        let cmd_shims_dir = None;
+
+        #[cfg(not(target_os = "windows"))]
+        let shell_shims_dir = Self::sh_bin_dir().ok();
+        #[cfg(target_os = "windows")]
+        let shell_shims_dir = None;
+
+        Ok(ConfigInspection {
+            base_dir: self.base_dir(),
+            registry_path: self.registry_path.clone(),
+            profiles_dir: self.profiles_dir.clone(),
+            generated_root: self.generated_root_dir(),
+            profiles: profiles.len(),
+            lightweight_profiles,
+            full_profiles,
+            providers: registry.providers.len(),
+            provider_keys,
+            mcp_servers: registry.mcp_servers.len(),
+            linked_mcp_refs,
+            generated_mcp_plugins: Self::count_named_entries(
+                &self.generated_mcps_dir(),
+                Self::is_managed_generated_mcp_dir_name,
+            ),
+            generated_tinyfish_plugins: Self::count_named_entries(
+                &self.generated_plugins_dir(),
+                Self::is_managed_generated_plugin_dir_name,
+            ),
+            generated_prompts: Self::count_named_entries(
+                &self.generated_prompts_dir(),
+                Self::is_managed_generated_prompt_name,
+            ),
+            cmd_shims_dir,
+            shell_shims_dir,
+        })
+    }
+
+    pub fn doctor_report(&self) -> Result<DoctorReport> {
+        let mut report = DoctorReport::default();
+        let base_dir = self.base_dir();
+        if base_dir.exists() {
+            report.items.push(Self::diagnostic(
+                DiagnosticLevel::Ok,
+                "storage",
+                format!("base directory exists: {}", base_dir.display()),
+                None,
+            ));
+        } else {
+            report.items.push(Self::diagnostic(
+                DiagnosticLevel::Warn,
+                "storage",
+                format!("base directory does not exist yet: {}", base_dir.display()),
+                Some("run any cswitch command that writes profiles or providers".to_string()),
+            ));
+        }
+
+        let registry = match self.load_registry() {
+            Ok(registry) => {
+                report.items.push(Self::diagnostic(
+                    DiagnosticLevel::Ok,
+                    "registry",
+                    format!("registry is readable: {}", self.registry_path.display()),
+                    None,
+                ));
+                registry
+            }
+            Err(err) => {
+                report.items.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "registry",
+                    format!("registry cannot be read: {err}"),
+                    Some("inspect or restore ~/.claude-switch/registry.json".to_string()),
+                ));
+                return Ok(report);
+            }
+        };
+
+        if registry.profiles.is_empty() {
+            report.items.push(Self::diagnostic(
+                DiagnosticLevel::Warn,
+                "profiles",
+                "no profiles are configured".to_string(),
+                Some("add one with cswitch add <name>".to_string()),
+            ));
+        }
+
+        for (profile_id, profile) in &registry.profiles {
+            if profile.name.trim().is_empty() {
+                report.items.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!("profile '{profile_id}' has an empty name"),
+                    None,
+                ));
+            }
+            if profile.kind == ProfileKind::Full {
+                let dir = self.profile_dir(profile);
+                if !dir.exists() {
+                    report.items.push(Self::diagnostic(
+                        DiagnosticLevel::Error,
+                        "profiles",
+                        format!("full profile '{}' directory is missing", profile.name),
+                        Some(format!("expected {}", dir.display())),
+                    ));
+                }
+            } else if profile.env.is_none() {
+                report.items.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!("lightweight profile '{}' has no env block", profile.name),
+                    Some("edit or recreate this profile".to_string()),
+                ));
+            }
+
+            if let Some(provider_id) = &profile.provider_id {
+                match registry.providers.get(provider_id) {
+                    Some(provider) => match &profile.key_id {
+                        Some(key_id) if provider.keys.contains_key(key_id) => {}
+                        Some(key_id) => report.items.push(Self::diagnostic(
+                            DiagnosticLevel::Error,
+                            "providers",
+                            format!(
+                                "profile '{}' references missing key '{}' in provider '{}'",
+                                profile.name, key_id, provider.name
+                            ),
+                            Some("relink the profile with cswitch provider link".to_string()),
+                        )),
+                        None => report.items.push(Self::diagnostic(
+                            DiagnosticLevel::Error,
+                            "providers",
+                            format!(
+                                "profile '{}' references provider '{}' without a key",
+                                profile.name, provider.name
+                            ),
+                            Some("relink the profile with cswitch provider link".to_string()),
+                        )),
+                    },
+                    None => report.items.push(Self::diagnostic(
+                        DiagnosticLevel::Error,
+                        "providers",
+                        format!(
+                            "profile '{}' references missing provider '{}'",
+                            profile.name, provider_id
+                        ),
+                        Some("unlink or relink the profile provider".to_string()),
+                    )),
+                }
+            }
+
+            if !profile.mcp_server_ids.is_empty() && profile.kind != ProfileKind::Lightweight {
+                report.items.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "mcp",
+                    format!("full profile '{}' has MCP registry links", profile.name),
+                    Some("MCP links are only supported for lightweight profiles".to_string()),
+                ));
+            }
+            for mcp_id in &profile.mcp_server_ids {
+                if !registry.mcp_servers.contains_key(mcp_id) {
+                    report.items.push(Self::diagnostic(
+                        DiagnosticLevel::Error,
+                        "mcp",
+                        format!(
+                            "profile '{}' references missing MCP '{}'",
+                            profile.name, mcp_id
+                        ),
+                        Some("unlink stale MCP ids or recreate the MCP entry".to_string()),
+                    ));
+                }
+            }
+            if profile.kind == ProfileKind::Lightweight && !profile.mcp_server_ids.is_empty() {
+                let plugin_root = self.local_profile_mcp_plugin_root(profile);
+                if !plugin_root.join(".mcp.json").exists() || !plugin_root.join("mcp.json").exists()
+                {
+                    report.items.push(Self::diagnostic(
+                        DiagnosticLevel::Warn,
+                        "mcp",
+                        format!(
+                            "profile '{}' MCP plugin artifacts have not been generated",
+                            profile.name
+                        ),
+                        Some("run cswitch aliases --local or launch the profile once".to_string()),
+                    ));
+                }
+            }
+        }
+
+        for provider in registry.providers.values() {
+            if provider.base_url.trim().is_empty() {
+                report.items.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "providers",
+                    format!("provider '{}' has an empty base URL", provider.name),
+                    Some("edit the provider URL".to_string()),
+                ));
+            }
+            if provider.keys.is_empty() {
+                report.items.push(Self::diagnostic(
+                    DiagnosticLevel::Warn,
+                    "providers",
+                    format!("provider '{}' has no keys", provider.name),
+                    Some("add a key with cswitch provider add-key".to_string()),
+                ));
+            }
+        }
+
+        for issue in registry
+            .mcp_servers
+            .values()
+            .flat_map(Self::validate_mcp_server_config)
+        {
+            report.items.push(Self::diagnostic(
+                issue.level,
+                "mcp",
+                format!("{}: {}", issue.server_name, issue.message),
+                issue.hint,
+            ));
+        }
+
+        let desired_mcp_dirs: std::collections::HashSet<String> = registry
+            .profiles
+            .values()
+            .filter(|profile| {
+                profile.kind == ProfileKind::Lightweight && !profile.mcp_server_ids.is_empty()
+            })
+            .map(Self::profile_mcp_plugin_dir_name)
+            .collect();
+        let stale_mcp_dirs = Self::managed_entry_names(
+            &self.generated_mcps_dir(),
+            Self::is_managed_generated_mcp_dir_name,
+        )
+        .into_iter()
+        .filter(|name| !desired_mcp_dirs.contains(name))
+        .count();
+        if stale_mcp_dirs > 0 {
+            report.items.push(Self::diagnostic(
+                DiagnosticLevel::Warn,
+                "generated",
+                format!("{stale_mcp_dirs} stale generated MCP plugin dir(s) found"),
+                Some("run cswitch aliases --local to resync generated artifacts".to_string()),
+            ));
+        }
+
+        if !Self::command_exists("claude") {
+            report.items.push(Self::diagnostic(
+                DiagnosticLevel::Warn,
+                "runtime",
+                "claude command is not available on PATH".to_string(),
+                Some("install Claude Code or adjust PATH before launching profiles".to_string()),
+            ));
+        }
+
+        if report.error_count() == 0 {
+            report.items.push(Self::diagnostic(
+                DiagnosticLevel::Ok,
+                "summary",
+                format!(
+                    "{} profile(s), {} provider(s), {} MCP server(s)",
+                    registry.profiles.len(),
+                    registry.providers.len(),
+                    registry.mcp_servers.len()
+                ),
+                None,
+            ));
+        }
+
+        Ok(report)
+    }
+
+    pub fn resolve_project_profile(&self, start: &Path) -> Result<Option<Profile>> {
+        let mut current = if start.as_os_str().is_empty() {
+            env::current_dir()?
+        } else if start.is_file() {
+            start.parent().unwrap_or(start).to_path_buf()
+        } else {
+            start.to_path_buf()
+        };
+        if current.is_relative() {
+            current = env::current_dir()?.join(current);
+        }
+
+        loop {
+            for marker in [".cswitch-profile", ".claudeprofile"] {
+                let marker_path = current.join(marker);
+                if let Some(query) = Self::read_profile_marker(&marker_path)? {
+                    let (_, profile) = self.find_profile(&query).with_context(|| {
+                        format!(
+                            "Project marker '{}' references unknown profile '{}'.",
+                            marker_path.display(),
+                            query
+                        )
+                    })?;
+                    return Ok(Some(profile));
+                }
+            }
+
+            if !current.pop() {
+                break;
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn statusline_info(
+        &self,
+        profile_query: Option<&str>,
+        project_dir: Option<&Path>,
+    ) -> Result<StatuslineInfo> {
+        let registry = self.load_registry()?;
+        let (profile, project_marker) = if let Some(query) = profile_query {
+            let (_, profile) = Self::find_profile_in_registry(&registry, query)?;
+            (Some(profile), false)
+        } else if let Some(project_dir) = project_dir {
+            (self.resolve_project_profile(project_dir)?, true)
+        } else {
+            (None, false)
+        };
+
+        let Some(profile) = profile else {
+            return Ok(StatuslineInfo {
+                profile_id: None,
+                profile_name: None,
+                profile_alias: None,
+                kind: None,
+                provider_name: None,
+                provider_id: None,
+                key_name: None,
+                key_id: None,
+                mcp_servers: 0,
+                mcp_names: Vec::new(),
+                project_marker: false,
+            });
+        };
+
+        let (provider_name, key_name) = profile
+            .provider_id
+            .as_ref()
+            .and_then(|provider_id| {
+                registry.providers.get(provider_id).map(|provider| {
+                    let key_name = profile
+                        .key_id
+                        .as_ref()
+                        .and_then(|key_id| provider.keys.get(key_id))
+                        .map(|key| key.name.clone());
+                    (Some(provider.name.clone()), key_name)
+                })
+            })
+            .unwrap_or((None, None));
+        let mut mcp_names = profile
+            .mcp_server_ids
+            .iter()
+            .filter_map(|id| registry.mcp_servers.get(id))
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        mcp_names.sort();
+
+        Ok(StatuslineInfo {
+            profile_id: Some(profile.id.clone()),
+            profile_name: Some(profile.name.clone()),
+            profile_alias: profile.alias.clone(),
+            kind: Some(profile.kind.clone()),
+            provider_name,
+            provider_id: profile.provider_id.clone(),
+            key_name,
+            key_id: profile.key_id.clone(),
+            mcp_servers: mcp_names.len(),
+            mcp_names,
+            project_marker,
+        })
+    }
+
+    pub fn export_config_bundle(
+        &self,
+        profile_queries: &[String],
+        include_secrets: bool,
+    ) -> Result<String> {
+        let registry = self.load_registry()?;
+        let mut profiles: Vec<Profile> = if profile_queries.is_empty() {
+            registry.profiles.values().cloned().collect()
+        } else {
+            let mut selected = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for query in profile_queries {
+                let (id, profile) = Self::find_profile_in_registry(&registry, query)?;
+                if seen.insert(id) {
+                    selected.push(profile);
+                }
+            }
+            selected
+        };
+        let selected_provider_keys: HashMap<String, HashSet<String>> =
+            Self::selected_provider_keys_for_profiles(&profiles);
+        let selected_provider_ids: HashSet<String> =
+            selected_provider_keys.keys().cloned().collect();
+        let selected_mcp_ids: std::collections::HashSet<String> = profiles
+            .iter()
+            .flat_map(|profile| profile.mcp_server_ids.iter().cloned())
+            .collect();
+        profiles.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        let mut providers: Vec<Provider> = if profile_queries.is_empty() {
+            registry.providers.values().cloned().collect()
+        } else {
+            registry
+                .providers
+                .values()
+                .filter(|provider| selected_provider_ids.contains(&provider.id))
+                .cloned()
+                .map(|mut provider| {
+                    if let Some(key_ids) = selected_provider_keys.get(&provider.id) {
+                        provider.keys.retain(|key_id, _| key_ids.contains(key_id));
+                    }
+                    provider
+                })
+                .collect()
+        };
+        providers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        let mut mcp_servers: Vec<McpServer> = if profile_queries.is_empty() {
+            registry.mcp_servers.values().cloned().collect()
+        } else {
+            registry
+                .mcp_servers
+                .values()
+                .filter(|server| selected_mcp_ids.contains(&server.id))
+                .cloned()
+                .collect()
+        };
+        mcp_servers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+
+        if !include_secrets {
+            for profile in &mut profiles {
+                if let Some(env) = &mut profile.env {
+                    env.auth_token = None;
+                }
+            }
+            for provider in &mut providers {
+                for key in provider.keys.values_mut() {
+                    key.api_key.clear();
+                }
+            }
+            for server in &mut mcp_servers {
+                Self::redact_mcp_server_secrets(server);
+            }
+        }
+
+        let bundle = ConfigBundle {
+            schema: "https://github.com/m2selfA/claude-switch/config-bundle/v1".to_string(),
+            exported_at: Utc::now(),
+            profiles,
+            providers,
+            mcp_servers,
+            secrets_included: include_secrets,
+        };
+        serde_json::to_string_pretty(&bundle).context("Failed to serialize config bundle")
+    }
+
+    pub fn validate_config_bundle(&self, content: &str) -> Result<ConfigBundleValidation> {
+        let bundle: ConfigBundle =
+            serde_json::from_str(content).context("Failed to parse config bundle JSON")?;
+        let mut validation = ConfigBundleValidation {
+            schema: bundle.schema.clone(),
+            profiles: bundle.profiles.len(),
+            providers: bundle.providers.len(),
+            mcp_servers: bundle.mcp_servers.len(),
+            secrets_included: bundle.secrets_included,
+            issues: Vec::new(),
+        };
+
+        if bundle.schema != "https://github.com/m2selfA/claude-switch/config-bundle/v1" {
+            validation.issues.push(Self::diagnostic(
+                DiagnosticLevel::Error,
+                "schema",
+                format!("unsupported schema '{}'", bundle.schema),
+                Some("export a fresh bundle with this cswitch version".to_string()),
+            ));
+        }
+
+        let mut provider_ids = std::collections::HashSet::new();
+        for provider in &bundle.providers {
+            if provider.id.trim().is_empty() {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "providers",
+                    format!("provider '{}' has an empty id", provider.name),
+                    None,
+                ));
+            } else if !provider_ids.insert(provider.id.clone()) {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "providers",
+                    format!("duplicate provider id '{}'", provider.id),
+                    None,
+                ));
+            }
+            if provider.name.trim().is_empty() {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "providers",
+                    format!("provider '{}' has an empty name", provider.id),
+                    None,
+                ));
+            }
+            if provider.base_url.trim().is_empty() {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "providers",
+                    format!("provider '{}' has an empty base URL", provider.name),
+                    None,
+                ));
+            }
+            if !bundle.secrets_included && provider.keys.values().any(|key| !key.api_key.is_empty())
+            {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Warn,
+                    "providers",
+                    format!(
+                        "provider '{}' contains keys despite secrets_included=false",
+                        provider.name
+                    ),
+                    Some(
+                        "re-export with the current cswitch version to enforce redaction"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+
+        let mut mcp_ids = std::collections::HashSet::new();
+        for server in &bundle.mcp_servers {
+            if server.id.trim().is_empty() {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "mcp",
+                    format!("MCP '{}' has an empty id", server.name),
+                    None,
+                ));
+            } else if !mcp_ids.insert(server.id.clone()) {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "mcp",
+                    format!("duplicate MCP id '{}'", server.id),
+                    None,
+                ));
+            }
+            validation
+                .issues
+                .extend(
+                    Self::validate_mcp_server_config(server)
+                        .into_iter()
+                        .map(|issue| {
+                            Self::diagnostic(
+                                issue.level,
+                                "mcp",
+                                format!("{}: {}", issue.server_name, issue.message),
+                                issue.hint,
+                            )
+                        }),
+                );
+            if !bundle.secrets_included && Self::mcp_server_has_secrets(server) {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Warn,
+                    "mcp",
+                    format!(
+                        "MCP '{}' contains secrets despite secrets_included=false",
+                        server.name
+                    ),
+                    Some(
+                        "re-export with the current cswitch version to enforce redaction"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+
+        let mut profile_ids = std::collections::HashSet::new();
+        let mcp_id_set: std::collections::HashSet<String> = bundle
+            .mcp_servers
+            .iter()
+            .map(|server| server.id.clone())
+            .collect();
+        for profile in &bundle.profiles {
+            if profile.id.trim().is_empty() {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!("profile '{}' has an empty id", profile.name),
+                    None,
+                ));
+            } else if !profile_ids.insert(profile.id.clone()) {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!("duplicate profile id '{}'", profile.id),
+                    None,
+                ));
+            }
+            if profile.name.trim().is_empty() {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!("profile '{}' has an empty name", profile.id),
+                    None,
+                ));
+            }
+            if let Some(alias) = &profile.alias
+                && let Err(err) = Self::validate_alias(alias)
+            {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!("profile '{}' alias is invalid: {err}", profile.name),
+                    None,
+                ));
+            }
+            if profile.kind == ProfileKind::Lightweight && profile.env.is_none() {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!("lightweight profile '{}' has no env block", profile.name),
+                    None,
+                ));
+            }
+            if profile.kind != ProfileKind::Lightweight && !profile.mcp_server_ids.is_empty() {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!("full profile '{}' has MCP links", profile.name),
+                    Some("MCP links are only supported for lightweight profiles".to_string()),
+                ));
+            }
+            if let Some(provider_id) = &profile.provider_id
+                && !provider_ids.contains(provider_id)
+            {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Error,
+                    "profiles",
+                    format!(
+                        "profile '{}' references missing provider '{}'",
+                        profile.name, provider_id
+                    ),
+                    None,
+                ));
+            }
+            for mcp_id in &profile.mcp_server_ids {
+                if !mcp_id_set.contains(mcp_id) {
+                    validation.issues.push(Self::diagnostic(
+                        DiagnosticLevel::Error,
+                        "profiles",
+                        format!(
+                            "profile '{}' references missing MCP '{}'",
+                            profile.name, mcp_id
+                        ),
+                        None,
+                    ));
+                }
+            }
+            if !bundle.secrets_included
+                && profile
+                    .env
+                    .as_ref()
+                    .and_then(|env| env.auth_token.as_ref())
+                    .is_some()
+            {
+                validation.issues.push(Self::diagnostic(
+                    DiagnosticLevel::Warn,
+                    "profiles",
+                    format!(
+                        "profile '{}' contains an auth token despite secrets_included=false",
+                        profile.name
+                    ),
+                    Some(
+                        "re-export with the current cswitch version to enforce redaction"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+
+        Ok(validation)
+    }
+
+    pub fn plan_config_bundle_import(
+        &self,
+        content: &str,
+        replace: bool,
+    ) -> Result<ConfigImportPlan> {
+        let bundle: ConfigBundle =
+            serde_json::from_str(content).context("Failed to parse config bundle JSON")?;
+        if bundle.schema != "https://github.com/m2selfA/claude-switch/config-bundle/v1" {
+            bail!("Unsupported config bundle schema '{}'.", bundle.schema);
+        }
+        let registry = self.load_registry()?;
+        Self::validate_bundle_references_after_import(&registry, &bundle, replace)?;
+        let mut plan = ConfigImportPlan {
+            summary: ConfigImportSummary {
+                profiles_added: 0,
+                profiles_updated: 0,
+                profiles_conflicted: 0,
+                providers_added: 0,
+                providers_updated: 0,
+                providers_conflicted: 0,
+                mcp_servers_added: 0,
+                mcp_servers_updated: 0,
+                mcp_servers_conflicted: 0,
+            },
+            profiles_add: Vec::new(),
+            profiles_update: Vec::new(),
+            profiles_conflict: Vec::new(),
+            providers_add: Vec::new(),
+            providers_update: Vec::new(),
+            providers_conflict: Vec::new(),
+            mcp_servers_add: Vec::new(),
+            mcp_servers_update: Vec::new(),
+            mcp_servers_conflict: Vec::new(),
+            secrets_included: bundle.secrets_included,
+        };
+
+        for provider in &bundle.providers {
+            if provider.id.trim().is_empty() {
+                bail!("Imported provider '{}' has an empty id.", provider.name);
+            }
+            if registry.providers.contains_key(&provider.id) {
+                if !replace {
+                    plan.summary.providers_conflicted += 1;
+                    plan.providers_conflict
+                        .push(format!("{} ({})", provider.name, provider.id));
+                    continue;
+                }
+                plan.summary.providers_updated += 1;
+                plan.providers_update
+                    .push(format!("{} ({})", provider.name, provider.id));
+            } else {
+                plan.summary.providers_added += 1;
+                plan.providers_add
+                    .push(format!("{} ({})", provider.name, provider.id));
+            }
+        }
+
+        for server in &bundle.mcp_servers {
+            if server.id.trim().is_empty() {
+                bail!("Imported MCP '{}' has an empty id.", server.name);
+            }
+            Self::normalize_mcp_server_type(&server.server_type)?;
+            if registry.mcp_servers.contains_key(&server.id) {
+                if !replace {
+                    plan.summary.mcp_servers_conflicted += 1;
+                    plan.mcp_servers_conflict
+                        .push(format!("{} ({})", server.name, server.id));
+                    continue;
+                }
+                Self::check_mcp_name_unique_in_registry(&registry, &server.id, &server.name)?;
+                plan.summary.mcp_servers_updated += 1;
+                plan.mcp_servers_update
+                    .push(format!("{} ({})", server.name, server.id));
+            } else {
+                Self::check_mcp_name_unique_in_registry(&registry, "", &server.name)?;
+                plan.summary.mcp_servers_added += 1;
+                plan.mcp_servers_add
+                    .push(format!("{} ({})", server.name, server.id));
+            }
+        }
+
+        for profile in &bundle.profiles {
+            if profile.id.trim().is_empty() {
+                bail!("Imported profile '{}' has an empty id.", profile.name);
+            }
+            if profile.name.trim().is_empty() {
+                bail!("Imported profile '{}' has an empty name.", profile.id);
+            }
+            if registry.profiles.contains_key(&profile.id) {
+                if !replace {
+                    plan.summary.profiles_conflicted += 1;
+                    plan.profiles_conflict
+                        .push(format!("{} ({})", profile.name, profile.id));
+                    continue;
+                }
+                Self::check_profile_unique_in_registry(
+                    &registry,
+                    &profile.id,
+                    &profile.name,
+                    profile.alias.as_deref(),
+                )?;
+                plan.summary.profiles_updated += 1;
+                plan.profiles_update
+                    .push(format!("{} ({})", profile.name, profile.id));
+            } else {
+                Self::check_profile_unique_in_registry(
+                    &registry,
+                    "",
+                    &profile.name,
+                    profile.alias.as_deref(),
+                )?;
+                plan.summary.profiles_added += 1;
+                plan.profiles_add
+                    .push(format!("{} ({})", profile.name, profile.id));
+            }
+        }
+
+        Ok(plan)
+    }
+
+    pub fn import_config_bundle(
+        &self,
+        content: &str,
+        replace: bool,
+    ) -> Result<ConfigImportSummary> {
+        let plan = self.plan_config_bundle_import(content, replace)?;
+        if plan.conflict_count() > 0 {
+            bail!(
+                "Config bundle has {} existing entrie(s). Use --replace to update them.",
+                plan.conflict_count()
+            );
+        }
+        let bundle: ConfigBundle =
+            serde_json::from_str(content).context("Failed to parse config bundle JSON")?;
+        let mut registry = self.load_registry()?;
+        let mut summary = ConfigImportSummary {
+            profiles_added: 0,
+            profiles_updated: 0,
+            profiles_conflicted: 0,
+            providers_added: 0,
+            providers_updated: 0,
+            providers_conflicted: 0,
+            mcp_servers_added: 0,
+            mcp_servers_updated: 0,
+            mcp_servers_conflicted: 0,
+        };
+
+        for mut provider in bundle.providers {
+            if provider.id.trim().is_empty() {
+                bail!("Imported provider '{}' has an empty id.", provider.name);
+            }
+            if registry.providers.contains_key(&provider.id) {
+                if !replace {
+                    bail!(
+                        "Provider '{}' already exists. Use --replace to update it.",
+                        provider.id
+                    );
+                }
+                if !bundle.secrets_included
+                    && let Some(existing) = registry.providers.get(&provider.id)
+                {
+                    for (key_id, key) in &mut provider.keys {
+                        if key.api_key.is_empty()
+                            && let Some(existing_key) = existing.keys.get(key_id)
+                        {
+                            key.api_key = existing_key.api_key.clone();
+                        }
+                    }
+                }
+                registry.providers.insert(provider.id.clone(), provider);
+                summary.providers_updated += 1;
+            } else {
+                registry.providers.insert(provider.id.clone(), provider);
+                summary.providers_added += 1;
+            }
+        }
+
+        for mut server in bundle.mcp_servers {
+            if server.id.trim().is_empty() {
+                bail!("Imported MCP '{}' has an empty id.", server.name);
+            }
+            Self::normalize_mcp_server_type(&server.server_type)?;
+            if registry.mcp_servers.contains_key(&server.id) {
+                if !replace {
+                    bail!(
+                        "MCP '{}' already exists. Use --replace to update it.",
+                        server.id
+                    );
+                }
+                Self::check_mcp_name_unique_in_registry(&registry, &server.id, &server.name)?;
+                if !bundle.secrets_included
+                    && let Some(existing) = registry.mcp_servers.get(&server.id)
+                {
+                    Self::preserve_mcp_server_secrets(&mut server, existing);
+                }
+                registry.mcp_servers.insert(server.id.clone(), server);
+                summary.mcp_servers_updated += 1;
+            } else {
+                Self::check_mcp_name_unique_in_registry(&registry, "", &server.name)?;
+                registry.mcp_servers.insert(server.id.clone(), server);
+                summary.mcp_servers_added += 1;
+            }
+        }
+
+        for mut profile in bundle.profiles {
+            if profile.id.trim().is_empty() {
+                bail!("Imported profile '{}' has an empty id.", profile.name);
+            }
+            if profile.name.trim().is_empty() {
+                bail!("Imported profile '{}' has an empty name.", profile.id);
+            }
+            if registry.profiles.contains_key(&profile.id) {
+                if !replace {
+                    bail!(
+                        "Profile '{}' already exists. Use --replace to update it.",
+                        profile.id
+                    );
+                }
+                Self::check_profile_unique_in_registry(
+                    &registry,
+                    &profile.id,
+                    &profile.name,
+                    profile.alias.as_deref(),
+                )?;
+                if !bundle.secrets_included
+                    && let Some(existing) = registry.profiles.get(&profile.id)
+                    && let (Some(incoming_env), Some(existing_env)) =
+                        (&mut profile.env, &existing.env)
+                    && incoming_env.auth_token.is_none()
+                {
+                    incoming_env.auth_token = existing_env.auth_token.clone();
+                }
+                registry.profiles.insert(profile.id.clone(), profile);
+                summary.profiles_updated += 1;
+            } else {
+                Self::check_profile_unique_in_registry(
+                    &registry,
+                    "",
+                    &profile.name,
+                    profile.alias.as_deref(),
+                )?;
+                registry.profiles.insert(profile.id.clone(), profile);
+                summary.profiles_added += 1;
+            }
+        }
+
+        self.migrate_providers(&mut registry)?;
+        self.save_registry(&registry)?;
+        Ok(summary)
+    }
+
+    pub fn plan_shim_recovery(&self, shim_dir: &Path, replace: bool) -> Result<ShimRecoveryPlan> {
+        Ok(self.build_shim_recovery_state(shim_dir, replace)?.plan)
+    }
+
+    pub fn recover_shims(&self, shim_dir: &Path, replace: bool) -> Result<ShimRecoverySummary> {
+        let state = self.build_shim_recovery_state(shim_dir, replace)?;
+        if state.plan.conflict_count() > 0 {
+            bail!(
+                "Shim recovery has {} conflicted profile(s). Use --replace to update them.",
+                state.plan.conflict_count()
+            );
+        }
+
+        let backup_path = if self.registry_path.exists() {
+            let backup_path = self.registry_backup_path();
+            fs::copy(&self.registry_path, &backup_path).with_context(|| {
+                format!(
+                    "Failed to create registry backup '{}'.",
+                    backup_path.display()
+                )
+            })?;
+            Some(backup_path)
+        } else {
+            None
+        };
+
+        let mut registry = state.registry;
+        self.migrate_providers(&mut registry)?;
+        self.save_registry(&registry)?;
+        Ok(ShimRecoverySummary {
+            plan: state.plan,
+            backup_path,
+        })
+    }
+
+    fn build_shim_recovery_state(
+        &self,
+        shim_dir: &Path,
+        replace: bool,
+    ) -> Result<ShimRecoveryState> {
+        if !shim_dir.exists() {
+            bail!("Shim directory '{}' does not exist.", shim_dir.display());
+        }
+        if !shim_dir.is_dir() {
+            bail!("Shim path '{}' is not a directory.", shim_dir.display());
+        }
+
+        let mut registry = self.load_registry()?;
+        let mut plan = ShimRecoveryPlan {
+            shim_dir: shim_dir.to_path_buf(),
+            ..Default::default()
+        };
+        let mut provider_names = registry
+            .providers
+            .values()
+            .map(|provider| provider.name.clone())
+            .collect::<HashSet<_>>();
+        let mut entries = fs::read_dir(shim_dir)
+            .with_context(|| format!("Failed to read shim directory '{}'.", shim_dir.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("Failed to list shim directory '{}'.", shim_dir.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if !Self::is_recoverable_shim_file_name(&file_name) {
+                continue;
+            }
+
+            plan.files_scanned += 1;
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(err) => {
+                    plan.files_skipped += 1;
+                    plan.warnings
+                        .push(format!("{}: failed to read shim: {}", file_name, err));
+                    continue;
+                }
+            };
+            let recovered = match Self::parse_recoverable_shim(&file_name, &content) {
+                Ok(profile) => profile,
+                Err(err) => {
+                    plan.files_skipped += 1;
+                    plan.warnings.push(format!("{}: {}", file_name, err));
+                    continue;
+                }
+            };
+            plan.files_recoverable += 1;
+
+            let existing_profile_id = match Self::find_profile_conflict_id(
+                &registry,
+                &recovered.name,
+                Some(&recovered.alias),
+            ) {
+                Ok(id) => id,
+                Err(err) => {
+                    plan.files_skipped += 1;
+                    plan.warnings.push(format!("{}: {}", file_name, err));
+                    continue;
+                }
+            };
+            if existing_profile_id.is_some() && !replace {
+                plan.profiles_conflicted += 1;
+                plan.profiles_conflict.push(format!(
+                    "{} ({}) from {}",
+                    recovered.name, recovered.alias, recovered.file_name
+                ));
+                continue;
+            }
+
+            let existing_profile = existing_profile_id
+                .as_ref()
+                .and_then(|id| registry.profiles.get(id))
+                .cloned();
+            let (provider_id, key_id) = Self::ensure_recovered_provider_key(
+                &mut registry,
+                &mut plan,
+                &mut provider_names,
+                &recovered,
+            );
+            let profile = Self::build_recovered_profile(
+                existing_profile_id.clone(),
+                &recovered,
+                provider_id,
+                key_id,
+                existing_profile.as_ref(),
+            );
+
+            if let Some(id) = existing_profile_id {
+                registry.profiles.insert(id, profile.clone());
+                plan.profiles_updated += 1;
+                plan.profiles_update.push(format!(
+                    "{} ({})",
+                    profile.name,
+                    profile.alias.as_deref().unwrap_or("")
+                ));
+            } else {
+                registry
+                    .profiles
+                    .insert(profile.id.clone(), profile.clone());
+                plan.profiles_added += 1;
+                plan.profiles_add.push(format!(
+                    "{} ({})",
+                    profile.name,
+                    profile.alias.as_deref().unwrap_or("")
+                ));
+            }
+        }
+
+        plan.profiles_add.sort();
+        plan.profiles_update.sort();
+        plan.profiles_conflict.sort();
+        plan.providers_add.sort();
+        plan.provider_keys_add.sort();
+        plan.warnings.sort();
+
+        Ok(ShimRecoveryState { plan, registry })
     }
 
     // ── Provider resolution ─────────────────────────────────────────────────
@@ -2155,10 +3921,8 @@ impl ProfileManager {
 
     #[cfg(not(target_os = "windows"))]
     fn generate_shell_aliases_with_bashrc_d(&self, profiles: &[Profile]) -> Result<String> {
-        use dirs::home_dir;
-
         let aliases_content = self.generate_shell_aliases(profiles)?;
-        let home = home_dir().context("Cannot determine home directory")?;
+        let home = Self::home_dir()?;
         let bashrc_d = home.join(".bashrc.d");
 
         if bashrc_d.exists() && bashrc_d.is_dir() {
@@ -2693,11 +4457,843 @@ impl ProfileManager {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn base_dir(&self) -> PathBuf {
+    pub fn base_dir(&self) -> PathBuf {
         self.registry_path
             .parent()
             .expect("registry path should always live under a base directory")
             .to_path_buf()
+    }
+
+    fn diagnostic(
+        level: DiagnosticLevel,
+        area: impl Into<String>,
+        message: impl Into<String>,
+        hint: Option<String>,
+    ) -> DiagnosticItem {
+        DiagnosticItem {
+            level,
+            area: area.into(),
+            message: message.into(),
+            hint,
+        }
+    }
+
+    fn selected_provider_keys_for_profiles(
+        profiles: &[Profile],
+    ) -> HashMap<String, HashSet<String>> {
+        let mut selected = HashMap::new();
+        for profile in profiles {
+            if let (Some(provider_id), Some(key_id)) = (&profile.provider_id, &profile.key_id) {
+                selected
+                    .entry(provider_id.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(key_id.clone());
+            }
+        }
+        selected
+    }
+
+    fn validate_bundle_references_after_import(
+        registry: &Registry,
+        bundle: &ConfigBundle,
+        replace: bool,
+    ) -> Result<()> {
+        let mut provider_keys: HashMap<String, HashSet<String>> = registry
+            .providers
+            .iter()
+            .map(|(id, provider)| {
+                (
+                    id.clone(),
+                    provider.keys.keys().cloned().collect::<HashSet<_>>(),
+                )
+            })
+            .collect();
+        for provider in &bundle.providers {
+            let keys = provider.keys.keys().cloned().collect::<HashSet<_>>();
+            if replace || !provider_keys.contains_key(&provider.id) {
+                provider_keys.insert(provider.id.clone(), keys);
+            }
+        }
+
+        let mut mcp_ids = registry.mcp_servers.keys().cloned().collect::<HashSet<_>>();
+        for server in &bundle.mcp_servers {
+            mcp_ids.insert(server.id.clone());
+        }
+
+        for profile in &bundle.profiles {
+            if profile.kind != ProfileKind::Lightweight {
+                if profile.provider_id.is_some() || profile.key_id.is_some() {
+                    bail!(
+                        "Imported full profile '{}' cannot reference a provider key.",
+                        profile.name
+                    );
+                }
+                continue;
+            }
+            match (&profile.provider_id, &profile.key_id) {
+                (Some(provider_id), Some(key_id)) => {
+                    let Some(keys) = provider_keys.get(provider_id) else {
+                        bail!(
+                            "Imported profile '{}' references missing provider '{}'.",
+                            profile.name,
+                            provider_id
+                        );
+                    };
+                    if !keys.contains(key_id) {
+                        bail!(
+                            "Imported profile '{}' references missing key '{}' in provider '{}'.",
+                            profile.name,
+                            key_id,
+                            provider_id
+                        );
+                    }
+                }
+                (Some(provider_id), None) => bail!(
+                    "Imported profile '{}' references provider '{}' without a key_id.",
+                    profile.name,
+                    provider_id
+                ),
+                (None, Some(key_id)) => bail!(
+                    "Imported profile '{}' references key '{}' without a provider_id.",
+                    profile.name,
+                    key_id
+                ),
+                (None, None) => {}
+            }
+
+            for mcp_id in &profile.mcp_server_ids {
+                if !mcp_ids.contains(mcp_id) {
+                    bail!(
+                        "Imported profile '{}' references missing MCP '{}'.",
+                        profile.name,
+                        mcp_id
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn registry_backup_path(&self) -> PathBuf {
+        let timestamp = Utc::now().format("%Y%m%d%H%M%S");
+        self.registry_path
+            .with_file_name(format!("registry.json.bak-{timestamp}"))
+    }
+
+    fn is_recoverable_shim_file_name(file_name: &str) -> bool {
+        let lower = file_name.to_ascii_lowercase();
+        (lower.starts_with("claude-") && lower.ends_with(".cmd"))
+            || (lower.starts_with("claude-") && !lower.contains('.'))
+    }
+
+    fn parse_recoverable_shim(file_name: &str, content: &str) -> Result<RecoveredShimProfile> {
+        if !content.contains(CMD_MARKER) && !content.contains(SH_MARKER) {
+            bail!("not a cswitch generated shim");
+        }
+        let alias = Self::alias_from_shim_file_name(file_name)?;
+        let (name, kind) = Self::parse_shim_profile_header(content)
+            .with_context(|| "missing generated profile header".to_string())?;
+        if kind != ProfileKind::Lightweight {
+            bail!("only lightweight shims can be recovered");
+        }
+        let settings = Self::extract_shim_settings(content)
+            .with_context(|| "missing recoverable --settings JSON".to_string())?;
+        let env_object = settings
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .with_context(|| "settings JSON does not contain an env object".to_string())?;
+        let token = Self::json_env_string(env_object, "ANTHROPIC_AUTH_TOKEN")?
+            .with_context(|| "settings env is missing ANTHROPIC_AUTH_TOKEN".to_string())?;
+        let base_url = Self::json_env_string(env_object, "ANTHROPIC_BASE_URL")?
+            .with_context(|| "settings env is missing ANTHROPIC_BASE_URL".to_string())?;
+        let mut extras = Vec::new();
+        for (key, value) in env_object {
+            if Self::known_lightweight_env_key(key) {
+                continue;
+            }
+            if let Some(value) = value.as_str() {
+                extras.push(format!("{key}={value}"));
+            }
+        }
+        extras.sort();
+        let env = LightweightEnv {
+            auth_token: None,
+            base_url: None,
+            default_opus_model: Self::json_env_string(env_object, "ANTHROPIC_DEFAULT_OPUS_MODEL")?,
+            default_sonnet_model: Self::json_env_string(
+                env_object,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            )?,
+            default_haiku_model: Self::json_env_string(
+                env_object,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            )?,
+            model: Self::json_env_string(env_object, "ANTHROPIC_MODEL")?,
+            subagent_model: Self::json_env_string(env_object, "CLAUDE_CODE_SUBAGENT_MODEL")?,
+            extras,
+        };
+        Ok(RecoveredShimProfile {
+            file_name: file_name.to_string(),
+            name,
+            alias,
+            token,
+            base_url,
+            env,
+            launch_args: Self::extract_shim_launch_args(content),
+        })
+    }
+
+    fn alias_from_shim_file_name(file_name: &str) -> Result<String> {
+        let stem = file_name
+            .strip_suffix(".cmd")
+            .or_else(|| file_name.strip_suffix(".CMD"))
+            .unwrap_or(file_name);
+        let alias = stem
+            .strip_prefix("claude-")
+            .with_context(|| format!("shim '{}' does not use the claude- prefix", file_name))?;
+        if alias.trim().is_empty() {
+            bail!("shim '{}' has an empty alias", file_name);
+        }
+        Self::validate_alias(alias)?;
+        Ok(alias.to_string())
+    }
+
+    fn parse_shim_profile_header(content: &str) -> Option<(String, ProfileKind)> {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            let header = trimmed
+                .strip_prefix(":: Profile: ")
+                .or_else(|| trimmed.strip_prefix("# Profile: "));
+            let Some(header) = header else {
+                continue;
+            };
+            let (name, kind) = header.rsplit_once(" (")?;
+            let kind = kind.strip_suffix(')')?;
+            let kind = match kind {
+                "lightweight" => ProfileKind::Lightweight,
+                "full" => ProfileKind::Full,
+                _ => return None,
+            };
+            return Some((name.to_string(), kind));
+        }
+        None
+    }
+
+    fn extract_shim_settings(content: &str) -> Result<serde_json::Value> {
+        let candidates = [
+            Self::extract_cmd_var(content, "_SETTINGS"),
+            Self::extract_cmd_var(content, "_TF_SETTINGS"),
+            Self::extract_legacy_inline_cmd_settings(content),
+            Self::extract_shell_settings_env(content),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate)
+                && value.get("env").is_some()
+            {
+                return Ok(value);
+            }
+        }
+        bail!("no parseable settings JSON found")
+    }
+
+    fn extract_cmd_var(content: &str, var_name: &str) -> Option<String> {
+        let prefix = format!("set \"{var_name}=");
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(value) = line
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix('"'))
+            {
+                return Some(Self::unescape_cmd_json_fragment(value));
+            }
+        }
+        None
+    }
+
+    fn extract_legacy_inline_cmd_settings(content: &str) -> Option<String> {
+        let marker = "claude --settings \"";
+        let start = content.find(marker)? + marker.len();
+        let rest = &content[start..];
+        let end = Self::find_cmd_quoted_value_end(rest)?;
+        Some(Self::unescape_cmd_json_fragment(&rest[..end]))
+    }
+
+    fn find_cmd_quoted_value_end(value: &str) -> Option<usize> {
+        let mut backslashes = 0usize;
+        for (idx, ch) in value.char_indices() {
+            if ch == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            if ch == '"' && backslashes.is_multiple_of(2) {
+                return Some(idx);
+            }
+            backslashes = 0;
+        }
+        None
+    }
+
+    fn extract_shell_settings_env(content: &str) -> Option<String> {
+        for line in content.lines() {
+            let line = line.trim();
+            let Some(value) = line.strip_prefix("SETTINGS_ENV=") else {
+                continue;
+            };
+            let value = value.strip_prefix('\'')?.strip_suffix('\'')?;
+            let mut settings = Self::unescape_shell_single_quoted_value(value);
+            settings.push('}');
+            return Some(settings);
+        }
+        None
+    }
+
+    fn unescape_cmd_json_fragment(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    out.push('"');
+                }
+                '^' => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                '%' if chars.peek() == Some(&'%') => {
+                    chars.next();
+                    out.push('%');
+                }
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
+    fn unescape_shell_single_quoted_value(value: &str) -> String {
+        value.replace("'\\''", "'")
+    }
+
+    fn json_env_string(
+        object: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Result<Option<String>> {
+        match object.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => bail!("settings env field '{}' must be a string", key),
+        }
+    }
+
+    fn known_lightweight_env_key(key: &str) -> bool {
+        matches!(
+            key,
+            "ANTHROPIC_AUTH_TOKEN"
+                | "ANTHROPIC_BASE_URL"
+                | "ANTHROPIC_DEFAULT_OPUS_MODEL"
+                | "ANTHROPIC_DEFAULT_SONNET_MODEL"
+                | "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+                | "ANTHROPIC_MODEL"
+                | "CLAUDE_CODE_SUBAGENT_MODEL"
+        )
+    }
+
+    fn extract_shim_launch_args(content: &str) -> Option<Vec<String>> {
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(value) = line
+                .strip_prefix("set \"_LAUNCH_ARGS=")
+                .and_then(|value| value.strip_suffix('"'))
+            {
+                return Some(Self::split_recovered_launch_args(value));
+            }
+        }
+        None
+    }
+
+    fn split_recovered_launch_args(value: &str) -> Vec<String> {
+        value
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn find_profile_conflict_id(
+        registry: &Registry,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<Option<String>> {
+        let by_name = registry
+            .profiles
+            .iter()
+            .find(|(_, profile)| profile.name == name)
+            .map(|(id, _)| id.clone());
+        let by_alias = alias.and_then(|alias| {
+            registry
+                .profiles
+                .iter()
+                .find(|(_, profile)| profile.alias.as_deref() == Some(alias))
+                .map(|(id, _)| id.clone())
+        });
+        match (by_name, by_alias) {
+            (Some(left), Some(right)) if left != right => bail!(
+                "name '{}' and alias '{}' match different existing profiles",
+                name,
+                alias.unwrap_or_default()
+            ),
+            (Some(id), _) | (_, Some(id)) => Ok(Some(id)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn ensure_recovered_provider_key(
+        registry: &mut Registry,
+        plan: &mut ShimRecoveryPlan,
+        provider_names: &mut HashSet<String>,
+        recovered: &RecoveredShimProfile,
+    ) -> (String, String) {
+        if let Some((provider_id, key_id)) = Self::find_provider_key_by_url_and_token(
+            registry,
+            &recovered.base_url,
+            &recovered.token,
+        ) {
+            plan.provider_keys_reused += 1;
+            return (provider_id, key_id);
+        }
+
+        let provider_id = if let Some((id, _)) = registry
+            .providers
+            .iter()
+            .find(|(_, provider)| provider.base_url == recovered.base_url)
+        {
+            id.clone()
+        } else {
+            let id = Self::new_unique_provider_id(registry);
+            let name = Self::unique_recovered_provider_name(provider_names, &recovered.base_url);
+            registry.providers.insert(
+                id.clone(),
+                Provider {
+                    id: id.clone(),
+                    name: name.clone(),
+                    base_url: recovered.base_url.clone(),
+                    keys: HashMap::new(),
+                    api_key: String::new(),
+                },
+            );
+            plan.providers_added += 1;
+            plan.providers_add
+                .push(format!("{} ({})", name, recovered.base_url));
+            id
+        };
+
+        let key_id = Self::new_unique_key_id(
+            registry
+                .providers
+                .get(&provider_id)
+                .expect("provider was just created or found"),
+        );
+        let key_name = Self::unique_recovered_key_name(
+            registry
+                .providers
+                .get(&provider_id)
+                .expect("provider was just created or found"),
+            &recovered.alias,
+        );
+        let provider = registry
+            .providers
+            .get_mut(&provider_id)
+            .expect("provider was just created or found");
+        provider.keys.insert(
+            key_id.clone(),
+            ProviderKey {
+                id: key_id.clone(),
+                name: key_name.clone(),
+                api_key: recovered.token.clone(),
+            },
+        );
+        plan.provider_keys_added += 1;
+        plan.provider_keys_add.push(format!(
+            "{} / {} from {}",
+            provider.name, key_name, recovered.file_name
+        ));
+        (provider_id, key_id)
+    }
+
+    fn find_provider_key_by_url_and_token(
+        registry: &Registry,
+        base_url: &str,
+        token: &str,
+    ) -> Option<(String, String)> {
+        for (provider_id, provider) in &registry.providers {
+            if provider.base_url != base_url {
+                continue;
+            }
+            for (key_id, key) in &provider.keys {
+                if key.api_key == token {
+                    return Some((provider_id.clone(), key_id.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn new_unique_provider_id(registry: &Registry) -> String {
+        loop {
+            let id = format!("prov_{}", &Uuid::new_v4().to_string()[..8]);
+            if !registry.providers.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn new_unique_key_id(provider: &Provider) -> String {
+        loop {
+            let id = format!("key_{}", &Uuid::new_v4().to_string()[..8]);
+            if !provider.keys.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn unique_recovered_provider_name(names: &mut HashSet<String>, base_url: &str) -> String {
+        let mut base = "Recovered provider".to_string();
+        if let Some(host) = Self::host_from_url(base_url)
+            && !host.is_empty()
+        {
+            base = format!("Recovered {host}");
+        }
+        let mut candidate = base.clone();
+        let mut index = 2usize;
+        while names.contains(&candidate) {
+            candidate = format!("{base} {index}");
+            index += 1;
+        }
+        names.insert(candidate.clone());
+        candidate
+    }
+
+    fn host_from_url(url: &str) -> Option<String> {
+        let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+        let authority = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?;
+        let host = authority.split(':').next()?.trim();
+        if host.is_empty() {
+            None
+        } else {
+            Some(host.to_string())
+        }
+    }
+
+    fn unique_recovered_key_name(provider: &Provider, alias: &str) -> String {
+        let base = format!("Recovered {alias}");
+        let names = provider
+            .keys
+            .values()
+            .map(|key| key.name.as_str())
+            .collect::<HashSet<_>>();
+        if !names.contains(base.as_str()) {
+            return base;
+        }
+        let mut index = 2usize;
+        loop {
+            let candidate = format!("{base} {index}");
+            if !names.contains(candidate.as_str()) {
+                return candidate;
+            }
+            index += 1;
+        }
+    }
+
+    fn build_recovered_profile(
+        existing_id: Option<String>,
+        recovered: &RecoveredShimProfile,
+        provider_id: String,
+        key_id: String,
+        existing: Option<&Profile>,
+    ) -> Profile {
+        Profile {
+            id: existing_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            name: recovered.name.clone(),
+            alias: Some(recovered.alias.clone()),
+            added: existing
+                .map(|profile| profile.added)
+                .unwrap_or_else(Utc::now),
+            last_used: existing.and_then(|profile| profile.last_used),
+            kind: ProfileKind::Lightweight,
+            env: Some(recovered.env.clone()),
+            launch_args: recovered.launch_args.clone(),
+            provider_id: Some(provider_id),
+            key_id: Some(key_id),
+            mcp_server_ids: existing
+                .map(|profile| profile.mcp_server_ids.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn selected_mcp_servers_in_registry(
+        registry: &Registry,
+        queries: &[String],
+        all: bool,
+    ) -> Result<Vec<McpServer>> {
+        let mut servers = Vec::new();
+        if all || queries.is_empty() {
+            servers.extend(registry.mcp_servers.values().cloned());
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            for query in queries {
+                let (id, server) = Self::find_mcp_server_in_registry(registry, query)?;
+                if seen.insert(id) {
+                    servers.push(server);
+                }
+            }
+        }
+        servers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        Ok(servers)
+    }
+
+    fn mcp_issue(
+        level: DiagnosticLevel,
+        server: &McpServer,
+        message: impl Into<String>,
+        hint: Option<String>,
+    ) -> McpValidationIssue {
+        McpValidationIssue {
+            level,
+            server_id: server.id.clone(),
+            server_name: server.name.clone(),
+            message: message.into(),
+            hint,
+        }
+    }
+
+    fn validate_mcp_server_config(server: &McpServer) -> Vec<McpValidationIssue> {
+        let mut issues = Vec::new();
+        if server.name.trim().is_empty() {
+            issues.push(Self::mcp_issue(
+                DiagnosticLevel::Error,
+                server,
+                "name is empty",
+                Some("rename or recreate this MCP server".to_string()),
+            ));
+        }
+
+        let server_type = server.server_type.trim().to_ascii_lowercase();
+        match server_type.as_str() {
+            "stdio" => {
+                if server
+                    .command
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    issues.push(Self::mcp_issue(
+                        DiagnosticLevel::Error,
+                        server,
+                        "stdio server is missing command",
+                        Some("set --command for this MCP server".to_string()),
+                    ));
+                } else if let Some(command) = &server.command
+                    && !Self::looks_like_variable(command)
+                    && !Self::command_exists(command)
+                {
+                    issues.push(Self::mcp_issue(
+                        DiagnosticLevel::Warn,
+                        server,
+                        format!("command '{}' is not currently on PATH", command),
+                        Some(
+                            "install the command or rely on Claude-time environment setup"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                if server.url.is_some() {
+                    issues.push(Self::mcp_issue(
+                        DiagnosticLevel::Warn,
+                        server,
+                        "stdio server also has a URL field",
+                        Some("remove --url unless this is intentional metadata".to_string()),
+                    ));
+                }
+                if let Some(cwd) = &server.cwd
+                    && !Self::looks_like_variable(cwd)
+                    && !Path::new(cwd).exists()
+                {
+                    issues.push(Self::mcp_issue(
+                        DiagnosticLevel::Warn,
+                        server,
+                        format!("cwd '{}' does not exist", cwd),
+                        Some("create the directory or update --cwd".to_string()),
+                    ));
+                }
+            }
+            "http" | "streamable-http" | "sse" => {
+                if server
+                    .url
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    issues.push(Self::mcp_issue(
+                        DiagnosticLevel::Error,
+                        server,
+                        format!("{} server is missing URL", server_type),
+                        Some("set --url for this MCP server".to_string()),
+                    ));
+                }
+                if server.command.is_some() || !server.args.is_empty() || server.cwd.is_some() {
+                    issues.push(Self::mcp_issue(
+                        DiagnosticLevel::Warn,
+                        server,
+                        "remote server has stdio-only fields",
+                        Some(
+                            "clear command, args, and cwd unless they are intentional metadata"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                if server_type == "sse" {
+                    issues.push(Self::mcp_issue(
+                        DiagnosticLevel::Warn,
+                        server,
+                        "sse transport is deprecated",
+                        Some(
+                            "prefer streamable-http when the remote server supports it".to_string(),
+                        ),
+                    ));
+                }
+            }
+            _ => issues.push(Self::mcp_issue(
+                DiagnosticLevel::Error,
+                server,
+                format!("type '{}' is invalid", server.server_type),
+                Some("use stdio, http, streamable-http, or sse".to_string()),
+            )),
+        }
+
+        for field in [&server.env, &server.headers] {
+            if field.keys().any(|key| key.trim().is_empty()) {
+                issues.push(Self::mcp_issue(
+                    DiagnosticLevel::Error,
+                    server,
+                    "env or header map contains an empty key",
+                    Some("remove the empty key from this MCP server".to_string()),
+                ));
+            }
+        }
+        if server.timeout == Some(0) {
+            issues.push(Self::mcp_issue(
+                DiagnosticLevel::Warn,
+                server,
+                "timeout is 0 ms",
+                Some("set a positive timeout or clear the timeout field".to_string()),
+            ));
+        }
+        if server.disabled == Some(true) {
+            issues.push(Self::mcp_issue(
+                DiagnosticLevel::Warn,
+                server,
+                "server is disabled",
+                Some(
+                    "clear disabled or set it to false before expecting tools to load".to_string(),
+                ),
+            ));
+        }
+        issues
+    }
+
+    fn looks_like_variable(value: &str) -> bool {
+        value.contains("${") || value.contains('%')
+    }
+
+    fn command_exists(command: &str) -> bool {
+        let command = command.trim();
+        if command.is_empty() {
+            return false;
+        }
+        if command.contains('/') || command.contains('\\') {
+            return Path::new(command).is_file();
+        }
+        let Some(paths) = env::var_os("PATH") else {
+            return false;
+        };
+
+        #[cfg(target_os = "windows")]
+        {
+            let has_extension = Path::new(command).extension().is_some();
+            let pathext = env::var_os("PATHEXT")
+                .map(|value| {
+                    value
+                        .to_string_lossy()
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|values| !values.is_empty())
+                .unwrap_or_else(|| {
+                    vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()]
+                });
+            for dir in env::split_paths(&paths) {
+                if dir.join(command).is_file() {
+                    return true;
+                }
+                if !has_extension {
+                    for ext in &pathext {
+                        if dir.join(format!("{command}{ext}")).is_file() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            for dir in env::split_paths(&paths) {
+                if dir.join(command).is_file() {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn read_profile_marker(path: &Path) -> Result<Option<String>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read project marker '{}'.", path.display()))?;
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                return Ok(Some(line.to_string()));
+            }
+        }
+        bail!(
+            "Project marker '{}' does not contain a profile name.",
+            path.display()
+        )
+    }
+
+    fn managed_entry_names(dir: &Path, predicate: fn(&str) -> bool) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
+            .filter(|name| predicate(name))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn count_named_entries(dir: &Path, predicate: fn(&str) -> bool) -> usize {
+        Self::managed_entry_names(dir, predicate).len()
     }
 
     fn generated_root_dir(&self) -> PathBuf {
@@ -3161,8 +5757,13 @@ impl ProfileManager {
 
     #[cfg(target_os = "windows")]
     fn cmd_bin_dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        Ok(home.join(".local").join("bin"))
+        let home = Self::home_dir()?;
+        Ok(Self::cmd_bin_dir_for_home(&home))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cmd_bin_dir_for_home(home: &Path) -> PathBuf {
+        home.join(".local").join("bin")
     }
 
     fn build_sh_settings_env_prefix(
@@ -3402,8 +6003,13 @@ impl ProfileManager {
 
     #[cfg(not(target_os = "windows"))]
     fn sh_bin_dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        Ok(home.join(".varusers").join("bin"))
+        let home = Self::home_dir()?;
+        Ok(Self::sh_bin_dir_for_home(&home))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn sh_bin_dir_for_home(home: &Path) -> PathBuf {
+        home.join(".varusers").join("bin")
     }
 
     fn run_local_command(program: &str, args: &[&str]) -> Result<String> {
@@ -4629,6 +7235,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn home_dir_layout_keeps_registry_and_generated_shims_under_same_root() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ProfileManager::new_in_home_dir(tmp.path()).unwrap();
+
+        assert_eq!(mgr.base_dir(), tmp.path().join(".claude-switch"));
+        assert_eq!(
+            mgr.registry_path,
+            tmp.path().join(".claude-switch").join("registry.json")
+        );
+        assert_eq!(
+            mgr.profiles_dir,
+            tmp.path().join(".claude-switch").join("profiles")
+        );
+        assert!(mgr.profiles_dir.exists());
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            ProfileManager::cmd_bin_dir_for_home(tmp.path()),
+            tmp.path().join(".local").join("bin")
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            ProfileManager::sh_bin_dir_for_home(tmp.path()),
+            tmp.path().join(".varusers").join("bin")
+        );
+    }
+
     fn make_claude_dir(root: &Path) -> PathBuf {
         let dir = root.to_path_buf();
         fs::create_dir_all(&dir).unwrap();
@@ -5611,6 +8246,145 @@ mod tests {
     }
 
     #[test]
+    fn recover_shims_parses_legacy_cmd_and_groups_provider_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let shim_dir = tmp.path().join("shims");
+        fs::create_dir_all(&shim_dir).unwrap();
+        let shim = r#"@echo off
+setlocal
+:: Generated by cswitch (claude-switch) — do not edit manually
+:: Profile: 芒果-deepseek (lightweight)
+set "_LAUNCH_ARGS=--dangerously-skip-permissions"
+:launch
+if defined _E (claude --settings "{\"env\":{\"ANTHROPIC_AUTH_TOKEN\":\"sk-mango\",\"ANTHROPIC_BASE_URL\":\"https://aigc-llm.mgtv.com\",\"ANTHROPIC_DEFAULT_HAIKU_MODEL\":\"deepseek-v4-flash[1m]\",\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"deepseek-v4-pro[1m]\",\"ANTHROPIC_DEFAULT_SONNET_MODEL\":\"deepseek-v4-pro[1m]\",\"ANTHROPIC_MODEL\":\"deepseek-v4-pro[1m]\",\"CLAUDE_CODE_SUBAGENT_MODEL\":\"qwen3.7-max[1m]\",\"EXTRA_FLAG\":\"yes\"}}" %_LAUNCH_ARGS%!_R!)
+"#;
+        fs::write(shim_dir.join("claude-mg-ds.cmd"), shim).unwrap();
+
+        let plan = mgr.plan_shim_recovery(&shim_dir, false).unwrap();
+        assert_eq!(plan.files_scanned, 1);
+        assert_eq!(plan.files_recoverable, 1);
+        assert_eq!(plan.profiles_added, 1);
+        assert_eq!(plan.providers_added, 1);
+        assert_eq!(plan.provider_keys_added, 1);
+
+        let summary = mgr.recover_shims(&shim_dir, false).unwrap();
+        assert_eq!(summary.plan.profiles_added, 1);
+        assert!(summary.backup_path.is_none());
+
+        let registry = mgr.load_registry().unwrap();
+        assert_eq!(registry.profiles.len(), 1);
+        assert_eq!(registry.providers.len(), 1);
+        let profile = registry.profiles.values().next().unwrap();
+        assert_eq!(profile.name, "芒果-deepseek");
+        assert_eq!(profile.alias.as_deref(), Some("mg-ds"));
+        assert_eq!(
+            profile.launch_args.as_deref(),
+            Some(&vec!["--dangerously-skip-permissions".to_string()][..])
+        );
+        let env = profile.env.as_ref().unwrap();
+        assert_eq!(env.auth_token, None);
+        assert_eq!(env.base_url, None);
+        assert_eq!(env.model.as_deref(), Some("deepseek-v4-pro[1m]"));
+        assert_eq!(env.subagent_model.as_deref(), Some("qwen3.7-max[1m]"));
+        assert_eq!(env.extras, vec!["EXTRA_FLAG=yes"]);
+        let provider = registry
+            .providers
+            .get(profile.provider_id.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(provider.base_url, "https://aigc-llm.mgtv.com");
+        let key = provider.keys.get(profile.key_id.as_ref().unwrap()).unwrap();
+        assert_eq!(key.api_key, "sk-mango");
+    }
+
+    #[test]
+    fn recover_shims_parses_current_cmd_settings_variable() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let profile = Profile {
+            id: Uuid::new_v4().to_string(),
+            name: "current".into(),
+            alias: Some("cur".into()),
+            added: Utc::now(),
+            last_used: None,
+            kind: ProfileKind::Lightweight,
+            env: Some(LightweightEnv {
+                auth_token: Some("sk-current".into()),
+                base_url: Some("https://current.example.invalid".into()),
+                model: Some("current-model".into()),
+                ..Default::default()
+            }),
+            launch_args: Some(vec!["--dangerously-skip-permissions".into()]),
+            provider_id: None,
+            key_id: None,
+            mcp_server_ids: Vec::new(),
+        };
+        let content = mgr.generate_cmd_content(&profile).unwrap();
+        let recovered = ProfileManager::parse_recoverable_shim("claude-cur.cmd", &content).unwrap();
+        assert_eq!(recovered.name, "current");
+        assert_eq!(recovered.alias, "cur");
+        assert_eq!(recovered.token, "sk-current");
+        assert_eq!(recovered.base_url, "https://current.example.invalid");
+        assert_eq!(recovered.env.model.as_deref(), Some("current-model"));
+        assert_eq!(
+            recovered.launch_args.as_deref(),
+            Some(&vec!["--dangerously-skip-permissions".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn recover_shims_parses_shell_settings_env() {
+        let content = r#"#!/usr/bin/env bash
+# Generated by cswitch (claude-switch) — do not edit manually
+# Profile: shell profile (lightweight)
+SETTINGS_ENV='{"env":{"ANTHROPIC_AUTH_TOKEN":"sk-shell","ANTHROPIC_BASE_URL":"https://shell.example.invalid","ANTHROPIC_MODEL":"shell-model"}'
+BASE_SETTINGS="${SETTINGS_ENV}"'}'
+exec claude "${SETTINGS_ARG[@]}"
+"#;
+        let recovered =
+            ProfileManager::parse_recoverable_shim("claude-shell-prof", content).unwrap();
+        assert_eq!(recovered.name, "shell profile");
+        assert_eq!(recovered.alias, "shell-prof");
+        assert_eq!(recovered.token, "sk-shell");
+        assert_eq!(recovered.base_url, "https://shell.example.invalid");
+        assert_eq!(recovered.env.model.as_deref(), Some("shell-model"));
+    }
+
+    #[test]
+    fn recover_shims_conflicts_until_replace() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        mgr.create_lightweight_profile("existing", Some("ex"), LightweightEnv::default())
+            .unwrap();
+        let shim_dir = tmp.path().join("shims");
+        fs::create_dir_all(&shim_dir).unwrap();
+        fs::write(
+            shim_dir.join("claude-ex.cmd"),
+            r#"@echo off
+:: Generated by cswitch (claude-switch) — do not edit manually
+:: Profile: existing (lightweight)
+claude --settings "{\"env\":{\"ANTHROPIC_AUTH_TOKEN\":\"sk-replace\",\"ANTHROPIC_BASE_URL\":\"https://replace.example.invalid\",\"ANTHROPIC_MODEL\":\"replace-model\"}}"
+"#,
+        )
+        .unwrap();
+
+        let plan = mgr.plan_shim_recovery(&shim_dir, false).unwrap();
+        assert_eq!(plan.profiles_conflicted, 1);
+        assert!(mgr.recover_shims(&shim_dir, false).is_err());
+
+        let summary = mgr.recover_shims(&shim_dir, true).unwrap();
+        assert_eq!(summary.plan.profiles_updated, 1);
+        assert!(summary.backup_path.is_some());
+        let (_, profile) = mgr.find_profile("ex").unwrap();
+        assert_eq!(
+            profile.env.as_ref().unwrap().model.as_deref(),
+            Some("replace-model")
+        );
+        assert!(profile.provider_id.is_some());
+        assert!(profile.key_id.is_some());
+    }
+
+    #[test]
     fn remote_path_join_matches_target_os_separator() {
         assert_eq!(
             ProfileManager::join_remote_path(
@@ -6493,6 +9267,459 @@ mod tests {
             config["mcpServers"]["github"]["alwaysLoad"].as_bool(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn mcp_export_import_and_replace_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "github".into(),
+                server_type: "stdio".into(),
+                command: Some("npx".into()),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                always_load: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let exported = mgr
+            .export_mcp_config(std::slice::from_ref(&server.id), false)
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(
+            config["mcpServers"]["github"]["command"].as_str(),
+            Some("npx")
+        );
+
+        let other_tmp = TempDir::new().unwrap();
+        let other = make_manager(&other_tmp);
+        let imported = other.import_mcp_config(&exported, false).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].name, "github");
+        assert_eq!(
+            imported[0].args,
+            vec!["-y", "@modelcontextprotocol/server-github"]
+        );
+
+        let replacement = serde_json::json!({
+            "mcpServers": {
+                "github": {
+                    "type": "stdio",
+                    "command": "node",
+                    "args": ["server.js"]
+                }
+            }
+        });
+        other
+            .import_mcp_config(&replacement.to_string(), true)
+            .unwrap();
+        let updated = other.get_mcp_server("github").unwrap();
+        assert_eq!(updated.command.as_deref(), Some("node"));
+        assert_eq!(updated.args, vec!["server.js"]);
+    }
+
+    #[test]
+    fn mcp_validate_reports_missing_runtime_command() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let command = format!("missing-cswitch-command-{}", Uuid::new_v4());
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "missing".into(),
+                server_type: "stdio".into(),
+                command: Some(command.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let issues = mgr
+            .validate_mcp_servers(std::slice::from_ref(&server.id), false)
+            .unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.level == DiagnosticLevel::Warn
+                    && issue.message.contains(&command))
+        );
+    }
+
+    #[test]
+    fn inspect_config_counts_registry_and_generated_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "filesystem".into(),
+                server_type: "stdio".into(),
+                command: Some("npx".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let lite = mgr
+            .create_lightweight_profile("lite", Some("lite-inspect"), LightweightEnv::default())
+            .unwrap();
+        let linked = mgr
+            .set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+            .unwrap();
+        let servers = mgr.profile_mcp_servers(&linked).unwrap();
+        mgr.upsert_local_profile_mcp_plugin(&linked, &servers)
+            .unwrap();
+
+        let inspection = mgr.inspect_config().unwrap();
+        assert_eq!(inspection.profiles, 1);
+        assert_eq!(inspection.lightweight_profiles, 1);
+        assert_eq!(inspection.mcp_servers, 1);
+        assert_eq!(inspection.linked_mcp_refs, 1);
+        assert_eq!(inspection.generated_mcp_plugins, 1);
+    }
+
+    #[test]
+    fn doctor_reports_stale_mcp_plugin_state() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "filesystem".into(),
+                server_type: "stdio".into(),
+                command: Some("npx".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let lite = mgr
+            .create_lightweight_profile("lite", Some("lite-doctor"), LightweightEnv::default())
+            .unwrap();
+        mgr.set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+            .unwrap();
+        let report = mgr.doctor_report().unwrap();
+        assert!(report.items.iter().any(|item| {
+            item.level == DiagnosticLevel::Warn
+                && item.area == "mcp"
+                && item.message.contains("artifacts have not been generated")
+        }));
+    }
+
+    #[test]
+    fn resolve_project_profile_reads_parent_marker() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let profile = mgr
+            .create_lightweight_profile("project profile", Some("proj"), LightweightEnv::default())
+            .unwrap();
+        let project_dir = tmp.path().join("project");
+        let nested_dir = project_dir.join("src").join("bin");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::write(project_dir.join(".cswitch-profile"), "proj\n").unwrap();
+
+        let selected = mgr
+            .resolve_project_profile(&nested_dir)
+            .unwrap()
+            .expect("marker should select profile");
+        assert_eq!(selected.id, profile.id);
+        assert!(mgr.resolve_project_profile(tmp.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn statusline_info_reports_profile_provider_and_mcps() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let provider = mgr
+            .add_provider_with_key_name(
+                "OpenRouter",
+                "https://openrouter.example.invalid/api",
+                "Team",
+                "sk-test",
+            )
+            .unwrap();
+        let key_id = provider.keys.keys().next().cloned().unwrap();
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "filesystem".into(),
+                server_type: "stdio".into(),
+                command: Some("npx".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let profile = mgr
+            .create_lightweight_profile("work", Some("wrk"), LightweightEnv::default())
+            .unwrap();
+        mgr.set_provider(&profile.id, &provider.id, &key_id)
+            .unwrap();
+        mgr.set_profile_mcps(&profile.id, std::slice::from_ref(&server.id))
+            .unwrap();
+
+        let info = mgr.statusline_info(Some("wrk"), None).unwrap();
+        assert_eq!(info.profile_name.as_deref(), Some("work"));
+        assert_eq!(info.profile_alias.as_deref(), Some("wrk"));
+        assert_eq!(info.provider_name.as_deref(), Some("OpenRouter"));
+        assert_eq!(info.key_name.as_deref(), Some("Team"));
+        assert_eq!(info.mcp_names, vec!["filesystem"]);
+        assert!(!info.project_marker);
+
+        let project_dir = tmp.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join(".cswitch-profile"), "wrk\n").unwrap();
+        let project_info = mgr.statusline_info(None, Some(&project_dir)).unwrap();
+        assert_eq!(project_info.profile_name.as_deref(), Some("work"));
+        assert!(project_info.project_marker);
+    }
+
+    #[test]
+    fn config_bundle_export_redacts_secrets_and_imports_with_replace() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let provider = mgr
+            .add_provider_with_key_name(
+                "Provider",
+                "https://provider.example.invalid",
+                "Default",
+                "secret-key",
+            )
+            .unwrap();
+        let key_id = provider.keys.keys().next().cloned().unwrap();
+        let mut mcp_env = HashMap::new();
+        mcp_env.insert("GITHUB_TOKEN".into(), "ghp-secret-token".into());
+        mcp_env.insert("TOKENIZERS_PARALLELISM".into(), "false".into());
+        let mut mcp_headers = HashMap::new();
+        mcp_headers.insert("Authorization".into(), "Bearer mcp-header-secret".into());
+        mcp_headers.insert("X-Mode".into(), "portable".into());
+        let server = mgr
+            .add_mcp_server(McpServerInput {
+                name: "github".into(),
+                server_type: "stdio".into(),
+                command: Some("npx".into()),
+                env: mcp_env,
+                headers: mcp_headers,
+                oauth: Some(serde_json::json!({
+                    "clientId": "client-id",
+                    "clientSecret": "oauth-secret",
+                    "scopes": ["read", "write"]
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        let profile = mgr
+            .create_lightweight_profile(
+                "bundle",
+                Some("bun"),
+                LightweightEnv {
+                    auth_token: Some("profile-secret".into()),
+                    base_url: Some("https://provider.example.invalid".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        mgr.set_provider(&profile.id, &provider.id, &key_id)
+            .unwrap();
+        mgr.set_profile_mcps(&profile.id, std::slice::from_ref(&server.id))
+            .unwrap();
+
+        let redacted = mgr.export_config_bundle(&[], false).unwrap();
+        assert!(!redacted.contains("secret-key"));
+        assert!(!redacted.contains("profile-secret"));
+        assert!(!redacted.contains("ghp-secret-token"));
+        assert!(!redacted.contains("mcp-header-secret"));
+        assert!(!redacted.contains("oauth-secret"));
+        let bundle: ConfigBundle = serde_json::from_str(&redacted).unwrap();
+        assert!(!bundle.secrets_included);
+        assert_eq!(bundle.profiles.len(), 1);
+        assert_eq!(
+            bundle.providers[0].keys.values().next().unwrap().api_key,
+            ""
+        );
+        assert_eq!(bundle.mcp_servers[0].env["GITHUB_TOKEN"], "");
+        assert_eq!(bundle.mcp_servers[0].env["TOKENIZERS_PARALLELISM"], "false");
+        assert_eq!(bundle.mcp_servers[0].headers["Authorization"], "");
+        assert_eq!(bundle.mcp_servers[0].headers["X-Mode"], "portable");
+        assert_eq!(
+            bundle.mcp_servers[0].oauth.as_ref().unwrap()["clientSecret"].as_str(),
+            Some("")
+        );
+        assert_eq!(
+            bundle.mcp_servers[0].oauth.as_ref().unwrap()["clientId"].as_str(),
+            Some("client-id")
+        );
+
+        let with_secrets = mgr.export_config_bundle(&[], true).unwrap();
+        assert!(with_secrets.contains("secret-key"));
+        assert!(with_secrets.contains("ghp-secret-token"));
+        assert!(with_secrets.contains("mcp-header-secret"));
+        assert!(with_secrets.contains("oauth-secret"));
+
+        let other_tmp = TempDir::new().unwrap();
+        let other = make_manager(&other_tmp);
+        let plan = other
+            .plan_config_bundle_import(&with_secrets, false)
+            .unwrap();
+        assert_eq!(plan.summary.profiles_added, 1);
+        assert_eq!(plan.summary.providers_added, 1);
+        assert_eq!(plan.summary.mcp_servers_added, 1);
+        assert_eq!(plan.profiles_add.len(), 1);
+        assert!(plan.profiles_update.is_empty());
+        assert!(other.list_profiles().unwrap().is_empty());
+
+        let summary = other.import_config_bundle(&with_secrets, false).unwrap();
+        assert_eq!(summary.profiles_added, 1);
+        assert_eq!(summary.providers_added, 1);
+        assert_eq!(summary.mcp_servers_added, 1);
+        assert_eq!(other.list_profiles().unwrap()[0].name, "bundle");
+
+        let plan = other
+            .plan_config_bundle_import(&with_secrets, true)
+            .unwrap();
+        assert_eq!(plan.summary.profiles_updated, 1);
+        assert_eq!(plan.summary.providers_updated, 1);
+        assert_eq!(plan.summary.mcp_servers_updated, 1);
+        assert!(plan.profiles_add.is_empty());
+        assert_eq!(plan.profiles_update.len(), 1);
+
+        let conflict_plan = other
+            .plan_config_bundle_import(&with_secrets, false)
+            .unwrap();
+        assert_eq!(conflict_plan.conflict_count(), 3);
+        assert_eq!(conflict_plan.summary.profiles_conflicted, 1);
+        assert_eq!(conflict_plan.summary.providers_conflicted, 1);
+        assert_eq!(conflict_plan.summary.mcp_servers_conflicted, 1);
+        assert!(
+            other
+                .import_config_bundle(&with_secrets, false)
+                .unwrap_err()
+                .to_string()
+                .contains("Use --replace")
+        );
+
+        let summary = other.import_config_bundle(&with_secrets, true).unwrap();
+        assert_eq!(summary.profiles_updated, 1);
+        assert_eq!(summary.providers_updated, 1);
+        assert_eq!(summary.mcp_servers_updated, 1);
+
+        let redacted_from_other = other.export_config_bundle(&[], false).unwrap();
+        other
+            .import_config_bundle(&redacted_from_other, true)
+            .unwrap();
+        let preserved_provider = other.get_provider(&provider.id).unwrap();
+        assert_eq!(
+            preserved_provider
+                .keys
+                .get(&key_id)
+                .map(|key| key.api_key.as_str()),
+            Some("secret-key")
+        );
+        let preserved_mcp = other.get_mcp_server(&server.id).unwrap();
+        assert_eq!(
+            preserved_mcp.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("ghp-secret-token")
+        );
+        assert_eq!(
+            preserved_mcp
+                .env
+                .get("TOKENIZERS_PARALLELISM")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            preserved_mcp
+                .headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer mcp-header-secret")
+        );
+        assert_eq!(
+            preserved_mcp.headers.get("X-Mode").map(String::as_str),
+            Some("portable")
+        );
+        assert_eq!(
+            preserved_mcp.oauth.as_ref().unwrap()["clientSecret"].as_str(),
+            Some("oauth-secret")
+        );
+
+        let scoped = mgr
+            .export_config_bundle(std::slice::from_ref(&profile.id), false)
+            .unwrap();
+        let scoped_bundle: ConfigBundle = serde_json::from_str(&scoped).unwrap();
+        assert_eq!(scoped_bundle.profiles.len(), 1);
+        assert_eq!(scoped_bundle.providers.len(), 1);
+        assert_eq!(scoped_bundle.mcp_servers.len(), 1);
+        assert_eq!(scoped_bundle.profiles[0].id, profile.id);
+        assert_eq!(scoped_bundle.providers[0].keys.len(), 1);
+        assert!(scoped_bundle.providers[0].keys.contains_key(&key_id));
+
+        let validation = mgr.validate_config_bundle(&scoped).unwrap();
+        assert_eq!(validation.profiles, 1);
+        assert_eq!(validation.error_count(), 0);
+    }
+
+    #[test]
+    fn scoped_config_export_includes_only_selected_provider_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let provider = mgr
+            .add_provider_with_key_name(
+                "Shared",
+                "https://shared.example.invalid",
+                "Team A",
+                "secret-a",
+            )
+            .unwrap();
+        let key_a = provider.keys.keys().next().cloned().unwrap();
+        let key_b = mgr.add_key(&provider.id, "Team B", "secret-b").unwrap().id;
+        let first = mgr
+            .create_lightweight_profile("first", Some("first"), LightweightEnv::default())
+            .unwrap();
+        let second = mgr
+            .create_lightweight_profile("second", Some("second"), LightweightEnv::default())
+            .unwrap();
+        mgr.set_provider(&first.id, &provider.id, &key_a).unwrap();
+        mgr.set_provider(&second.id, &provider.id, &key_b).unwrap();
+
+        let scoped = mgr
+            .export_config_bundle(std::slice::from_ref(&first.id), true)
+            .unwrap();
+        assert!(scoped.contains("secret-a"));
+        assert!(!scoped.contains("secret-b"));
+        let bundle: ConfigBundle = serde_json::from_str(&scoped).unwrap();
+        assert_eq!(bundle.providers.len(), 1);
+        assert_eq!(bundle.providers[0].keys.len(), 1);
+        assert!(bundle.providers[0].keys.contains_key(&key_a));
+        assert!(!bundle.providers[0].keys.contains_key(&key_b));
+    }
+
+    #[test]
+    fn config_import_rejects_profiles_with_missing_provider_references() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let bundle = ConfigBundle {
+            schema: "https://github.com/m2selfA/claude-switch/config-bundle/v1".into(),
+            exported_at: Utc::now(),
+            profiles: vec![Profile {
+                id: Uuid::new_v4().to_string(),
+                name: "broken".into(),
+                alias: Some("broken".into()),
+                added: Utc::now(),
+                last_used: None,
+                kind: ProfileKind::Lightweight,
+                env: Some(LightweightEnv::default()),
+                launch_args: None,
+                provider_id: Some("missing-provider".into()),
+                key_id: Some("missing-key".into()),
+                mcp_server_ids: Vec::new(),
+            }],
+            providers: Vec::new(),
+            mcp_servers: Vec::new(),
+            secrets_included: true,
+        };
+        let content = serde_json::to_string(&bundle).unwrap();
+
+        let err = mgr
+            .plan_config_bundle_import(&content, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing provider"), "{err}");
+        let err = mgr
+            .import_config_bundle(&content, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing provider"), "{err}");
+        assert!(mgr.load_registry().unwrap().profiles.is_empty());
     }
 
     #[test]
