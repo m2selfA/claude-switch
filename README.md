@@ -13,7 +13,7 @@ Two isolation modes:
 ### Cargo (requires Rust)
 
 ```bash
-cargo install cswitch --version 0.7.10
+cargo install cswitch --version 0.8.0
 ```
 
 ### Pre-built binaries
@@ -100,6 +100,7 @@ cswitch
 | `cswitch provider add-key <provider-id> --name <name> --key <key>` | Add another key to a provider |
 | `cswitch provider edit <provider-id> [--name <name>] [--url <url>]` | Edit a provider's name or base URL |
 | `cswitch provider edit-key <provider-id> <key-id> [--name <name>] [--key <key>]` | Edit a provider key's name or token |
+| `cswitch provider rename-key <provider-id> <key-id> --name <name>` | Rename a provider key without changing its token |
 | `cswitch provider remove <provider-id>` | Remove a provider |
 | `cswitch provider remove-key <provider-id> <key-id>` | Remove a key from a provider |
 | `cswitch provider link <profile> --provider <provider-id> --key <key-id>` | Link a lightweight profile to a provider key |
@@ -138,11 +139,11 @@ Run `cswitch` with no arguments to open the TUI.
 | `e` | Edit profile (name/alias/flags, or full model editor for lite) |
 | `m` | Toggle [1m] suffix on model slots |
 | `Tab` | Move to the next field, or complete/cycle values in model/provider editing flows |
-| `Ctrl+P/N` | Move between fields in multi-step forms; in model test, also browse fetched models when the model field is focused |
+| `Ctrl+P/N` | Move between fields in multi-step forms; in model test, Up/Down browse fetched models when the model field is focused |
 | `Ctrl+A/E/B/F` | Move cursor in text fields |
 | `Ctrl+H/D/K/U/W` | Edit text in Emacs style |
 | `Ctrl+G` | Cancel or go back |
-| `Shift+Tab` | Switch between Profile Manager, Provider Manager, and MCP Manager |
+| `Shift+Tab` | Switch managers from manager/search/provider-key-list views |
 | `r` | Refresh — re-copy ~/.claude into selected |
 | `d` | Delete selected profile |
 | `?` | Help overlay |

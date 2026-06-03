@@ -1,0 +1,275 @@
+use super::*;
+use std::collections::HashMap;
+
+impl ProfileManager {
+    pub(super) fn normalize_mcp_server_type(server_type: &str) -> Result<String> {
+        let value = server_type.trim();
+        let normalized = if value.is_empty() { "stdio" } else { value }.to_ascii_lowercase();
+        match normalized.as_str() {
+            "stdio" | "http" | "streamable-http" | "sse" => Ok(normalized),
+            _ => bail!(
+                "MCP type '{}' is invalid. Use stdio, http, streamable-http, or sse.",
+                server_type
+            ),
+        }
+    }
+
+    fn normalize_optional_string(value: Option<String>) -> Option<String> {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn json_object_field<'a>(
+        object: &'a serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Option<&'a serde_json::Map<String, serde_json::Value>>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Object(value)) => Ok(Some(value)),
+            Some(_) => bail!("MCP '{}' field '{}' must be an object.", mcp_name, field),
+        }
+    }
+
+    fn json_string_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Option<String>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => {
+                Ok(Self::normalize_optional_string(Some(value.clone())))
+            }
+            Some(_) => bail!("MCP '{}' field '{}' must be a string.", mcp_name, field),
+        }
+    }
+
+    fn json_string_vec_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Vec<String>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .map(|value| match value {
+                    serde_json::Value::String(value) => Ok(value.clone()),
+                    _ => bail!("MCP '{}' field '{}' must contain strings.", mcp_name, field),
+                })
+                .collect(),
+            Some(_) => bail!("MCP '{}' field '{}' must be an array.", mcp_name, field),
+        }
+    }
+
+    fn json_string_map_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<HashMap<String, String>> {
+        let mut map = HashMap::new();
+        let Some(values) = Self::json_object_field(object, field, mcp_name)? else {
+            return Ok(map);
+        };
+        for (key, value) in values {
+            if key.trim().is_empty() {
+                bail!("MCP '{}' field '{}' has an empty key.", mcp_name, field);
+            }
+            let serde_json::Value::String(value) = value else {
+                bail!(
+                    "MCP '{}' field '{}' values must be strings.",
+                    mcp_name,
+                    field
+                );
+            };
+            map.insert(key.clone(), value.clone());
+        }
+        Ok(map)
+    }
+
+    fn json_bool_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Option<bool>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+            Some(_) => bail!("MCP '{}' field '{}' must be a boolean.", mcp_name, field),
+        }
+    }
+
+    fn json_u64_field(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        mcp_name: &str,
+    ) -> Result<Option<u64>> {
+        match object.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Number(value)) => value
+                .as_u64()
+                .with_context(|| {
+                    format!(
+                        "MCP '{}' field '{}' must be a non-negative integer.",
+                        mcp_name, field
+                    )
+                })
+                .map(Some),
+            Some(_) => bail!("MCP '{}' field '{}' must be a number.", mcp_name, field),
+        }
+    }
+
+    pub(super) fn mcp_server_input_from_config(
+        name: &str,
+        value: &serde_json::Value,
+    ) -> Result<McpServerInput> {
+        let Some(object) = value.as_object() else {
+            bail!("MCP '{}' must be an object.", name);
+        };
+        let server_type =
+            Self::json_string_field(object, "type", name)?.unwrap_or_else(default_mcp_server_type);
+        let oauth = match object.get("oauth") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.clone()),
+        };
+        Ok(McpServerInput {
+            name: name.to_string(),
+            server_type,
+            command: Self::json_string_field(object, "command", name)?,
+            args: Self::json_string_vec_field(object, "args", name)?,
+            env: Self::json_string_map_field(object, "env", name)?,
+            cwd: Self::json_string_field(object, "cwd", name)?,
+            url: Self::json_string_field(object, "url", name)?,
+            headers: Self::json_string_map_field(object, "headers", name)?,
+            oauth,
+            headers_helper: Self::json_string_field(object, "headersHelper", name)?,
+            timeout: Self::json_u64_field(object, "timeout", name)?,
+            always_load: Self::json_bool_field(object, "alwaysLoad", name)?,
+            disabled: Self::json_bool_field(object, "disabled", name)?,
+        })
+    }
+
+    pub(super) fn build_mcp_server(id: String, input: McpServerInput) -> Result<McpServer> {
+        let name = input.name.trim().to_string();
+        if name.is_empty() {
+            bail!("MCP name cannot be empty.");
+        }
+        let server_type = Self::normalize_mcp_server_type(&input.server_type)?;
+        let command = Self::normalize_optional_string(input.command);
+        let cwd = Self::normalize_optional_string(input.cwd);
+        let url = Self::normalize_optional_string(input.url);
+        let headers_helper = Self::normalize_optional_string(input.headers_helper);
+        match server_type.as_str() {
+            "stdio" if command.is_none() => {
+                bail!("MCP '{}' uses stdio and requires a command.", name);
+            }
+            "http" | "streamable-http" | "sse" if url.is_none() => {
+                bail!("MCP '{}' uses {} and requires a URL.", name, server_type);
+            }
+            _ => {}
+        }
+
+        Ok(McpServer {
+            id,
+            name,
+            server_type,
+            command,
+            args: input.args,
+            env: input.env,
+            cwd,
+            url,
+            headers: input.headers,
+            oauth: input.oauth,
+            headers_helper,
+            timeout: input.timeout,
+            always_load: input.always_load,
+            disabled: input.disabled,
+        })
+    }
+
+    fn mcp_server_config_value(server: &McpServer) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "type".into(),
+            serde_json::Value::String(server.server_type.clone()),
+        );
+        if let Some(command) = &server.command {
+            object.insert("command".into(), serde_json::Value::String(command.clone()));
+        }
+        if !server.args.is_empty() {
+            object.insert("args".into(), serde_json::json!(server.args));
+        }
+        if !server.env.is_empty() {
+            object.insert("env".into(), serde_json::json!(server.env));
+        }
+        if let Some(cwd) = &server.cwd {
+            object.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+        }
+        if let Some(url) = &server.url {
+            object.insert("url".into(), serde_json::Value::String(url.clone()));
+        }
+        if !server.headers.is_empty() {
+            object.insert("headers".into(), serde_json::json!(server.headers));
+        }
+        if let Some(oauth) = &server.oauth {
+            object.insert("oauth".into(), oauth.clone());
+        }
+        if let Some(headers_helper) = &server.headers_helper {
+            object.insert(
+                "headersHelper".into(),
+                serde_json::Value::String(headers_helper.clone()),
+            );
+        }
+        if let Some(timeout) = server.timeout {
+            object.insert("timeout".into(), serde_json::json!(timeout));
+        }
+        if let Some(always_load) = server.always_load {
+            object.insert("alwaysLoad".into(), serde_json::json!(always_load));
+        }
+        if let Some(disabled) = server.disabled {
+            object.insert("disabled".into(), serde_json::json!(disabled));
+        }
+        serde_json::Value::Object(object)
+    }
+
+    pub(super) fn profile_mcp_servers(&self, profile: &Profile) -> Result<Vec<McpServer>> {
+        if profile.mcp_server_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if profile.kind != ProfileKind::Lightweight {
+            bail!("MCP servers can only be linked to lightweight profiles.");
+        }
+        let registry = self.load_registry()?;
+        let mut servers = Vec::new();
+        for mcp_id in &profile.mcp_server_ids {
+            let server = registry.mcp_servers.get(mcp_id).with_context(|| {
+                format!(
+                    "Profile '{}' references missing MCP '{}'.",
+                    profile.name, mcp_id
+                )
+            })?;
+            servers.push(server.clone());
+        }
+        Ok(servers)
+    }
+
+    pub(super) fn profile_mcp_config(servers: &[McpServer]) -> Result<String> {
+        let mut mcp_servers = serde_json::Map::new();
+        for server in servers {
+            if mcp_servers.contains_key(&server.name) {
+                bail!(
+                    "Duplicate MCP server name '{}' in profile selection.",
+                    server.name
+                );
+            }
+            mcp_servers.insert(server.name.clone(), Self::mcp_server_config_value(server));
+        }
+        let root = serde_json::json!({
+            "$schema": "https://json.schemastore.org/claude-code-settings.json",
+            "mcpServers": mcp_servers,
+        });
+        serde_json::to_string_pretty(&root).context("Failed to serialize MCP config JSON")
+    }
+}
