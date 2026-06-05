@@ -2,6 +2,24 @@ use super::*;
 use std::collections::HashMap;
 
 impl ProfileManager {
+    pub(crate) fn parse_mcp_smart_paste_inputs(raw: &str) -> Result<Vec<McpServerInput>> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            bail!("MCP JSON is empty.");
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(primary_err) => {
+                let wrapped = format!("{{{trimmed}}}");
+                serde_json::from_str(&wrapped)
+                    .with_context(|| format!("Failed to parse MCP JSON: {primary_err}"))?
+            }
+        };
+
+        Self::mcp_server_inputs_from_paste_value(&value)
+    }
+
     pub(super) fn normalize_mcp_server_type(server_type: &str) -> Result<String> {
         let value = server_type.trim();
         let normalized = if value.is_empty() { "stdio" } else { value }.to_ascii_lowercase();
@@ -119,6 +137,66 @@ impl ProfileManager {
                 .map(Some),
             Some(_) => bail!("MCP '{}' field '{}' must be a number.", mcp_name, field),
         }
+    }
+
+    fn looks_like_direct_mcp_server(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+        object.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "name"
+                    | "type"
+                    | "command"
+                    | "args"
+                    | "env"
+                    | "cwd"
+                    | "url"
+                    | "headers"
+                    | "oauth"
+                    | "headersHelper"
+                    | "timeout"
+                    | "alwaysLoad"
+                    | "disabled"
+            )
+        })
+    }
+
+    fn mcp_server_inputs_from_named_map(
+        object: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<McpServerInput>> {
+        if object.is_empty() {
+            bail!("MCP JSON does not contain any servers.");
+        }
+
+        object
+            .iter()
+            .map(|(name, value)| Self::mcp_server_input_from_config(name, value))
+            .collect()
+    }
+
+    fn mcp_server_inputs_from_paste_value(
+        value: &serde_json::Value,
+    ) -> Result<Vec<McpServerInput>> {
+        let Some(object) = value.as_object() else {
+            bail!("MCP JSON must be an object.");
+        };
+
+        if let Some(servers) = object.get("mcpServers").and_then(|value| value.as_object()) {
+            return Self::mcp_server_inputs_from_named_map(servers);
+        }
+
+        if Self::looks_like_direct_mcp_server(object) {
+            let name = Self::json_string_field(object, "name", "imported-mcp")?
+                .unwrap_or_else(|| "imported-mcp".to_string());
+            return Ok(vec![Self::mcp_server_input_from_config(&name, value)?]);
+        }
+
+        if object.values().all(serde_json::Value::is_object) {
+            return Self::mcp_server_inputs_from_named_map(object);
+        }
+
+        bail!(
+            "Paste a single MCP server object, a named MCP entry, or an object containing mcpServers."
+        )
     }
 
     pub(super) fn mcp_server_input_from_config(

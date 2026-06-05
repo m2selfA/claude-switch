@@ -73,6 +73,72 @@ impl ProfileManager {
         Ok(server)
     }
 
+    pub(crate) fn import_mcp_servers_skip_existing(
+        &self,
+        inputs: Vec<McpServerInput>,
+    ) -> Result<McpSmartPasteImportResult> {
+        let mut registry = self.load_registry()?;
+        let mut pending = Vec::new();
+        let mut skipped_existing = Vec::new();
+        let existing_names = registry
+            .mcp_servers
+            .values()
+            .map(|server| server.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut pending_names = std::collections::HashSet::new();
+
+        for input in inputs {
+            let candidate_name = input.name.trim().to_string();
+            if existing_names.contains(&candidate_name) {
+                skipped_existing.push(candidate_name);
+                continue;
+            }
+
+            let id = loop {
+                let id = format!("mcp_{}", &Uuid::new_v4().to_string()[..8]);
+                if !registry.mcp_servers.contains_key(&id)
+                    && pending.iter().all(|(pending_id, _)| pending_id != &id)
+                {
+                    break id;
+                }
+            };
+
+            let server = Self::build_mcp_server(id.clone(), input)?;
+            if !pending_names.insert(server.name.clone()) {
+                bail!("MCP '{}' is duplicated in pasted JSON.", server.name);
+            }
+            Self::check_mcp_name_unique_in_registry(&registry, "", &server.name)?;
+            pending.push((id, server));
+        }
+
+        if pending.is_empty() {
+            skipped_existing.sort();
+            skipped_existing.dedup();
+            return Ok(McpSmartPasteImportResult {
+                imported: Vec::new(),
+                skipped_existing,
+            });
+        }
+
+        for (id, server) in &pending {
+            registry.mcp_servers.insert(id.clone(), server.clone());
+        }
+        self.save_registry(&registry)?;
+
+        let mut imported = pending
+            .into_iter()
+            .map(|(_, server)| server)
+            .collect::<Vec<_>>();
+        imported.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        skipped_existing.sort();
+        skipped_existing.dedup();
+
+        Ok(McpSmartPasteImportResult {
+            imported,
+            skipped_existing,
+        })
+    }
+
     pub fn update_mcp_server(&self, query: &str, update: McpServerUpdate) -> Result<McpServer> {
         let (id, existing) = self.find_mcp_server(query)?;
         let mut registry = self.load_registry()?;

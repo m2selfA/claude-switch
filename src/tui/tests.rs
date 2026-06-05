@@ -59,6 +59,13 @@ fn make_test_app() -> TestApp {
     }
 }
 
+fn line_text(line: &Line) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {
     let mut request = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -188,6 +195,81 @@ fn smart_paste_parses_opencat_url() {
     assert_eq!(parsed.key_name, "Default");
     assert_eq!(parsed.base_url, base_url);
     assert_eq!(parsed.api_key, api_key);
+}
+
+#[test]
+fn mcp_smart_paste_parses_single_named_fragment() {
+    let parsed = parse_mcp_smart_paste(
+        r#"
+        "grok-search": {
+          "command": "grok-search",
+          "env": {
+            "GROK_MODEL": "grok-4.20-multi-agent-xhigh"
+          },
+          "type": "stdio"
+        }
+        "#,
+    )
+    .unwrap();
+
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].name, "grok-search");
+    assert_eq!(parsed[0].command.as_deref(), Some("grok-search"));
+    assert_eq!(
+        parsed[0].env.get("GROK_MODEL").map(String::as_str),
+        Some("grok-4.20-multi-agent-xhigh")
+    );
+}
+
+#[test]
+fn mcp_smart_paste_parses_full_mcp_servers_block() {
+    let parsed = parse_mcp_smart_paste(
+        r#"
+        {
+          "mcpServers": {
+            "github": {
+              "type": "http",
+              "url": "https://api.githubcopilot.com/mcp/"
+            },
+            "tavily": {
+              "type": "http",
+              "url": "https://tavily.ivanli.cc/mcp"
+            }
+          }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut names = parsed
+        .into_iter()
+        .map(|input| input.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec!["github", "tavily"]);
+}
+
+#[test]
+fn mcp_smart_paste_keeps_direct_server_object_support() {
+    let parsed = parse_mcp_smart_paste(
+        r#"
+        {
+          "name": "filesystem",
+          "type": "stdio",
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+        }
+        "#,
+    )
+    .unwrap();
+
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].name, "filesystem");
+    assert_eq!(parsed[0].command.as_deref(), Some("npx"));
+    assert_eq!(
+        parsed[0].args,
+        vec!["-y", "@modelcontextprotocol/server-filesystem"]
+    );
 }
 
 #[test]
@@ -1811,6 +1893,58 @@ fn mcp_profile_picker_filter_accepts_bare_j_and_k() {
 }
 
 #[test]
+fn profile_details_show_linked_mcp_names() {
+    let app = make_test_app();
+    let github = app
+        .manager
+        .add_mcp_server(McpServerInput {
+            name: "github".into(),
+            server_type: "stdio".into(),
+            command: Some("github-mcp".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let filesystem = app
+        .manager
+        .add_mcp_server(McpServerInput {
+            name: "filesystem".into(),
+            server_type: "stdio".into(),
+            command: Some("filesystem-mcp".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let profile = app
+        .manager
+        .create_lightweight_profile("lite", Some("lite-mcp-details"), LightweightEnv::default())
+        .unwrap();
+    let updated = app
+        .manager
+        .set_profile_mcps(&profile.id, &[github.id.clone(), filesystem.id.clone()])
+        .unwrap();
+
+    let section = app.profile_mcp_section_lines(&updated).unwrap();
+    let lines = section.iter().map(line_text).collect::<Vec<_>>();
+
+    assert_eq!(lines[0], "");
+    assert!(lines[1].contains("MCP Servers"));
+    assert!(lines.iter().any(|line| line.contains("filesystem")));
+    assert!(lines.iter().any(|line| line.contains("github")));
+    assert!(lines[2].contains("filesystem"));
+    assert!(lines[3].contains("github"));
+}
+
+#[test]
+fn profile_details_hide_empty_mcp_section() {
+    let app = make_test_app();
+    let profile = app
+        .manager
+        .create_lightweight_profile("lite", Some("lite-empty"), LightweightEnv::default())
+        .unwrap();
+
+    assert!(app.profile_mcp_section_lines(&profile).is_none());
+}
+
+#[test]
 fn mcp_editor_adds_stdio_server() {
     let mut app = make_test_app();
     app.reset_mcp_editor();
@@ -1825,6 +1959,63 @@ fn mcp_editor_adds_stdio_server() {
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].name, "codex-sessions");
     assert_eq!(servers[0].command.as_deref(), Some("codex-sessions-mcp"));
+}
+
+#[test]
+fn mcp_smart_paste_imports_multiple_servers_and_reports_skips() {
+    let mut app = make_test_app();
+    app.manager
+        .add_mcp_server(McpServerInput {
+            name: "github".into(),
+            server_type: "stdio".into(),
+            command: Some("existing-github".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    app.mode = Mode::McpSmartPaste;
+    app.mcp_oauth_buf = r#"
+    {
+      "mcpServers": {
+        "github": {
+          "type": "stdio",
+          "command": "replacement-should-skip"
+        },
+        "grok-search": {
+          "type": "stdio",
+          "command": "grok-search"
+        },
+        "tavily": {
+          "type": "http",
+          "url": "https://tavily.ivanli.cc/mcp"
+        }
+      }
+    }
+    "#
+    .into();
+    app.cursor_pos = app.mcp_oauth_buf.len();
+
+    app.handle_mcp_smart_paste(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    let servers = app.manager.list_mcp_servers().unwrap();
+    assert_eq!(servers.len(), 3);
+    assert_eq!(
+        app.manager
+            .get_mcp_server("github")
+            .unwrap()
+            .command
+            .as_deref(),
+        Some("existing-github")
+    );
+    assert!(servers.iter().any(|server| server.name == "grok-search"));
+    assert!(servers.iter().any(|server| server.name == "tavily"));
+    assert_eq!(
+        app.mode,
+        Mode::Message(
+            "Imported 2 MCP(s); skipped 1 existing: github.".into(),
+            false
+        )
+    );
 }
 
 #[test]

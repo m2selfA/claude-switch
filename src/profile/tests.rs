@@ -2355,6 +2355,48 @@ fn mcp_export_import_and_replace_round_trip() {
 }
 
 #[test]
+fn smart_paste_import_skip_existing_is_atomic_for_other_errors() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    mgr.add_mcp_server(McpServerInput {
+        name: "github".into(),
+        server_type: "stdio".into(),
+        command: Some("existing-github".into()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let inputs = ProfileManager::parse_mcp_smart_paste_inputs(
+        r#"
+        {
+          "mcpServers": {
+            "github": {
+              "type": "stdio",
+              "command": "replacement-should-skip"
+            },
+            "broken": {
+              "type": "stdio"
+            },
+            "tavily": {
+              "type": "http",
+              "url": "https://tavily.ivanli.cc/mcp"
+            }
+          }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let err = mgr.import_mcp_servers_skip_existing(inputs).unwrap_err();
+    assert!(err.to_string().contains("broken"));
+
+    let servers = mgr.list_mcp_servers().unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, "github");
+    assert_eq!(servers[0].command.as_deref(), Some("existing-github"));
+}
+
+#[test]
 fn mcp_validate_reports_missing_runtime_command() {
     let tmp = TempDir::new().unwrap();
     let mgr = make_manager(&tmp);

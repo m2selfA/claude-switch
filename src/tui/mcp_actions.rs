@@ -381,16 +381,18 @@ impl App {
         match code {
             _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
             KeyCode::Enter => match parse_mcp_smart_paste(&self.mcp_oauth_buf) {
-                Ok(input) => match self.manager.add_mcp_server(input) {
-                    Ok(server) => {
+                Ok(inputs) => match self.manager.import_mcp_servers_skip_existing(inputs) {
+                    Ok(result) => {
                         self.sync_shims();
                         self.mcps_cache = self.manager.list_mcp_servers().unwrap_or_default();
-                        if let Some(idx) = self.mcps_cache.iter().position(|m| m.id == server.id) {
+                        if let Some(server) = result.imported.first()
+                            && let Some(idx) =
+                                self.mcps_cache.iter().position(|m| m.id == server.id)
+                        {
                             self.mcp_list_state.select(Some(idx));
                         }
                         self.refresh_mcp_profile_links();
-                        self.mode =
-                            Mode::Message(format!("MCP '{}' imported.", server.name), false);
+                        self.mode = Mode::Message(Self::mcp_smart_paste_summary(&result), false);
                     }
                     Err(error) => self.mode = Mode::Message(error.to_string(), true),
                 },
@@ -407,6 +409,36 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn mcp_smart_paste_summary(result: &crate::profile::McpSmartPasteImportResult) -> String {
+        let skipped_preview = |names: &[String]| {
+            let preview = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            if names.len() > 3 {
+                format!("{preview}, +{} more", names.len() - 3)
+            } else {
+                preview
+            }
+        };
+
+        match (
+            result.imported.as_slice(),
+            result.skipped_existing.as_slice(),
+        ) {
+            ([server], []) => format!("MCP '{}' imported.", server.name),
+            ([], skipped) => format!(
+                "Skipped {} existing MCP(s): {}.",
+                skipped.len(),
+                skipped_preview(skipped)
+            ),
+            (imported, []) => format!("Imported {} MCP(s).", imported.len()),
+            (imported, skipped) => format!(
+                "Imported {} MCP(s); skipped {} existing: {}.",
+                imported.len(),
+                skipped.len(),
+                skipped_preview(skipped)
+            ),
+        }
     }
 
     pub(super) fn handle_confirm_delete_mcp(&mut self, code: KeyCode) -> Result<()> {

@@ -428,7 +428,7 @@ impl App {
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Paste a single server object, or an object with mcpServers containing one server.",
+                "  Paste one MCP object, a named MCP fragment, or a full mcpServers block.",
                 Style::default().fg(DIM),
             )),
             Line::from(""),

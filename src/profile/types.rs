@@ -82,6 +82,12 @@ pub struct McpServerUpdate {
     pub disabled: Option<Option<bool>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct McpSmartPasteImportResult {
+    pub imported: Vec<McpServer>,
+    pub skipped_existing: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticLevel {

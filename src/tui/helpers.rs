@@ -73,85 +73,8 @@ pub(super) fn entries_to_map(entries: &[String], field: &str) -> Result<HashMap<
     Ok(map)
 }
 
-pub(super) fn parse_mcp_smart_paste(raw: &str) -> Result<McpServerInput> {
-    let value: serde_json::Value = serde_json::from_str(raw.trim())?;
-    if let Some(servers) = value.get("mcpServers").and_then(|value| value.as_object()) {
-        if servers.len() != 1 {
-            bail!("Import expects exactly one mcpServers entry.");
-        }
-        let (name, config) = servers.iter().next().expect("len checked above");
-        return mcp_input_from_json(name, config);
-    }
-    let name = value
-        .get("name")
-        .and_then(|value| value.as_str())
-        .unwrap_or("imported-mcp");
-    mcp_input_from_json(name, &value)
-}
-
-fn mcp_input_from_json(name: &str, value: &serde_json::Value) -> Result<McpServerInput> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("MCP JSON must be an object."))?;
-    let server_type = object
-        .get("type")
-        .and_then(|value| value.as_str())
-        .unwrap_or("stdio")
-        .to_string();
-    let args = object
-        .get("args")
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(McpServerInput {
-        name: name.to_string(),
-        server_type,
-        command: object
-            .get("command")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        args,
-        env: json_string_map(object.get("env"))?,
-        cwd: object
-            .get("cwd")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        url: object
-            .get("url")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        headers: json_string_map(object.get("headers"))?,
-        oauth: object.get("oauth").cloned(),
-        headers_helper: object
-            .get("headersHelper")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        timeout: object.get("timeout").and_then(|value| value.as_u64()),
-        always_load: object.get("alwaysLoad").and_then(|value| value.as_bool()),
-        disabled: object.get("disabled").and_then(|value| value.as_bool()),
-    })
-}
-
-fn json_string_map(value: Option<&serde_json::Value>) -> Result<HashMap<String, String>> {
-    let Some(value) = value else {
-        return Ok(HashMap::new());
-    };
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("Expected an object with string values."))?;
-    let mut map = HashMap::new();
-    for (key, value) in object {
-        let Some(value) = value.as_str() else {
-            bail!("Value for '{}' must be a string.", key);
-        };
-        map.insert(key.clone(), value.to_string());
-    }
-    Ok(map)
+pub(super) fn parse_mcp_smart_paste(raw: &str) -> Result<Vec<McpServerInput>> {
+    ProfileManager::parse_mcp_smart_paste_inputs(raw)
 }
 
 pub(super) fn replace_last_word(s: &str, replacement: &str) -> String {

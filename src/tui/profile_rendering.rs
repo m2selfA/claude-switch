@@ -196,103 +196,87 @@ impl App {
                 },
                 Style::default().fg(Color::Rgb(140, 200, 140)),
             )));
-        } else if let Some(ref env) = profile.env {
-            if let Some(ref pid) = profile.provider_id
-                && let Ok(provider) = self.manager.get_provider(pid)
-            {
-                let prov_label = format!("{} ({})", provider.name, provider.id);
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "  ─── Provider ─────────────────────────────",
-                    Style::default().fg(BORDER),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled("  Provider     ", Style::default().fg(DIM)),
-                    Span::styled(prov_label, Style::default().fg(ACCENT)),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("  Base URL     ", Style::default().fg(DIM)),
-                    Span::styled(
-                        provider.base_url,
-                        Style::default().fg(Color::Rgb(140, 200, 140)),
-                    ),
-                ]));
-                if let Some(ref kid) = profile.key_id
-                    && let Some(k) = provider.keys.get(kid)
+        } else {
+            if let Some(ref env) = profile.env {
+                if let Some(ref pid) = profile.provider_id
+                    && let Ok(provider) = self.manager.get_provider(pid)
                 {
+                    let prov_label = format!("{} ({})", provider.name, provider.id);
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "  ─── Provider ─────────────────────────────",
+                        Style::default().fg(BORDER),
+                    )));
+                    lines.push(Line::from(""));
                     lines.push(Line::from(vec![
-                        Span::styled("  Key          ", Style::default().fg(DIM)),
+                        Span::styled("  Provider     ", Style::default().fg(DIM)),
+                        Span::styled(prov_label, Style::default().fg(ACCENT)),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  Base URL     ", Style::default().fg(DIM)),
                         Span::styled(
-                            format!("{} ({})", k.name, k.id),
-                            Style::default().fg(ACCENT),
+                            provider.base_url,
+                            Style::default().fg(Color::Rgb(140, 200, 140)),
                         ),
                     ]));
+                    if let Some(ref kid) = profile.key_id
+                        && let Some(k) = provider.keys.get(kid)
+                    {
+                        lines.push(Line::from(vec![
+                            Span::styled("  Key          ", Style::default().fg(DIM)),
+                            Span::styled(
+                                format!("{} ({})", k.name, k.id),
+                                Style::default().fg(ACCENT),
+                            ),
+                        ]));
+                    }
                 }
-            }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  ─── Env Vars ───────────────────────────",
-                Style::default().fg(BORDER),
-            )));
-            lines.push(Line::from(""));
-            if let Some(ref u) = env.base_url {
-                lines.push(Line::from(vec![
-                    Span::styled("  Base URL     ", Style::default().fg(DIM)),
-                    Span::styled(u, Style::default().fg(Color::Rgb(140, 200, 140))),
-                ]));
-            }
-            if let Some(ref m) = env.default_opus_model {
-                lines.push(Line::from(vec![
-                    Span::styled("  Opus model   ", Style::default().fg(DIM)),
-                    Span::styled(m, Style::default().fg(TEXT)),
-                ]));
-            }
-            if let Some(ref m) = env.default_sonnet_model {
-                lines.push(Line::from(vec![
-                    Span::styled("  Sonnet model ", Style::default().fg(DIM)),
-                    Span::styled(m, Style::default().fg(TEXT)),
-                ]));
-            }
-            if let Some(ref m) = env.default_haiku_model {
-                lines.push(Line::from(vec![
-                    Span::styled("  Haiku model  ", Style::default().fg(DIM)),
-                    Span::styled(m, Style::default().fg(TEXT)),
-                ]));
-            }
-            if let Some(ref m) = env.model {
-                lines.push(Line::from(vec![
-                    Span::styled("  Model        ", Style::default().fg(DIM)),
-                    Span::styled(m, Style::default().fg(TEXT)),
-                ]));
-            }
-            if let Some(ref m) = env.subagent_model {
-                lines.push(Line::from(vec![
-                    Span::styled("  Subagent     ", Style::default().fg(DIM)),
-                    Span::styled(m, Style::default().fg(TEXT)),
-                ]));
-            }
-
-            if !profile.mcp_server_ids.is_empty() {
-                let mcp_names = self
-                    .manager
-                    .list_mcp_servers()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|mcp| profile.mcp_server_ids.iter().any(|id| id == &mcp.id))
-                    .map(|mcp| mcp.name)
-                    .collect::<Vec<_>>();
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "  ─── MCP Servers ───────────────────────",
+                    "  ─── Env Vars ───────────────────────────",
                     Style::default().fg(BORDER),
                 )));
-                for name in mcp_names {
+                lines.push(Line::from(""));
+                if let Some(ref u) = env.base_url {
                     lines.push(Line::from(vec![
-                        Span::styled("  MCP          ", Style::default().fg(DIM)),
-                        Span::styled(name, Style::default().fg(ACCENT)),
+                        Span::styled("  Base URL     ", Style::default().fg(DIM)),
+                        Span::styled(u, Style::default().fg(Color::Rgb(140, 200, 140))),
                     ]));
                 }
+                if let Some(ref m) = env.default_opus_model {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Opus model   ", Style::default().fg(DIM)),
+                        Span::styled(m, Style::default().fg(TEXT)),
+                    ]));
+                }
+                if let Some(ref m) = env.default_sonnet_model {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Sonnet model ", Style::default().fg(DIM)),
+                        Span::styled(m, Style::default().fg(TEXT)),
+                    ]));
+                }
+                if let Some(ref m) = env.default_haiku_model {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Haiku model  ", Style::default().fg(DIM)),
+                        Span::styled(m, Style::default().fg(TEXT)),
+                    ]));
+                }
+                if let Some(ref m) = env.model {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Model        ", Style::default().fg(DIM)),
+                        Span::styled(m, Style::default().fg(TEXT)),
+                    ]));
+                }
+                if let Some(ref m) = env.subagent_model {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Subagent     ", Style::default().fg(DIM)),
+                        Span::styled(m, Style::default().fg(TEXT)),
+                    ]));
+                }
+            }
+
+            if let Some(mcp_lines) = self.profile_mcp_section_lines(profile) {
+                lines.extend(mcp_lines);
             }
 
             lines.push(Line::from(""));
@@ -324,6 +308,40 @@ impl App {
         }
 
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    pub(super) fn profile_mcp_section_lines(&self, profile: &Profile) -> Option<Vec<Line<'_>>> {
+        if profile.kind != ProfileKind::Lightweight || profile.mcp_server_ids.is_empty() {
+            return None;
+        }
+
+        let mut mcp_names = self
+            .manager
+            .list_mcp_servers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|mcp| profile.mcp_server_ids.iter().any(|id| id == &mcp.id))
+            .map(|mcp| mcp.name)
+            .collect::<Vec<_>>();
+        mcp_names.sort();
+        if mcp_names.is_empty() {
+            return None;
+        }
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  ─── MCP Servers ───────────────────────",
+                Style::default().fg(BORDER),
+            )),
+        ];
+        for name in mcp_names {
+            lines.push(Line::from(vec![
+                Span::styled("  MCP          ", Style::default().fg(DIM)),
+                Span::styled(name, Style::default().fg(ACCENT)),
+            ]));
+        }
+        Some(lines)
     }
 
     pub(super) fn render_add_name_popup(&self, f: &mut Frame) {
