@@ -327,6 +327,64 @@ impl App {
         Ok(())
     }
 
+    pub(super) fn start_public_site_process_switch(&mut self) -> Result<()> {
+        let Some(result) = self
+            .public_site_results
+            .get(
+                self.public_site_result_selected
+                    .min(self.public_site_results.len().saturating_sub(1)),
+            )
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        let profile = match self.manager.get_profile(&result.profile_id) {
+            Ok(profile) => profile,
+            Err(_) => {
+                self.show_message(
+                    format!(
+                        "Profile '{}' is no longer available for process switching.",
+                        result.profile_name
+                    ),
+                    true,
+                    Some(Mode::PublicSiteResults),
+                );
+                return Ok(());
+            }
+        };
+        let (Some(provider_id), Some(key_id)) = (&profile.provider_id, &profile.key_id) else {
+            self.show_message(
+                format!(
+                    "Profile '{}' uses inline credentials; process switch requires a provider/key link.",
+                    profile.name
+                ),
+                true,
+                Some(Mode::PublicSiteResults),
+            );
+            return Ok(());
+        };
+        let provider = self.manager.get_provider(provider_id)?;
+        if crate::profile::is_local_runtime_base_url(&provider.base_url) {
+            self.show_message(
+                format!(
+                    "Profile '{}' uses a local/self-hosted API; local/self-hosted lite profiles launch directly, use an inline apiKeyHelper, and cannot use dynamic hot switch.",
+                    profile.name
+                ),
+                true,
+                Some(Mode::PublicSiteResults),
+            );
+            return Ok(());
+        }
+
+        self.provider_test_model_buf = result.model;
+        self.start_process_switch_picker(
+            provider_id.clone(),
+            key_id.clone(),
+            Mode::PublicSiteResults,
+        )
+    }
+
     pub(super) fn handle_public_site_prompt(
         &mut self,
         code: KeyCode,
@@ -372,6 +430,12 @@ impl App {
 
         if let Some(slot) = public_site_provider_test_slot_from_key(code, modifiers) {
             self.start_public_site_provider_test(slot)?;
+            return Ok(());
+        }
+        if matches!(code, KeyCode::Char('S'))
+            && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT)
+        {
+            self.start_public_site_process_switch()?;
             return Ok(());
         }
 

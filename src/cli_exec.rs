@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
@@ -6,15 +7,33 @@ use std::io::{self, Write};
 
 mod config;
 mod mcp;
+mod process;
 mod provider;
 
 use crate::cli_output::{
     print_config_bundle_validation, print_config_import_plan, print_config_import_summary,
-    print_config_inspection, print_doctor_report, print_mcp_validation, print_shim_recovery_plan,
-    print_shim_recovery_summary, render_statusline, write_or_print,
+    print_config_inspection, print_doctor_report, print_global_settings, print_mcp_validation,
+    print_shim_recovery_plan, print_shim_recovery_summary, render_statusline, write_or_print,
 };
 use crate::cli_parse::{parse_key_values, parse_optional_json, render_shell_hook};
-use crate::profile::{LightweightEnv, ProfileManager, fetch_models};
+use crate::profile::{
+    LaunchOptions, LightweightEnv, LocalGatewayToolMode, ProfileManager, RequestedLocalGatewayMode,
+    fetch_models,
+};
+
+fn parse_local_gateway_mode(raw: Option<&str>) -> Result<RequestedLocalGatewayMode> {
+    let Some(raw) = raw else {
+        return Ok(RequestedLocalGatewayMode::Omitted);
+    };
+    LocalGatewayToolMode::parse_cli(raw)
+        .map(RequestedLocalGatewayMode::Explicit)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid --local-gateway-mode '{}'. Use auto, search-fetch, fetch-only, or gateway-only.",
+                raw
+            )
+        })
+}
 
 pub(crate) fn handle_add(
     manager: &ProfileManager,
@@ -250,9 +269,17 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Use {
             name,
             no_extras,
+            local_gateway_mode,
             args,
         }) => {
-            manager.launch_claude(&name, &args, !no_extras)?;
+            manager.launch_claude(
+                &name,
+                &args,
+                LaunchOptions {
+                    use_stored_args: !no_extras,
+                    local_gateway_mode: parse_local_gateway_mode(local_gateway_mode.as_deref())?,
+                },
+            )?;
         }
 
         Some(Commands::Info { name }) => match manager.get_profile(&name) {
@@ -433,6 +460,40 @@ pub(crate) fn run() -> Result<()> {
         }
 
         Some(Commands::Mcp { command }) => mcp::handle_mcp_command(&manager, command)?,
+
+        Some(Commands::Process { command }) => process::handle_process_command(&manager, command)?,
+
+        Some(Commands::Runtime { command }) => match command {
+            RuntimeCommands::Auth { session_id } => {
+                let state = manager.load_runtime_session(&session_id)?;
+                print!("{}", state.auth_token);
+            }
+        },
+
+        Some(Commands::Shim { command }) => match command {
+            ShimCommands::Launch {
+                probe,
+                profile_id,
+                no_extras,
+                local_gateway_mode,
+                args,
+            } => {
+                if probe {
+                    return Ok(());
+                }
+                let profile_id = profile_id.context("Missing --profile-id for shim launch")?;
+                manager.launch_claude(
+                    &profile_id,
+                    &args,
+                    LaunchOptions {
+                        use_stored_args: !no_extras,
+                        local_gateway_mode: parse_local_gateway_mode(
+                            local_gateway_mode.as_deref(),
+                        )?,
+                    },
+                )?;
+            }
+        },
     }
 
     Ok(())

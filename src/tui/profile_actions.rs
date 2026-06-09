@@ -1,6 +1,123 @@
+use anyhow::Context;
+
 use super::*;
+use crate::profile::{
+    LaunchOptions, LocalGatewayToolMode, RequestedLocalGatewayMode, tinyfish_available,
+};
 
 impl App {
+    fn open_local_gateway_launch_picker(
+        &mut self,
+        profile: &Profile,
+        use_stored_args: bool,
+    ) -> Result<bool> {
+        let Some(base_url) = self.manager.resolved_local_gateway_base_url(profile)? else {
+            return Ok(false);
+        };
+        self.local_gateway_mode_selected = 0;
+        self.mode = Mode::LocalGatewayLaunchPicker {
+            profile_id: profile.id.clone(),
+            use_stored_args,
+            base_url,
+        };
+        Ok(true)
+    }
+
+    fn launch_selected_profile(&mut self, profile: &Profile, use_stored_args: bool) -> Result<()> {
+        ratatui::restore();
+        println!(
+            "Launching Claude with profile '{}' ({} extra args)...",
+            profile.name,
+            if use_stored_args { "with" } else { "without" }
+        );
+        self.manager.launch_claude(
+            &profile.id,
+            &[],
+            LaunchOptions {
+                use_stored_args,
+                local_gateway_mode: RequestedLocalGatewayMode::Omitted,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn selected_local_gateway_launch_mode(&self) -> LocalGatewayToolMode {
+        LocalGatewayToolMode::EXPLICIT[self
+            .local_gateway_mode_selected
+            .min(LocalGatewayToolMode::EXPLICIT.len().saturating_sub(1))]
+    }
+
+    pub(super) fn handle_local_gateway_launch_mode(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        let (profile_id, use_stored_args, return_mode) = match &self.mode {
+            Mode::LocalGatewayLaunchPicker {
+                profile_id,
+                use_stored_args,
+                ..
+            } => (profile_id.clone(), *use_stored_args, self.mode.clone()),
+            _ => return Ok(()),
+        };
+
+        match code {
+            _ if Self::is_cancel_key(code, modifiers) => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Enter => {
+                let local_gateway_mode = self.selected_local_gateway_launch_mode();
+                if local_gateway_mode.requires_tinyfish() && !tinyfish_available() {
+                    self.show_message(
+                        "TinyFish is required for the selected local gateway mode but the 'tinyfish' command is unavailable.".into(),
+                        true,
+                        Some(return_mode),
+                    );
+                    return Ok(());
+                }
+                let profile = self
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == profile_id)
+                    .cloned()
+                    .context("Selected profile no longer exists.")?;
+                ratatui::restore();
+                println!(
+                    "Launching Claude with profile '{}' ({}) via {}...",
+                    profile.name,
+                    if use_stored_args {
+                        "with extra args"
+                    } else {
+                        "without extra args"
+                    },
+                    local_gateway_mode.as_cli_value()
+                );
+                self.manager.launch_claude(
+                    &profile.id,
+                    &[],
+                    LaunchOptions {
+                        use_stored_args,
+                        local_gateway_mode: RequestedLocalGatewayMode::Explicit(local_gateway_mode),
+                    },
+                )?;
+            }
+            _ if Self::is_prev_list_key(code, modifiers) => {
+                if self.local_gateway_mode_selected == 0 {
+                    self.local_gateway_mode_selected =
+                        LocalGatewayToolMode::EXPLICIT.len().saturating_sub(1);
+                } else {
+                    self.local_gateway_mode_selected -= 1;
+                }
+            }
+            _ if Self::is_next_list_key(code, modifiers) => {
+                self.local_gateway_mode_selected =
+                    (self.local_gateway_mode_selected + 1) % LocalGatewayToolMode::EXPLICIT.len();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub(super) fn handle_profile_page_key(
         &mut self,
         code: KeyCode,
@@ -21,25 +138,14 @@ impl App {
             }
 
             KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
-                if let Some(p) = self.selected_profile() {
-                    ratatui::restore();
-                    println!(
-                        "Launching Claude with profile '{}' (without extra args)...",
-                        p.name
-                    );
-                    self.manager.launch_claude(&p.id, &[], false)?;
+                if let Some(p) = self.selected_profile().cloned() {
+                    self.launch_selected_profile(&p, false)?;
                 }
             }
 
             KeyCode::Enter => {
-                if let Some(p) = self.selected_profile() {
-                    let name = p.name.clone();
-                    ratatui::restore();
-                    println!(
-                        "Launching Claude with profile '{}' (with extra args)…",
-                        name
-                    );
-                    self.manager.launch_claude(&p.id, &[], true)?;
+                if let Some(p) = self.selected_profile().cloned() {
+                    self.launch_selected_profile(&p, true)?;
                 }
             }
 
@@ -53,6 +159,12 @@ impl App {
 
             KeyCode::Char('M') => {
                 self.start_selected_profile_mcp_picker()?;
+            }
+
+            KeyCode::Char('g') => {
+                if let Some(p) = self.selected_profile().cloned() {
+                    self.open_local_gateway_launch_picker(&p, true)?;
+                }
             }
 
             KeyCode::Char('a') => {

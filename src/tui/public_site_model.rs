@@ -95,26 +95,9 @@ pub(super) fn normalize_base_url_key(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
-fn base_url_host(base_url: &str) -> Option<String> {
-    let trimmed = base_url.trim();
-    let without_scheme = trimmed.split("://").nth(1).unwrap_or(trimmed);
-    let host = without_scheme
-        .split('/')
-        .next()?
-        .rsplit('@')
-        .next()?
-        .split(':')
-        .next()?;
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
-    }
-}
-
 pub(super) fn is_public_test_excluded_base_url(base_url: &str) -> bool {
     matches!(
-        base_url_host(base_url).as_deref(),
+        crate::profile::base_url_host(base_url).as_deref(),
         Some("api.anthropic.com" | "api.deepseek.com")
     )
 }

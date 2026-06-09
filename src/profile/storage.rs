@@ -7,6 +7,20 @@ use uuid::Uuid;
 use super::{CLAUDE_SWITCH_HOME_ENV, ProfileKind, ProfileManager, Provider, ProviderKey, Registry};
 
 impl ProfileManager {
+    pub(crate) fn global_settings(&self) -> Result<super::GlobalSettings> {
+        Ok(self.load_registry()?.settings)
+    }
+
+    pub(crate) fn allow_local_runtime_hot_switch(&self) -> Result<bool> {
+        Ok(self.global_settings()?.allow_local_runtime_hot_switch)
+    }
+
+    pub(crate) fn set_allow_local_runtime_hot_switch(&self, allowed: bool) -> Result<()> {
+        let mut registry = self.load_registry()?;
+        registry.settings.allow_local_runtime_hot_switch = allowed;
+        self.save_registry(&registry)
+    }
+
     pub fn new() -> Result<Self> {
         let home = Self::home_dir()?;
         Self::new_in_home_dir(&home)

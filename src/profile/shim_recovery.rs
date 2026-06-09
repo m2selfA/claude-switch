@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::{
-    CMD_MARKER, LightweightEnv, Profile, ProfileKind, ProfileManager, Provider, ProviderKey,
-    Registry, SH_MARKER, ShimRecoveryPlan, ShimRecoverySummary,
+    CMD_MARKER, LightweightEnv, LocalGatewayToolMode, Profile, ProfileKind, ProfileManager,
+    Provider, ProviderKey, Registry, SH_MARKER, ShimRecoveryPlan, ShimRecoverySummary,
 };
 
 pub(super) struct RecoveredShimProfile {
@@ -109,6 +109,9 @@ impl ProfileManager {
                     continue;
                 }
             };
+            if !Self::shim_local_gateway_mode(&content).is_auto() {
+                continue;
+            }
             let recovered = match Self::parse_recoverable_shim(&file_name, &content) {
                 Ok(profile) => profile,
                 Err(err) => {
@@ -216,12 +219,17 @@ impl ProfileManager {
         }
         let settings = Self::extract_shim_settings(content)
             .with_context(|| "missing recoverable --settings JSON".to_string())?;
+        let settings_object = settings
+            .as_object()
+            .with_context(|| "settings JSON root must be an object".to_string())?;
         let env_object = settings
             .get("env")
             .and_then(serde_json::Value::as_object)
             .with_context(|| "settings JSON does not contain an env object".to_string())?;
-        let token = Self::json_env_string(env_object, "ANTHROPIC_AUTH_TOKEN")?
-            .with_context(|| "settings env is missing ANTHROPIC_AUTH_TOKEN".to_string())?;
+        let token = Self::auth_token_from_settings(settings_object)?.with_context(|| {
+            "settings JSON is missing a recoverable ANTHROPIC_AUTH_TOKEN or apiKeyHelper"
+                .to_string()
+        })?;
         let base_url = Self::json_env_string(env_object, "ANTHROPIC_BASE_URL")?
             .with_context(|| "settings env is missing ANTHROPIC_BASE_URL".to_string())?;
         let mut extras = Vec::new();
@@ -302,6 +310,8 @@ impl ProfileManager {
             Self::extract_cmd_var(content, "_SETTINGS"),
             Self::extract_cmd_var(content, "_TF_SETTINGS"),
             Self::extract_legacy_inline_cmd_settings(content),
+            Self::extract_shell_settings_var(content, "BASE_SETTINGS"),
+            Self::extract_shell_settings_var(content, "TF_SETTINGS"),
             Self::extract_shell_settings_env(content),
         ];
         for candidate in candidates.into_iter().flatten() {
@@ -365,11 +375,28 @@ impl ProfileManager {
         None
     }
 
+    fn extract_shell_settings_var(content: &str, var_name: &str) -> Option<String> {
+        let prefix = format!("{var_name}='");
+        for line in content.lines() {
+            let line = line.trim();
+            let Some(value) = line.strip_prefix(&prefix) else {
+                continue;
+            };
+            let value = value.strip_suffix('\'')?;
+            return Some(Self::unescape_shell_single_quoted_value(value));
+        }
+        None
+    }
+
     fn unescape_cmd_json_fragment(value: &str) -> String {
         let mut out = String::with_capacity(value.len());
         let mut chars = value.chars().peekable();
         while let Some(ch) = chars.next() {
             match ch {
+                '\\' if chars.peek() == Some(&'\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
                 '\\' if chars.peek() == Some(&'"') => {
                     chars.next();
                     out.push('"');
@@ -414,7 +441,21 @@ impl ProfileManager {
                 | "ANTHROPIC_DEFAULT_HAIKU_MODEL"
                 | "ANTHROPIC_MODEL"
                 | "CLAUDE_CODE_SUBAGENT_MODEL"
+                | "CLAUDE_SWITCH_TINYFISH_MODE"
         )
+    }
+
+    fn shim_local_gateway_mode(content: &str) -> LocalGatewayToolMode {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            let mode = trimmed
+                .strip_prefix(":: Local gateway mode: ")
+                .or_else(|| trimmed.strip_prefix("# Local gateway mode: "));
+            if let Some(mode) = mode.and_then(LocalGatewayToolMode::parse_cli) {
+                return mode;
+            }
+        }
+        LocalGatewayToolMode::Auto
     }
 
     fn extract_shim_launch_args(content: &str) -> Option<Vec<String>> {

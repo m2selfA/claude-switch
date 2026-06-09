@@ -87,6 +87,7 @@ impl ProfileManager {
             profiles,
             providers,
             mcp_servers,
+            settings: Some(registry.settings),
             secrets_included: include_secrets,
         };
         serde_json::to_string_pretty(&bundle).context("Failed to serialize config bundle")
@@ -451,7 +452,11 @@ impl ProfileManager {
         }
         let bundle: ConfigBundle =
             serde_json::from_str(content).context("Failed to parse config bundle JSON")?;
+        let bundle_settings = bundle.settings.clone();
         let mut registry = self.load_registry()?;
+        if let Some(settings) = bundle_settings {
+            registry.settings = settings;
+        }
         let mut summary = ConfigImportSummary {
             profiles_added: 0,
             profiles_updated: 0,

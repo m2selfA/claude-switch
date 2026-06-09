@@ -1,11 +1,13 @@
 use super::*;
 
 impl ProfileManager {
+    const REMOTE_UNIX_VARUSERS_PATH_PROBE: &str = "sh -lc 'if [ -d \"$HOME/.varusers/bin\" ]; then case \":$PATH:\" in *\":$HOME/.varusers/bin:\"*) printf \"1\\n\" ;; *) printf \"0\\n\" ;; esac; else printf \"0\\n\"; fi'";
+
     pub(super) fn run_local_command(program: &str, args: &[&str]) -> Result<String> {
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("Failed to run {}", program))?;
+        let output = super::with_local_command_candidates(program, |resolved| {
+            Command::new(resolved).args(args).output()
+        })
+        .with_context(|| format!("Failed to run {}", program))?;
         if !output.status.success() {
             bail!(
                 "{} failed: {}",
@@ -17,25 +19,27 @@ impl ProfileManager {
     }
 
     pub(super) fn run_remote_sftp_commands(host: &str, stdin: &str) -> Result<String> {
-        let mut child = Command::new("sftp")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ForwardX11=no",
-                "-b",
-                "-",
-                host,
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("Failed to spawn sftp")?;
+        let mut child = super::with_local_command_candidates("sftp", |resolved| {
+            Command::new(resolved)
+                .args([
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "ForwardX11=no",
+                    "-b",
+                    "-",
+                    host,
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        })
+        .context("Failed to spawn sftp")?;
 
         use std::io::Write;
         {
@@ -88,6 +92,25 @@ impl ProfileManager {
         )
     }
 
+    pub(super) fn run_remote_ssh_command(host: &str, command: &str) -> Result<String> {
+        Self::run_local_command(
+            "ssh",
+            &[
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ForwardX11=no",
+                "-T",
+                host,
+                command,
+            ],
+        )
+    }
+
     pub(super) fn probe_remote_os_and_home(host: &str) -> Result<(RemoteOs, String)> {
         let output = Self::run_remote_sftp_commands(host, "pwd\n")?;
         let home = output
@@ -115,6 +138,36 @@ impl ProfileManager {
             );
         };
         Ok((remote_os, home))
+    }
+
+    pub(super) fn probe_remote_unix_varusers_on_path(host: &str) -> Result<bool> {
+        Self::probe_remote_unix_varusers_on_path_with_runner(host, |host, command| {
+            Self::run_remote_ssh_command(host, command)
+        })
+    }
+
+    pub(super) fn probe_remote_unix_varusers_on_path_with_runner<F>(
+        host: &str,
+        runner: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&str, &str) -> Result<String>,
+    {
+        let output = runner(host, Self::REMOTE_UNIX_VARUSERS_PATH_PROBE)?;
+        let marker = output
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .context("remote Unix PATH probe returned no usable output")?;
+        match marker {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            _ => bail!(
+                "remote Unix PATH probe returned unexpected output: {}",
+                output
+            ),
+        }
     }
 
     pub(super) fn sftp_quote(path: &str) -> String {
@@ -325,10 +378,28 @@ impl ProfileManager {
     where
         F: FnMut(&str) -> Result<String>,
     {
+        let tool_shell = match remote_os {
+            RemoteOs::Unix => TinyfishToolShell::Bash,
+            RemoteOs::Windows => TinyfishToolShell::PowerShell,
+        };
         let manifest_dir = Self::join_remote_path(remote_path, remote_os, ".claude-plugin");
         let manifest_json = Self::join_remote_path(&manifest_dir, remote_os, "plugin.json");
         let hooks_dir = Self::join_remote_path(remote_path, remote_os, "hooks");
         let hooks_json = Self::join_remote_path(&hooks_dir, remote_os, "hooks.json");
+        let scripts_dir = Self::join_remote_path(remote_path, remote_os, "scripts");
+        let hook_script = Self::join_remote_path(
+            &scripts_dir,
+            remote_os,
+            tinyfish_plugin_script_file_name(tool_shell),
+        );
+        let statusline_script = Self::join_remote_path(
+            &scripts_dir,
+            remote_os,
+            tinyfish_statusline_script_file_name(tool_shell),
+        );
+        let output_styles_dir = Self::join_remote_path(remote_path, remote_os, "output-styles");
+        let output_style =
+            Self::join_remote_path(&output_styles_dir, remote_os, "route-default.md");
         let manifest_json_sftp = if matches!(remote_os, RemoteOs::Windows) {
             manifest_json.replace('\\', "/")
         } else {
@@ -344,6 +415,31 @@ impl ProfileManager {
         } else {
             hooks_json
         };
+        let scripts_dir_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            scripts_dir.replace('\\', "/")
+        } else {
+            scripts_dir
+        };
+        let hook_script_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            hook_script.replace('\\', "/")
+        } else {
+            hook_script
+        };
+        let statusline_script_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            statusline_script.replace('\\', "/")
+        } else {
+            statusline_script
+        };
+        let output_styles_dir_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            output_styles_dir.replace('\\', "/")
+        } else {
+            output_styles_dir
+        };
+        let output_style_sftp = if matches!(remote_os, RemoteOs::Windows) {
+            output_style.replace('\\', "/")
+        } else {
+            output_style
+        };
         let hooks_dir_sftp = if matches!(remote_os, RemoteOs::Windows) {
             hooks_dir.replace('\\', "/")
         } else {
@@ -355,11 +451,16 @@ impl ProfileManager {
             remote_path.to_string()
         };
         let cmds = format!(
-            "rm {}\nrm {}\nrmdir {}\nrmdir {}\nrmdir {}\n",
+            "rm {}\nrm {}\nrm {}\nrm {}\nrm {}\nrmdir {}\nrmdir {}\nrmdir {}\nrmdir {}\nrmdir {}\n",
             Self::sftp_quote(&manifest_json_sftp),
             Self::sftp_quote(&hooks_json_sftp),
+            Self::sftp_quote(&hook_script_sftp),
+            Self::sftp_quote(&statusline_script_sftp),
+            Self::sftp_quote(&output_style_sftp),
             Self::sftp_quote(&manifest_dir_sftp),
             Self::sftp_quote(&hooks_dir_sftp),
+            Self::sftp_quote(&scripts_dir_sftp),
+            Self::sftp_quote(&output_styles_dir_sftp),
             Self::sftp_quote(&plugin_dir_sftp),
         );
         match run_sftp(&cmds) {
@@ -384,11 +485,32 @@ impl ProfileManager {
         }
     }
 
+    pub(super) fn remote_shim_file_names(
+        &self,
+        profile: &Profile,
+        remote_os: RemoteOs,
+    ) -> Result<Vec<(String, LocalGatewayToolMode)>> {
+        if profile.kind == ProfileKind::Full {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for local_gateway_mode in self.local_gateway_shim_modes(profile)? {
+            let alias_name = Self::shim_alias_name(profile, local_gateway_mode);
+            let file_name = match remote_os {
+                RemoteOs::Unix => format!("claude-{}", alias_name),
+                RemoteOs::Windows => format!("claude-{}.cmd", alias_name),
+            };
+            names.push((file_name, local_gateway_mode));
+        }
+        Ok(names)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn remote_shim_file_name(profile: &Profile, remote_os: RemoteOs) -> Option<String> {
         if profile.kind == ProfileKind::Full {
             return None;
         }
-        let alias_name = profile.alias.as_deref().unwrap_or(&profile.name);
+        let alias_name = Self::shim_alias_name(profile, LocalGatewayToolMode::Auto);
         Some(match remote_os {
             RemoteOs::Unix => format!("claude-{}", alias_name),
             RemoteOs::Windows => format!("claude-{}.cmd", alias_name),

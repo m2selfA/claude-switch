@@ -225,6 +225,10 @@ impl App {
                 Style::default().fg(DIM),
             )),
             Line::from(Span::styled(
+                "  Shift+S opens process switch for the selected result's provider/key/model.",
+                Style::default().fg(DIM),
+            )),
+            Line::from(Span::styled(
                 "  Ctrl+P/N moves results. PgUp/PgDn jumps pages. Enter/q/Esc/Ctrl+G exits.",
                 Style::default().fg(DIM),
             )),

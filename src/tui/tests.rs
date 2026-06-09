@@ -1,6 +1,9 @@
 use super::*;
 use crate::profile::ProfileManager;
+use crate::profile::{RuntimeSessionState, RuntimeSessionStatus};
 use std::env;
+use std::ffi::OsString;
+use std::fs;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
@@ -56,6 +59,32 @@ fn make_test_app() -> TestApp {
         app,
         _tmp: tmp,
         _guard: guard,
+    }
+}
+
+struct PathOverrideGuard {
+    original: Option<OsString>,
+}
+
+impl PathOverrideGuard {
+    fn replace(paths: &[std::path::PathBuf]) -> Self {
+        let original = env::var_os("PATH");
+        let joined = env::join_paths(paths).expect("test PATH entries should be valid");
+        unsafe {
+            env::set_var("PATH", joined);
+        }
+        Self { original }
+    }
+}
+
+impl Drop for PathOverrideGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.original {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
     }
 }
 
@@ -1371,6 +1400,140 @@ fn public_site_slot_key_opens_provider_test_with_profile_model() {
 }
 
 #[test]
+fn public_site_results_shift_s_opens_process_switch_picker() {
+    let mut app = make_test_app();
+    let provider = app
+        .manager
+        .add_provider_with_key_name(
+            "Relay",
+            "https://relay.example.invalid",
+            "Default",
+            "sk-default",
+        )
+        .unwrap();
+    let key_id = provider.keys.keys().next().unwrap().clone();
+    let profile = app
+        .manager
+        .create_lightweight_profile(
+            "relay-runtime",
+            Some("relay-runtime"),
+            LightweightEnv {
+                model: Some("claude-3-7-sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    app.manager
+        .set_provider(&profile.id, &provider.id, &key_id)
+        .unwrap();
+
+    let session_id = "proc_publicsite".to_string();
+    let session_dir = app.manager.base_dir().join("runtime").join(&session_id);
+    fs::create_dir_all(&session_dir).unwrap();
+    let session = RuntimeSessionState {
+        schema: "claude-switch-runtime-v1".into(),
+        session_id: session_id.clone(),
+        status: RuntimeSessionStatus::Active,
+        pid: Some(std::process::id()),
+        process_started_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        profile_id: profile.id.clone(),
+        profile_name: profile.name.clone(),
+        profile_alias: profile.alias.clone(),
+        cwd: Some(std::env::current_dir().unwrap()),
+        provider_id: Some(provider.id.clone()),
+        provider_name: Some(provider.name.clone()),
+        key_id: Some(key_id.clone()),
+        key_name: provider.keys.get(&key_id).map(|key| key.name.clone()),
+        auth_token: "sk-default".into(),
+        base_url: provider.base_url.clone(),
+        default_opus_model: None,
+        default_sonnet_model: None,
+        default_haiku_model: None,
+        model: Some("claude-3-7-sonnet".into()),
+        subagent_model: None,
+        extras: Vec::new(),
+    };
+    fs::write(
+        session_dir.join("state.json"),
+        serde_json::to_string_pretty(&session).unwrap(),
+    )
+    .unwrap();
+
+    app.mode = Mode::PublicSiteResults;
+    app.public_site_results = vec![PublicSiteTestResult {
+        provider_name: "Relay".into(),
+        key_name: "Default".into(),
+        base_url: "https://relay.example.invalid".into(),
+        profile_id: profile.id.clone(),
+        profile_name: profile.name.clone(),
+        model: "claude-3-7-opus".into(),
+        first_char: Some("H".into()),
+        response_preview: Some("Hello".into()),
+        endpoint_used: Some("https://relay.example.invalid/v1/messages".into()),
+        latency_ms: Some(120),
+        input_tokens: Some(4),
+        output_tokens: Some(8),
+        is_success: true,
+        error: None,
+    }];
+
+    app.handle_public_site_results(KeyCode::Char('S'), KeyModifiers::SHIFT)
+        .unwrap();
+
+    assert_eq!(app.provider_test_model_buf, "claude-3-7-opus");
+    assert_eq!(app.runtime_sessions_cache.len(), 1);
+    assert_eq!(
+        app.mode,
+        Mode::ProcessSwitchPicker {
+            provider_id: provider.id,
+            key_id,
+            return_mode: Box::new(Mode::PublicSiteResults),
+        }
+    );
+}
+
+#[test]
+fn public_site_results_shift_s_blocks_local_self_hosted_profiles_when_policy_disabled() {
+    let mut app = make_test_app();
+    let provider = app
+        .manager
+        .add_provider_with_key_name("Local", "http://localhost:11434/v1", "Default", "sk-local")
+        .unwrap();
+    let key_id = provider.keys.keys().next().unwrap().clone();
+    let profile = app
+        .manager
+        .create_lightweight_profile("local", Some("local"), LightweightEnv::default())
+        .unwrap();
+    app.manager
+        .set_provider(&profile.id, &provider.id, &key_id)
+        .unwrap();
+    app.mode = Mode::PublicSiteResults;
+    app.public_site_results = vec![PublicSiteTestResult {
+        provider_name: provider.name.clone(),
+        key_name: "Default".into(),
+        base_url: provider.base_url.clone(),
+        profile_id: profile.id.clone(),
+        profile_name: profile.name.clone(),
+        model: "qwen3".into(),
+        first_char: None,
+        response_preview: None,
+        endpoint_used: None,
+        latency_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        is_success: true,
+        error: None,
+    }];
+
+    app.handle_public_site_results(KeyCode::Char('S'), KeyModifiers::SHIFT)
+        .unwrap();
+
+    assert!(matches!(app.mode, Mode::Message(_, true)));
+}
+
+#[test]
 fn trim_model_context_suffix_removes_1m_suffix() {
     assert_eq!(
         trim_model_context_suffix("claude-3-7-sonnet[1m]"),
@@ -1732,6 +1895,173 @@ fn provider_test_outcome_q_exits_to_parent_mode() {
 }
 
 #[test]
+fn provider_test_outcome_s_opens_process_switch_picker() {
+    let mut app = make_test_app();
+    let provider = app
+        .manager
+        .add_provider_with_key_name(
+            "Relay",
+            "https://relay.example.invalid",
+            "Default",
+            "sk-default",
+        )
+        .unwrap();
+    let profile = app
+        .manager
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                model: Some("claude-3-7-sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let session_id = "proc_testpicker".to_string();
+    let session_dir = app.manager.base_dir().join("runtime").join(&session_id);
+    fs::create_dir_all(&session_dir).unwrap();
+    let session = RuntimeSessionState {
+        schema: "claude-switch-runtime-v1".into(),
+        session_id: session_id.clone(),
+        status: RuntimeSessionStatus::Active,
+        pid: Some(std::process::id()),
+        process_started_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        profile_id: profile.id.clone(),
+        profile_name: profile.name.clone(),
+        profile_alias: profile.alias.clone(),
+        cwd: Some(std::env::current_dir().unwrap()),
+        provider_id: Some(provider.id.clone()),
+        provider_name: Some(provider.name.clone()),
+        key_id: provider.keys.keys().next().cloned(),
+        key_name: provider.keys.values().next().map(|key| key.name.clone()),
+        auth_token: "sk-default".into(),
+        base_url: provider.base_url.clone(),
+        default_opus_model: None,
+        default_sonnet_model: None,
+        default_haiku_model: None,
+        model: Some("claude-3-7-sonnet".into()),
+        subagent_model: None,
+        extras: Vec::new(),
+    };
+    fs::write(
+        session_dir.join("state.json"),
+        serde_json::to_string_pretty(&session).unwrap(),
+    )
+    .unwrap();
+
+    app.provider_test_model_buf = "claude-3-7-sonnet".into();
+    app.mode = Mode::ProviderAnthropicOutcome {
+        provider_id: provider.id.clone(),
+        key_id: provider.keys.keys().next().unwrap().clone(),
+        source: ProviderTestSource::Page,
+        field: 0,
+        model: "claude-3-7-sonnet".into(),
+        endpoint_used: Some("https://relay.example.invalid/v1/messages".into()),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+        body: "ok".into(),
+        is_error: false,
+    };
+
+    app.handle_provider_anthropic_outcome(KeyCode::Char('s'), KeyModifiers::empty())
+        .unwrap();
+
+    assert!(matches!(
+        app.mode,
+        Mode::ProcessSwitchPicker {
+            provider_id: _,
+            key_id: _,
+            ..
+        }
+    ));
+    assert_eq!(app.runtime_sessions_cache.len(), 1);
+}
+
+#[test]
+fn process_switch_picker_enter_opens_model_confirm_with_tested_model() {
+    let mut app = make_test_app();
+    let provider = app
+        .manager
+        .add_provider_with_key_name(
+            "Relay",
+            "https://relay.example.invalid",
+            "Default",
+            "sk-default",
+        )
+        .unwrap();
+    let key_id = provider.keys.keys().next().unwrap().clone();
+    let profile = app
+        .manager
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                model: Some("claude-3-7-sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let session_id = "proc_modelconfirm".to_string();
+    let session_dir = app.manager.base_dir().join("runtime").join(&session_id);
+    fs::create_dir_all(&session_dir).unwrap();
+    let session = RuntimeSessionState {
+        schema: "claude-switch-runtime-v1".into(),
+        session_id: session_id.clone(),
+        status: RuntimeSessionStatus::Active,
+        pid: Some(std::process::id()),
+        process_started_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        profile_id: profile.id.clone(),
+        profile_name: profile.name.clone(),
+        profile_alias: profile.alias.clone(),
+        cwd: Some(std::env::current_dir().unwrap()),
+        provider_id: Some(provider.id.clone()),
+        provider_name: Some(provider.name.clone()),
+        key_id: provider.keys.keys().next().cloned(),
+        key_name: provider.keys.values().next().map(|key| key.name.clone()),
+        auth_token: "sk-default".into(),
+        base_url: provider.base_url.clone(),
+        default_opus_model: None,
+        default_sonnet_model: None,
+        default_haiku_model: None,
+        model: Some("claude-3-7-sonnet".into()),
+        subagent_model: None,
+        extras: Vec::new(),
+    };
+    fs::write(
+        session_dir.join("state.json"),
+        serde_json::to_string_pretty(&session).unwrap(),
+    )
+    .unwrap();
+
+    app.runtime_sessions_cache = app.manager.list_runtime_sessions().unwrap();
+    app.provider_test_model_buf = "claude-3-7-opus".into();
+    app.mode = Mode::ProcessSwitchPicker {
+        provider_id: provider.id.clone(),
+        key_id: key_id.clone(),
+        return_mode: Box::new(Mode::Normal),
+    };
+
+    app.handle_process_switch_picker(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.runtime_switch_model_buf, "claude-3-7-opus");
+    assert_eq!(app.cursor_pos, app.runtime_switch_model_buf.len());
+    assert_eq!(
+        app.mode,
+        Mode::ProcessSwitchModelConfirm {
+            session_id,
+            provider_id: provider.id,
+            key_id,
+            return_mode: Box::new(Mode::Normal),
+        }
+    );
+}
+
+#[test]
 fn model_fetch_unavailable_message_marks_manual_entry_possible() {
     let message = model_fetch_unavailable_message("403 forbidden");
 
@@ -1793,8 +2123,250 @@ fn shift_tab_switches_manager_in_allowed_modes() {
         app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
             .unwrap()
     );
+    assert_eq!(app.page, Page::Settings);
+    assert_eq!(app.mode, Mode::Normal);
+
+    assert!(
+        app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
+            .unwrap()
+    );
     assert_eq!(app.page, Page::Profile);
     assert_eq!(app.mode, Mode::Normal);
+}
+
+#[test]
+fn settings_page_toggle_persists_global_policy() {
+    let mut app = make_test_app();
+    app.page = Page::Settings;
+    app.mode = Mode::Normal;
+    assert!(!app.manager.allow_local_runtime_hot_switch().unwrap());
+
+    app.handle_normal_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(app.settings_allow_local_runtime_hot_switch);
+    assert!(app.manager.allow_local_runtime_hot_switch().unwrap());
+    assert!(matches!(app.mode, Mode::Message(_, false)));
+}
+
+#[test]
+fn enter_on_local_gateway_profile_launches_directly_without_popup() {
+    let mut app = make_test_app();
+    let profile = app
+        .manager
+        .create_lightweight_profile(
+            "Local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    app.refresh().unwrap();
+    app.select_by_id(&profile.id);
+    app.mode = Mode::Normal;
+    let empty_bin = app._tmp.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).unwrap();
+    let _path_guard = PathOverrideGuard::replace(std::slice::from_ref(&empty_bin));
+
+    let error = app
+        .handle_profile_page_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("Failed to launch claude"));
+    assert_eq!(app.mode, Mode::Normal);
+}
+
+#[test]
+fn shift_enter_on_local_gateway_profile_launches_directly_without_popup() {
+    let mut app = make_test_app();
+    let profile = app
+        .manager
+        .create_lightweight_profile(
+            "Local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    app.refresh().unwrap();
+    app.select_by_id(&profile.id);
+    app.mode = Mode::Normal;
+    let empty_bin = app._tmp.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).unwrap();
+    let _path_guard = PathOverrideGuard::replace(std::slice::from_ref(&empty_bin));
+
+    let error = app
+        .handle_profile_page_key(KeyCode::Enter, KeyModifiers::SHIFT)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("Failed to launch claude"));
+    assert_eq!(app.mode, Mode::Normal);
+}
+
+#[test]
+fn g_on_local_gateway_profile_opens_launch_mode_popup() {
+    let mut app = make_test_app();
+    let profile = app
+        .manager
+        .create_lightweight_profile(
+            "Local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    app.refresh().unwrap();
+    app.select_by_id(&profile.id);
+    app.mode = Mode::Normal;
+
+    app.handle_profile_page_key(KeyCode::Char('g'), KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.local_gateway_mode_selected, 0);
+    assert_eq!(
+        app.mode,
+        Mode::LocalGatewayLaunchPicker {
+            profile_id: profile.id,
+            use_stored_args: true,
+            base_url: "http://localhost:11434/v1".into(),
+        }
+    );
+}
+
+#[test]
+fn provider_outcome_switch_blocks_local_self_hosted_provider_when_policy_disabled() {
+    let mut app = make_test_app();
+    let provider = app
+        .manager
+        .add_provider_with_key_name("Local", "http://localhost:11434/v1", "Default", "sk-local")
+        .unwrap();
+    app.provider_test_model_buf = "qwen3".into();
+    app.mode = Mode::ProviderAnthropicOutcome {
+        provider_id: provider.id.clone(),
+        key_id: provider.keys.keys().next().unwrap().clone(),
+        source: ProviderTestSource::Page,
+        field: 0,
+        model: "qwen3".into(),
+        endpoint_used: Some("http://localhost:11434/v1/messages".into()),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+        body: "ok".into(),
+        is_error: false,
+    };
+
+    app.handle_provider_anthropic_outcome(KeyCode::Char('s'), KeyModifiers::empty())
+        .unwrap();
+
+    assert!(matches!(app.mode, Mode::Message(_, true)));
+}
+
+#[test]
+fn process_switch_picker_filters_out_local_runtime_sessions_when_policy_disabled() {
+    let mut app = make_test_app();
+    let target_provider = app
+        .manager
+        .add_provider_with_key_name(
+            "Relay",
+            "https://relay.example.invalid",
+            "Default",
+            "sk-relay",
+        )
+        .unwrap();
+    let local_provider = app
+        .manager
+        .add_provider_with_key_name("Local", "http://localhost:11434/v1", "Default", "sk-local")
+        .unwrap();
+    let profile = app
+        .manager
+        .create_lightweight_profile("local", Some("local"), LightweightEnv::default())
+        .unwrap();
+    let session_id = "proc_local".to_string();
+    let session_dir = app.manager.base_dir().join("runtime").join(&session_id);
+    fs::create_dir_all(&session_dir).unwrap();
+    let session = RuntimeSessionState {
+        schema: "claude-switch-runtime-v1".into(),
+        session_id,
+        status: RuntimeSessionStatus::Active,
+        pid: Some(std::process::id()),
+        process_started_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        profile_id: profile.id,
+        profile_name: profile.name,
+        profile_alias: profile.alias,
+        cwd: Some(std::env::current_dir().unwrap()),
+        provider_id: Some(local_provider.id.clone()),
+        provider_name: Some(local_provider.name.clone()),
+        key_id: local_provider.keys.keys().next().cloned(),
+        key_name: local_provider
+            .keys
+            .values()
+            .next()
+            .map(|key| key.name.clone()),
+        auth_token: "sk-local".into(),
+        base_url: local_provider.base_url.clone(),
+        default_opus_model: None,
+        default_sonnet_model: None,
+        default_haiku_model: None,
+        model: Some("qwen3".into()),
+        subagent_model: None,
+        extras: Vec::new(),
+    };
+    fs::write(
+        session_dir.join("state.json"),
+        serde_json::to_string_pretty(&session).unwrap(),
+    )
+    .unwrap();
+
+    app.start_process_switch_picker(
+        target_provider.id.clone(),
+        target_provider.keys.keys().next().unwrap().clone(),
+        Mode::Normal,
+    )
+    .unwrap();
+
+    assert!(matches!(app.mode, Mode::Message(_, true)));
+    assert!(app.runtime_sessions_cache.is_empty());
+}
+
+#[test]
+fn process_switch_model_confirm_keeps_tui_open_when_session_exits() {
+    let mut app = make_test_app();
+    let provider = app
+        .manager
+        .add_provider_with_key_name(
+            "Relay",
+            "https://relay.example.invalid",
+            "Default",
+            "sk-relay",
+        )
+        .unwrap();
+    let key_id = provider.keys.keys().next().unwrap().clone();
+    app.runtime_switch_model_buf = "claude-3-7-sonnet".into();
+    app.mode = Mode::ProcessSwitchModelConfirm {
+        session_id: "proc_missing".into(),
+        provider_id: provider.id.clone(),
+        key_id: key_id.clone(),
+        return_mode: Box::new(Mode::Normal),
+    };
+
+    app.handle_process_switch_model_confirm(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(matches!(app.mode, Mode::Message(_, true)));
+    assert_eq!(app.message_return_mode, Some(Mode::Normal));
 }
 
 #[test]

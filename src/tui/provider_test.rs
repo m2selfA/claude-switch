@@ -404,16 +404,40 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> Result<()> {
-        let (provider_id, key_id, source, field) = match &self.mode {
+        let (provider_id, key_id, source, field, is_error) = match &self.mode {
             Mode::ProviderAnthropicOutcome {
                 provider_id,
                 key_id,
                 source,
                 field,
+                is_error,
                 ..
-            } => (provider_id.clone(), key_id.clone(), *source, *field),
+            } => (
+                provider_id.clone(),
+                key_id.clone(),
+                *source,
+                *field,
+                *is_error,
+            ),
             _ => return Ok(()),
         };
+
+        if !is_error && code == KeyCode::Char('s') && modifiers.is_empty() {
+            let provider = self.manager.get_provider(&provider_id)?;
+            if crate::profile::is_local_runtime_base_url(&provider.base_url) {
+                self.show_message(
+                    format!(
+                        "Provider '{}' uses a local/self-hosted API; local/self-hosted lite profiles launch directly, use an inline apiKeyHelper, and cannot use dynamic hot switch.",
+                        provider.name
+                    ),
+                    true,
+                    Some(self.mode.clone()),
+                );
+                return Ok(());
+            }
+            let return_mode = self.mode.clone();
+            return self.start_process_switch_picker(provider_id, key_id, return_mode);
+        }
 
         self.mode =
             provider_test_outcome_next_mode(code, modifiers, &provider_id, &key_id, source, field);

@@ -94,6 +94,7 @@ impl App {
                         Page::Profile => "  profile manager",
                         Page::Provider => "  provider manager",
                         Page::Mcp => "  mcp manager",
+                        Page::Settings => "  settings",
                     },
                     Style::default().fg(DIM),
                 ),
@@ -106,11 +107,13 @@ impl App {
             Page::Profile => (self.filtered_indices.len(), self.profiles.len()),
             Page::Provider => (self.providers_cache.len(), self.providers_cache.len()),
             Page::Mcp => (self.mcps_cache.len(), self.mcps_cache.len()),
+            Page::Settings => (1, 1),
         };
         let item_name = match self.page {
             Page::Profile => "profile",
             Page::Provider => "provider",
             Page::Mcp => "mcp",
+            Page::Settings => "setting",
         };
         let label = if count == total {
             format!(

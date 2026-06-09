@@ -29,6 +29,46 @@ fn parses_nested_provider_commands() {
 }
 
 #[test]
+fn parses_config_settings_commands() {
+    let cli = Cli::try_parse_from(["cswitch", "config", "settings", "show", "--json"]).unwrap();
+    match cli.command {
+        Some(Commands::Config {
+            command:
+                ConfigCommands::Settings {
+                    command: ConfigSettingsCommands::Show { json },
+                },
+        }) => assert!(json),
+        _ => panic!("unexpected config settings show parse result"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "cswitch",
+        "config",
+        "settings",
+        "set",
+        "--allow-local-runtime-hot-switch",
+        "--json",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Commands::Config {
+            command:
+                ConfigCommands::Settings {
+                    command:
+                        ConfigSettingsCommands::Set {
+                            allow_local_runtime_hot_switch,
+                            json,
+                        },
+                },
+        }) => {
+            assert!(allow_local_runtime_hot_switch);
+            assert!(json);
+        }
+        _ => panic!("unexpected config settings set parse result"),
+    }
+}
+
+#[test]
 fn parses_provider_rename_key_command() {
     let cli = Cli::try_parse_from([
         "cswitch",
@@ -412,6 +452,34 @@ fn parses_diagnostics_and_shell_commands() {
         _ => panic!("unexpected recover-shims parse result"),
     }
 
+    let cli = Cli::try_parse_from([
+        "cswitch",
+        "config",
+        "migrate-auth",
+        "--write",
+        "--json",
+        "--remote",
+        "gm00",
+        "--remote",
+        "devbox",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Commands::Config {
+            command:
+                ConfigCommands::MigrateAuth {
+                    write,
+                    json,
+                    remote,
+                },
+        }) => {
+            assert!(write);
+            assert!(json);
+            assert_eq!(remote, vec!["gm00", "devbox"]);
+        }
+        _ => panic!("unexpected migrate-auth parse result"),
+    }
+
     let cli =
         Cli::try_parse_from(["cswitch", "statusline", "--profile", "work", "--json"]).unwrap();
     match cli.command {
@@ -429,6 +497,111 @@ fn parses_diagnostics_and_shell_commands() {
             command: ShellCommands::Hook { shell },
         }) => assert_eq!(shell, "bash"),
         _ => panic!("unexpected shell hook parse result"),
+    }
+
+    let cli = Cli::try_parse_from(["cswitch", "process", "list"]).unwrap();
+    match cli.command {
+        Some(Commands::Process {
+            command: ProcessCommands::List,
+        }) => {}
+        _ => panic!("unexpected process list parse result"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "cswitch",
+        "process",
+        "switch",
+        "proc_ab12cd34",
+        "--provider",
+        "prov_12345678",
+        "--key",
+        "key_12345678",
+        "--model",
+        "claude-3-7-sonnet",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Commands::Process {
+            command:
+                ProcessCommands::Switch {
+                    session_id,
+                    provider,
+                    key,
+                    model,
+                },
+        }) => {
+            assert_eq!(session_id, "proc_ab12cd34");
+            assert_eq!(provider, "prov_12345678");
+            assert_eq!(key, "key_12345678");
+            assert_eq!(model, "claude-3-7-sonnet");
+        }
+        _ => panic!("unexpected process switch parse result"),
+    }
+
+    let cli = Cli::try_parse_from(["cswitch", "runtime", "auth", "proc_ab12cd34"]).unwrap();
+    match cli.command {
+        Some(Commands::Runtime {
+            command: RuntimeCommands::Auth { session_id },
+        }) => assert_eq!(session_id, "proc_ab12cd34"),
+        _ => panic!("unexpected runtime auth parse result"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "cswitch",
+        "use",
+        "local",
+        "--local-gateway-mode",
+        "fetch-only",
+        "--",
+        "--resume",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Commands::Use {
+            name,
+            no_extras,
+            local_gateway_mode,
+            args,
+        }) => {
+            assert_eq!(name, "local");
+            assert!(!no_extras);
+            assert_eq!(local_gateway_mode.as_deref(), Some("fetch-only"));
+            assert_eq!(args, vec!["--resume"]);
+        }
+        _ => panic!("unexpected use parse result"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "cswitch",
+        "shim",
+        "launch",
+        "--profile-id",
+        "profile-generated",
+        "--local-gateway-mode",
+        "search-fetch",
+        "--no-extras",
+        "--",
+        "--resume",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Commands::Shim {
+            command:
+                ShimCommands::Launch {
+                    probe,
+                    profile_id,
+                    no_extras,
+                    local_gateway_mode,
+                    args,
+                },
+        }) => {
+            assert!(!probe);
+            assert_eq!(profile_id.as_deref(), Some("profile-generated"));
+            assert!(no_extras);
+            assert_eq!(local_gateway_mode.as_deref(), Some("search-fetch"));
+            assert_eq!(args, vec!["--resume"]);
+        }
+        _ => panic!("unexpected shim launch parse result"),
     }
 }
 

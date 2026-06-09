@@ -351,7 +351,11 @@ impl App {
 
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  Enter returns to test. Esc/Ctrl+G or q exits.",
+                if is_error {
+                    "  Enter returns to test. Esc/Ctrl+G or q exits."
+                } else {
+                    "  s switches a running process. Enter returns to test. Esc/Ctrl+G or q exits."
+                },
                 Style::default().fg(DIM),
             ))),
             sections[3],

@@ -11,6 +11,62 @@ pub enum ProfileKind {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocalGatewayToolMode {
+    #[default]
+    Auto,
+    SearchFetch,
+    FetchOnly,
+    GatewayOnly,
+}
+
+impl LocalGatewayToolMode {
+    pub const EXPLICIT: [Self; 3] = [Self::SearchFetch, Self::FetchOnly, Self::GatewayOnly];
+
+    pub fn parse_cli(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "search-fetch" => Some(Self::SearchFetch),
+            "fetch-only" => Some(Self::FetchOnly),
+            "gateway-only" => Some(Self::GatewayOnly),
+            _ => None,
+        }
+    }
+
+    pub fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SearchFetch => "search-fetch",
+            Self::FetchOnly => "fetch-only",
+            Self::GatewayOnly => "gateway-only",
+        }
+    }
+
+    pub fn shim_suffix(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::SearchFetch => Some("search-fetch"),
+            Self::FetchOnly => Some("fetch-only"),
+            Self::GatewayOnly => Some("gateway"),
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn requires_tinyfish(self) -> bool {
+        matches!(self, Self::SearchFetch | Self::FetchOnly)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestedLocalGatewayMode {
+    #[default]
+    Omitted,
+    Explicit(LocalGatewayToolMode),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServer {
     /// Auto-generated short ID (e.g. "mcp_a1b2").
@@ -141,6 +197,7 @@ pub struct ConfigInspection {
     pub registry_path: PathBuf,
     pub profiles_dir: PathBuf,
     pub generated_root: PathBuf,
+    pub runtime_root: PathBuf,
     pub profiles: usize,
     pub lightweight_profiles: usize,
     pub full_profiles: usize,
@@ -151,8 +208,18 @@ pub struct ConfigInspection {
     pub generated_mcp_plugins: usize,
     pub generated_tinyfish_plugins: usize,
     pub generated_prompts: usize,
+    pub runtime_sessions: usize,
+    pub active_runtime_sessions: usize,
+    pub stale_runtime_sessions: usize,
+    pub allow_local_runtime_hot_switch: bool,
     pub cmd_shims_dir: Option<PathBuf>,
     pub shell_shims_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GlobalSettings {
+    #[serde(default)]
+    pub allow_local_runtime_hot_switch: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +253,8 @@ pub struct ConfigBundle {
     pub profiles: Vec<Profile>,
     pub providers: Vec<Provider>,
     pub mcp_servers: Vec<McpServer>,
+    #[serde(default)]
+    pub settings: Option<GlobalSettings>,
     pub secrets_included: bool,
 }
 
@@ -284,6 +353,27 @@ pub struct ShimRecoverySummary {
     pub backup_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AuthMigrationPlan {
+    pub local_files_scanned: usize,
+    pub remote_files_scanned: usize,
+    pub files_to_update_count: usize,
+    pub files_already_ok: usize,
+    pub files_missing: usize,
+    pub files_skipped: usize,
+    pub helpers_overwritten: usize,
+    pub files_to_update: Vec<String>,
+    pub helper_overwrite: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthMigrationSummary {
+    #[serde(flatten)]
+    pub plan: AuthMigrationPlan,
+    pub backup_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderKey {
     /// Auto-generated short ID (e.g. "key_a1b2")
@@ -369,5 +459,71 @@ pub struct Registry {
     #[serde(default)]
     pub providers: HashMap<String, Provider>,
     /// Keyed by profile `id` (UUID).
+    #[serde(default)]
     pub profiles: HashMap<String, Profile>,
+    #[serde(default)]
+    pub settings: GlobalSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeSessionStatus {
+    #[default]
+    Active,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeSessionState {
+    pub schema: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub status: RuntimeSessionStatus,
+    pub pid: Option<u32>,
+    pub process_started_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub profile_id: String,
+    pub profile_name: String,
+    #[serde(default)]
+    pub profile_alias: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub provider_name: Option<String>,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub key_name: Option<String>,
+    pub auth_token: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub default_opus_model: Option<String>,
+    #[serde(default)]
+    pub default_sonnet_model: Option<String>,
+    #[serde(default)]
+    pub default_haiku_model: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub subagent_model: Option<String>,
+    #[serde(default)]
+    pub extras: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeSessionInfo {
+    pub state: RuntimeSessionState,
+    pub state_path: PathBuf,
+    pub settings_path: PathBuf,
+    pub active: bool,
+    pub stale_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeGcSummary {
+    pub scanned: usize,
+    pub removed: usize,
+    pub kept: usize,
 }

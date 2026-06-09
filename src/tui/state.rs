@@ -33,6 +33,22 @@ pub(super) enum Mode {
         body: String,
         is_error: bool,
     },
+    ProcessSwitchPicker {
+        provider_id: String,
+        key_id: String,
+        return_mode: Box<Mode>,
+    },
+    ProcessSwitchModelConfirm {
+        session_id: String,
+        provider_id: String,
+        key_id: String,
+        return_mode: Box<Mode>,
+    },
+    LocalGatewayLaunchPicker {
+        profile_id: String,
+        use_stored_args: bool,
+        base_url: String,
+    },
     LiteModelSelect {
         profile_name: String,
         token: String,
@@ -120,6 +136,7 @@ pub(super) enum Page {
     Profile,
     Provider,
     Mcp,
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -176,6 +193,10 @@ pub struct App {
     pub(super) provider_test_models: Vec<String>,
     pub(super) provider_test_model_fetch_state: ModelFetchState,
     pub(super) provider_test_model_selected: usize,
+    pub(super) runtime_sessions_cache: Vec<RuntimeSessionInfo>,
+    pub(super) runtime_session_selected: usize,
+    pub(super) runtime_switch_model_buf: String,
+    pub(super) local_gateway_mode_selected: usize,
     pub(super) message_return_mode: Option<Mode>,
     pub(super) providers_cache: Vec<Provider>,
     pub(super) provider_keys_cache: Vec<ProviderKey>,
@@ -210,6 +231,7 @@ pub struct App {
     pub(super) public_site_total: usize,
     pub(super) public_site_status: String,
     pub(super) public_site_event_rx: Option<mpsc::Receiver<PublicSiteWorkerEvent>>,
+    pub(super) settings_allow_local_runtime_hot_switch: bool,
     pub(super) lite_mod_opus: String,
     pub(super) lite_mod_sonnet: String,
     pub(super) lite_mod_haiku: String,
@@ -222,6 +244,8 @@ pub struct App {
 impl App {
     pub fn new(manager: ProfileManager) -> Result<Self> {
         let profiles = manager.list_profiles()?;
+        let allow_local_runtime_hot_switch =
+            manager.allow_local_runtime_hot_switch().unwrap_or(false);
         let filtered_indices: Vec<usize> = (0..profiles.len()).collect();
         let mut list_state = ListState::default();
         if !profiles.is_empty() {
@@ -271,6 +295,10 @@ impl App {
             provider_test_models: Vec::new(),
             provider_test_model_fetch_state: ModelFetchState::Loaded,
             provider_test_model_selected: 0,
+            runtime_sessions_cache: Vec::new(),
+            runtime_session_selected: 0,
+            runtime_switch_model_buf: String::new(),
+            local_gateway_mode_selected: 0,
             message_return_mode: None,
             providers_cache: Vec::new(),
             provider_keys_cache: Vec::new(),
@@ -305,6 +333,7 @@ impl App {
             public_site_total: 0,
             public_site_status: String::new(),
             public_site_event_rx: None,
+            settings_allow_local_runtime_hot_switch: allow_local_runtime_hot_switch,
             lite_edit_id: String::new(),
             lite_mod_opus: String::new(),
             lite_mod_sonnet: String::new(),

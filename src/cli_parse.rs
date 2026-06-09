@@ -75,9 +75,9 @@ pub(crate) fn render_shell_hook(shell: &str) -> Result<String> {
         & cswitch use $profile -- @args
         return
     }
-    $cmd = Get-Command claude.exe -CommandType Application -ErrorAction SilentlyContinue
+    $cmd = Get-Command claude -CommandType Application,ExternalScript -ErrorAction SilentlyContinue
     if (-not $cmd) {
-        throw "claude.exe was not found on PATH"
+        throw "claude was not found on PATH"
     }
     & $cmd.Source @args
 }"#
@@ -133,6 +133,14 @@ mod tests {
         let hook = super::render_shell_hook("fish").unwrap();
         assert!(hook.contains("(command cswitch shell current"));
         assert!(hook.contains("command cswitch use"));
+    }
+
+    #[test]
+    fn powershell_shell_hook_uses_suffix_aware_claude_lookup() {
+        let hook = super::render_shell_hook("powershell").unwrap();
+        assert!(hook.contains("Get-Command claude -CommandType Application,ExternalScript"));
+        assert!(hook.contains("throw \"claude was not found on PATH\""));
+        assert!(!hook.contains("Get-Command claude.exe"));
     }
 
     #[cfg(not(windows))]

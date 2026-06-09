@@ -39,6 +39,10 @@ impl App {
                 self.render_mcp_list_page(f, cols[0]);
                 self.render_mcp_detail_page(f, cols[1]);
             }
+            Page::Settings => {
+                self.render_settings_summary(f, cols[0]);
+                self.render_settings_detail(f, cols[1]);
+            }
         }
         self.render_footer(f, layout[2]);
 
@@ -55,6 +59,9 @@ impl App {
             Mode::ProviderAnthropicOutcome { .. } => {
                 self.render_provider_anthropic_outcome_popup(f)
             }
+            Mode::ProcessSwitchPicker { .. } => self.render_process_switch_picker_popup(f),
+            Mode::ProcessSwitchModelConfirm { .. } => self.render_process_switch_model_popup(f),
+            Mode::LocalGatewayLaunchPicker { .. } => self.render_local_gateway_launch_popup(f),
             Mode::LiteModelSelect { .. } | Mode::LiteEdit { .. } => {
                 self.render_lite_model_select_popup(f)
             }
@@ -113,11 +120,24 @@ impl App {
                 ("Ctrl+P/N", "results"),
                 ("PgUp/PgDn", "page"),
                 ("h/s/o/m/a", "slot test"),
+                ("Shift+S", "switch proc"),
                 ("enter/q", "close"),
                 ("esc/Ctrl+G", "back"),
             ]
         } else if matches!(self.mode, Mode::ProviderAnthropicOutcome { .. }) {
-            vec![("any key", "back"), ("q", "quit")]
+            vec![("s", "switch proc"), ("any key", "back"), ("q", "quit")]
+        } else if matches!(self.mode, Mode::ProcessSwitchPicker { .. }) {
+            vec![
+                ("Ctrl+P/N", "process"),
+                ("enter", "pick"),
+                ("esc/Ctrl+G", "back"),
+            ]
+        } else if matches!(self.mode, Mode::ProcessSwitchModelConfirm { .. }) {
+            vec![
+                ("type", "model"),
+                ("enter", "switch"),
+                ("esc/Ctrl+G", "picker"),
+            ]
         } else if matches!(self.mode, Mode::ProviderAnthropicTest { .. }) {
             vec![
                 ("Ctrl+N/P", "field"),
@@ -142,6 +162,7 @@ impl App {
                     ("Ctrl+P/N", "nav"),
                     ("enter", "launch"),
                     ("Shift+Enter", "w/o args"),
+                    ("g", "gateway mode"),
                     ("/", "search"),
                     ("t", "lite"),
                     ("T", "public test"),
@@ -175,6 +196,11 @@ impl App {
                     ("Ctrl+Y", "import"),
                     ("enter", "link count"),
                     ("?", "help"),
+                    ("Shift+Tab", "settings"),
+                    ("q", "quit"),
+                ],
+                Page::Settings => vec![
+                    ("enter/space", "toggle"),
                     ("Shift+Tab", "profiles"),
                     ("q", "quit"),
                 ],
@@ -193,6 +219,149 @@ impl App {
             .collect();
 
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+    }
+
+    fn render_settings_summary(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(" Settings ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL));
+        let enabled = self.settings_allow_local_runtime_hot_switch;
+        let line = Line::from(vec![
+            Span::styled(
+                if enabled { " [x] " } else { " [ ] " },
+                Style::default().fg(ACCENT).bold(),
+            ),
+            Span::styled(
+                "Legacy localhost/LAN runtime override",
+                Style::default().fg(TEXT),
+            ),
+        ]);
+        f.render_widget(
+            Paragraph::new(line).block(block).wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_settings_detail(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(" Global Policy ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL));
+        let status = "Local/self-hosted lite profiles always launch directly, use an inline apiKeyHelper, and cannot use dynamic process switch.";
+        let body = Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(status, Style::default().fg(TEXT))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Local/self-hosted hosts: localhost, *.localhost, 127.*, ::1, 10.*, 192.168.*, 172.16-31.*",
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "The toggle is kept only for legacy compatibility and does not re-enable runtime sessions for local lite profiles.",
+                Style::default().fg(ACCENT),
+            )),
+        ]);
+        f.render_widget(
+            Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    pub(super) fn render_local_gateway_launch_popup(&self, f: &mut Frame) {
+        let (profile_id, use_stored_args, base_url) = match &self.mode {
+            Mode::LocalGatewayLaunchPicker {
+                profile_id,
+                use_stored_args,
+                base_url,
+            } => (profile_id, *use_stored_args, base_url),
+            _ => return,
+        };
+        let area = centered_rect(82, 15, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Local Gateway Tool Mode ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(block.clone(), area);
+
+        let profile_name = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == *profile_id)
+            .map(|profile| profile.name.as_str())
+            .unwrap_or("unknown");
+        let launch_style = if use_stored_args {
+            "with stored extra args"
+        } else {
+            "without stored extra args"
+        };
+        let modes = [
+            (
+                "Search + Fetch",
+                "Force both WebSearch and WebFetch through TinyFish.",
+            ),
+            (
+                "Fetch Only",
+                "Keep search native to the gateway and force fetch through TinyFish.",
+            ),
+            (
+                "Gateway Only",
+                "Disable TinyFish routing and rely on the gateway's built-in tools.",
+            ),
+        ];
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("  Profile  ", Style::default().fg(DIM)),
+                Span::styled(profile_name, Style::default().fg(TEXT).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("  Base URL ", Style::default().fg(DIM)),
+                Span::styled(base_url.as_str(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Launch   ", Style::default().fg(DIM)),
+                Span::styled(launch_style, Style::default().fg(TEXT)),
+            ]),
+            Line::from(""),
+        ];
+        for (index, (label, description)) in modes.iter().enumerate() {
+            let selected = index == self.local_gateway_mode_selected;
+            let style = if selected {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(TEXT)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", if selected { "▶" } else { " " }), style),
+                Span::styled(*label, style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(*description, Style::default().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Ctrl+P/N selects. Enter launches. Esc/Ctrl+G cancels.",
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(Block::default())
+                .wrap(Wrap { trim: false }),
+            block.inner(area),
+        );
     }
 
     pub(super) fn render_confirm_delete_popup(&self, f: &mut Frame) {

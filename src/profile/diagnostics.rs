@@ -40,11 +40,22 @@ impl ProfileManager {
         #[cfg(target_os = "windows")]
         let shell_shims_dir = None;
 
+        let runtime_root = self.runtime_root_dir();
+        let runtime_sessions = self.list_runtime_sessions().unwrap_or_default();
+        let active_runtime_sessions = runtime_sessions
+            .iter()
+            .filter(|session| session.active)
+            .count();
+        let stale_runtime_sessions = runtime_sessions
+            .len()
+            .saturating_sub(active_runtime_sessions);
+
         Ok(ConfigInspection {
             base_dir: self.base_dir(),
             registry_path: self.registry_path.clone(),
             profiles_dir: self.profiles_dir.clone(),
             generated_root: self.generated_root_dir(),
+            runtime_root,
             profiles: profiles.len(),
             lightweight_profiles,
             full_profiles,
@@ -64,6 +75,10 @@ impl ProfileManager {
                 &self.generated_prompts_dir(),
                 Self::is_managed_generated_prompt_name,
             ),
+            runtime_sessions: runtime_sessions.len(),
+            active_runtime_sessions,
+            stale_runtime_sessions,
+            allow_local_runtime_hot_switch: registry.settings.allow_local_runtime_hot_switch,
             cmd_shims_dir,
             shell_shims_dir,
         })
@@ -71,6 +86,7 @@ impl ProfileManager {
 
     pub fn doctor_report(&self) -> Result<DoctorReport> {
         let mut report = DoctorReport::default();
+        let _ = self.garbage_collect_runtime_sessions();
         let base_dir = self.base_dir();
         if base_dir.exists() {
             report.items.push(Self::diagnostic(
@@ -115,6 +131,40 @@ impl ProfileManager {
                 "profiles",
                 "no profiles are configured".to_string(),
                 Some("add one with cswitch add <name>".to_string()),
+            ));
+        }
+
+        let runtime_root = self.runtime_root_dir();
+        if runtime_root.exists() {
+            report.items.push(Self::diagnostic(
+                DiagnosticLevel::Ok,
+                "runtime",
+                format!("runtime directory exists: {}", runtime_root.display()),
+                None,
+            ));
+        }
+        let runtime_sessions = self.list_runtime_sessions().unwrap_or_default();
+        let stale_sessions = runtime_sessions
+            .iter()
+            .filter(|session| !session.active)
+            .collect::<Vec<_>>();
+        report.items.push(Self::diagnostic(
+            DiagnosticLevel::Ok,
+            "runtime",
+            format!(
+                "{} runtime session(s) found ({} active, {} stale)",
+                runtime_sessions.len(),
+                runtime_sessions.len().saturating_sub(stale_sessions.len()),
+                stale_sessions.len()
+            ),
+            None,
+        ));
+        for stale in stale_sessions {
+            report.items.push(Self::diagnostic(
+                DiagnosticLevel::Warn,
+                "runtime",
+                format!("runtime session '{}' is stale", stale.state.session_id),
+                stale.stale_reason.clone(),
             ));
         }
 
@@ -430,58 +480,7 @@ impl ProfileManager {
     }
 
     pub(super) fn command_exists(command: &str) -> bool {
-        let command = command.trim();
-        if command.is_empty() {
-            return false;
-        }
-        if command.contains('/') || command.contains('\\') {
-            return Path::new(command).is_file();
-        }
-        let Some(paths) = env::var_os("PATH") else {
-            return false;
-        };
-
-        #[cfg(target_os = "windows")]
-        {
-            let has_extension = Path::new(command).extension().is_some();
-            let pathext = env::var_os("PATHEXT")
-                .map(|value| {
-                    value
-                        .to_string_lossy()
-                        .split(';')
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|values| !values.is_empty())
-                .unwrap_or_else(|| {
-                    vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()]
-                });
-            for dir in env::split_paths(&paths) {
-                if dir.join(command).is_file() {
-                    return true;
-                }
-                if !has_extension {
-                    for ext in &pathext {
-                        if dir.join(format!("{command}{ext}")).is_file() {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            for dir in env::split_paths(&paths) {
-                if dir.join(command).is_file() {
-                    return true;
-                }
-            }
-        }
-
-        false
+        super::local_command_exists(command)
     }
 
     fn read_profile_marker(path: &Path) -> Result<Option<String>> {

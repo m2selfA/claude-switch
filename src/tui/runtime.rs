@@ -81,6 +81,13 @@ impl App {
                 Page::Mcp
             }
             Page::Mcp => {
+                self.settings_allow_local_runtime_hot_switch = self
+                    .manager
+                    .allow_local_runtime_hot_switch()
+                    .unwrap_or(false);
+                Page::Settings
+            }
+            Page::Settings => {
                 self.refresh()?;
                 Page::Profile
             }
@@ -231,6 +238,15 @@ impl App {
                         }
                         Mode::ProviderAnthropicOutcome { .. } => {
                             self.handle_provider_anthropic_outcome(key.code, key.modifiers)?;
+                        }
+                        Mode::ProcessSwitchPicker { .. } => {
+                            self.handle_process_switch_picker(key.code, key.modifiers)?;
+                        }
+                        Mode::ProcessSwitchModelConfirm { .. } => {
+                            self.handle_process_switch_model_confirm(key.code, key.modifiers)?;
+                        }
+                        Mode::LocalGatewayLaunchPicker { .. } => {
+                            self.handle_local_gateway_launch_mode(key.code, key.modifiers)?;
                         }
                         Mode::EditProfile { .. } => {
                             self.handle_edit_profile(key.code, key.modifiers)?;
@@ -384,6 +400,13 @@ impl App {
                     );
                 }
             }
+            Mode::ProcessSwitchModelConfirm { .. } => {
+                insert_str_at_cursor(
+                    &mut self.runtime_switch_model_buf,
+                    &mut self.cursor_pos,
+                    text,
+                );
+            }
             Mode::PublicSitePrompt => {
                 insert_str_at_cursor(&mut self.public_site_prompt_buf, &mut self.cursor_pos, text);
             }
@@ -438,7 +461,32 @@ impl App {
             Page::Profile => self.handle_profile_page_key(code, modifiers),
             Page::Provider => self.handle_provider_page_normal_key(code, modifiers),
             Page::Mcp => self.handle_mcp_page_normal_key(code, modifiers),
+            Page::Settings => self.handle_settings_page_normal_key(code, modifiers),
         }
+    }
+
+    fn handle_settings_page_normal_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<bool> {
+        if matches!(code, KeyCode::Enter | KeyCode::Char(' ')) && modifiers.is_empty() {
+            self.settings_allow_local_runtime_hot_switch =
+                !self.settings_allow_local_runtime_hot_switch;
+            self.manager
+                .set_allow_local_runtime_hot_switch(self.settings_allow_local_runtime_hot_switch)?;
+            let status = if self.settings_allow_local_runtime_hot_switch {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            self.show_message(
+                format!("Local/self-hosted runtime hot switch {}.", status),
+                false,
+                Some(Mode::Normal),
+            );
+        }
+        Ok(false)
     }
 
     pub(super) fn sync_shims(&self) {

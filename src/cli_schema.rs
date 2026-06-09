@@ -56,6 +56,9 @@ pub(crate) enum Commands {
         /// Skip profile's stored launch args (e.g. --dangerously-skip-permissions)
         #[arg(long = "no-extras")]
         no_extras: bool,
+        /// Local gateway mode for localhost/LAN self-hosted lightweight profiles: auto, search-fetch, fetch-only, or gateway-only
+        #[arg(long = "local-gateway-mode")]
+        local_gateway_mode: Option<String>,
         /// Additional passthrough args passed directly to claude (use -- to separate)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -128,6 +131,24 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: McpCommands,
     },
+
+    /// Inspect and switch running lightweight Claude sessions
+    Process {
+        #[command(subcommand)]
+        command: ProcessCommands,
+    },
+
+    #[command(hide = true)]
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
+
+    #[command(hide = true)]
+    Shim {
+        #[command(subcommand)]
+        command: ShimCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -137,6 +158,12 @@ pub(crate) enum ConfigCommands {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Show or update global claude-switch settings
+    Settings {
+        #[command(subcommand)]
+        command: ConfigSettingsCommands,
     },
 
     /// Export profiles, providers, and MCP registry entries as a portable bundle
@@ -189,6 +216,39 @@ pub(crate) enum ConfigCommands {
         /// Replace existing profiles with matching name or alias
         #[arg(long)]
         replace: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Migrate token-based Claude settings auth to apiKeyHelper
+    MigrateAuth {
+        /// Write changes to settings files; omitted means preview only
+        #[arg(long)]
+        write: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Also migrate ~/.claude/settings.json on remote hosts; repeatable
+        #[arg(long)]
+        remote: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigSettingsCommands {
+    /// Show persisted global settings
+    Show {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Update persisted global settings
+    Set {
+        /// Allow runtime hot-switch for localhost/LAN self-hosted APIs
+        #[arg(long)]
+        allow_local_runtime_hot_switch: bool,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -483,5 +543,66 @@ pub(crate) enum McpCommands {
         /// Exit non-zero when warnings are present; errors always fail
         #[arg(long)]
         strict: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ProcessCommands {
+    /// List runtime-managed Claude sessions
+    List,
+
+    /// Show one runtime-managed Claude session
+    Inspect {
+        /// Session id
+        session_id: String,
+    },
+
+    /// Switch a running Claude session to a provider/key/model
+    Switch {
+        /// Session id
+        session_id: String,
+        /// Provider id
+        #[arg(short, long)]
+        provider: String,
+        /// Key id
+        #[arg(short, long)]
+        key: String,
+        /// Model id to set as ANTHROPIC_MODEL
+        #[arg(short, long)]
+        model: String,
+    },
+
+    /// Remove stale runtime session directories
+    Gc,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RuntimeCommands {
+    /// Print the auth token for one runtime session
+    Auth {
+        /// Session id
+        session_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ShimCommands {
+    /// Probe runtime shim-launch support
+    Launch {
+        /// Probe only; do not launch anything
+        #[arg(long)]
+        probe: bool,
+        /// Profile id
+        #[arg(long = "profile-id")]
+        profile_id: Option<String>,
+        /// Skip stored launch args
+        #[arg(long = "no-extras")]
+        no_extras: bool,
+        /// Local gateway mode for localhost/LAN self-hosted lightweight profiles
+        #[arg(long = "local-gateway-mode")]
+        local_gateway_mode: Option<String>,
+        /// Additional passthrough args passed directly to claude (use -- to separate)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }

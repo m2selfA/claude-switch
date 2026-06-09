@@ -22,17 +22,15 @@ impl ProfileManager {
         if profiles.is_empty() {
             return Ok("# No profiles found. Add one with: cswitch add <name>".to_string());
         }
-        // If ~/.varusers/bin exists, sync self-contained shell scripts there.
-        // Otherwise fall back to bash-aliases / bashrc.d.
-        if let Ok(bin) = Self::sh_bin_dir() {
-            if bin.exists() && bin.is_dir() {
-                let report = self.sync_sh_scripts()?;
-                return Ok(format!(
-                    "# Shell scripts synced to {}\n{}",
-                    bin.display(),
-                    report
-                ));
-            }
+        // Prefer ~/.varusers/bin only when it is already on PATH.
+        // Otherwise use ~/.local/bin when it exists, then fall back to bashrc.d aliases.
+        if let Some(bin) = Self::preferred_local_shim_bin_dir()? {
+            let report = self.sync_sh_scripts_to_dir(&bin)?;
+            return Ok(format!(
+                "# Shell scripts synced to {}\n{}",
+                bin.display(),
+                report
+            ));
         }
         self.generate_shell_aliases_with_bashrc_d(&profiles)
     }

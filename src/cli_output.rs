@@ -3,9 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::profile::{
-    ConfigBundleValidation, ConfigImportPlan, ConfigImportSummary, ConfigInspection,
-    DiagnosticItem, DoctorReport, McpValidationIssue, ShimRecoveryPlan, ShimRecoverySummary,
-    StatuslineInfo,
+    AuthMigrationPlan, AuthMigrationSummary, ConfigBundleValidation, ConfigImportPlan,
+    ConfigImportSummary, ConfigInspection, DiagnosticItem, DoctorReport, GlobalSettings,
+    McpValidationIssue, RuntimeGcSummary, RuntimeSessionInfo, ShimRecoveryPlan,
+    ShimRecoverySummary, StatuslineInfo,
 };
 
 pub(crate) fn print_doctor_report(report: &DoctorReport) {
@@ -48,6 +49,10 @@ pub(crate) fn print_config_inspection(inspection: &ConfigInspection) {
         "Generated root:           {}",
         inspection.generated_root.display()
     );
+    println!(
+        "Runtime root:             {}",
+        inspection.runtime_root.display()
+    );
     println!("Profiles:                 {}", inspection.profiles);
     println!(
         "  lightweight/full:       {}/{}",
@@ -66,12 +71,31 @@ pub(crate) fn print_config_inspection(inspection: &ConfigInspection) {
         inspection.generated_tinyfish_plugins
     );
     println!("Generated prompts:        {}", inspection.generated_prompts);
+    println!("Runtime sessions:         {}", inspection.runtime_sessions);
+    println!(
+        "  active/stale:           {}/{}",
+        inspection.active_runtime_sessions, inspection.stale_runtime_sessions
+    );
+    println!(
+        "Legacy local override:   {}",
+        inspection.allow_local_runtime_hot_switch
+    );
     if let Some(dir) = &inspection.cmd_shims_dir {
         println!("CMD shims dir:            {}", dir.display());
     }
     if let Some(dir) = &inspection.shell_shims_dir {
         println!("Shell shims dir:          {}", dir.display());
     }
+}
+
+pub(crate) fn print_global_settings(settings: &GlobalSettings) {
+    println!(
+        "Legacy local override:   {}",
+        settings.allow_local_runtime_hot_switch
+    );
+    println!(
+        "Note: local/self-hosted lite profiles always bypass runtime sessions and use an inline apiKeyHelper."
+    );
 }
 
 pub(crate) fn print_config_import_summary(summary: &ConfigImportSummary, input: &Path) {
@@ -197,6 +221,32 @@ pub(crate) fn print_shim_recovery_counts(plan: &ShimRecoveryPlan, planned: bool)
     println!("Provider keys reused:     {}", plan.provider_keys_reused);
 }
 
+pub(crate) fn print_auth_migration_plan(plan: &AuthMigrationPlan) {
+    println!("Auth migration plan");
+    print_auth_migration_counts(plan);
+    print_plan_items("Settings files to update", &plan.files_to_update);
+    print_plan_items("Helpers to overwrite", &plan.helper_overwrite);
+    print_plan_items("Warnings", &plan.warnings);
+}
+
+pub(crate) fn print_auth_migration_summary(summary: &AuthMigrationSummary) {
+    println!("Auth migration complete.");
+    print_auth_migration_counts(&summary.plan);
+    print_plan_items("Settings files updated", &summary.plan.files_to_update);
+    print_plan_items("Backups written", &summary.backup_paths);
+    print_plan_items("Warnings", &summary.plan.warnings);
+}
+
+pub(crate) fn print_auth_migration_counts(plan: &AuthMigrationPlan) {
+    println!("Local files scanned:      {}", plan.local_files_scanned);
+    println!("Remote files scanned:     {}", plan.remote_files_scanned);
+    println!("Files to update:          {}", plan.files_to_update_count);
+    println!("Files already ok:         {}", plan.files_already_ok);
+    println!("Files missing:            {}", plan.files_missing);
+    println!("Files skipped:            {}", plan.files_skipped);
+    println!("Helpers overwritten:      {}", plan.helpers_overwritten);
+}
+
 pub(crate) fn print_mcp_validation(issues: &[McpValidationIssue]) {
     if issues.is_empty() {
         println!("MCP validation passed.");
@@ -213,6 +263,104 @@ pub(crate) fn print_mcp_validation(issues: &[McpValidationIssue]) {
             println!("      {:<24} hint: {}", "", hint);
         }
     }
+}
+
+pub(crate) fn print_runtime_session_list(sessions: &[RuntimeSessionInfo]) {
+    if sessions.is_empty() {
+        println!("No runtime sessions found.");
+        return;
+    }
+    println!(
+        "{:<14} {:<8} {:<7} {:<18} {:<18} CWD",
+        "SESSION", "PID", "STATUS", "PROFILE", "PROVIDER/KEY"
+    );
+    println!("{}", "─".repeat(96));
+    for session in sessions {
+        let pid = session
+            .state
+            .pid
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let status = if session.active { "active" } else { "stale" };
+        let profile = session
+            .state
+            .profile_alias
+            .as_ref()
+            .map(|alias| format!("{} ({alias})", session.state.profile_name))
+            .unwrap_or_else(|| session.state.profile_name.clone());
+        let provider = format!(
+            "{}/{}",
+            session.state.provider_name.as_deref().unwrap_or("inline"),
+            session.state.key_name.as_deref().unwrap_or("no-key")
+        );
+        let cwd = session
+            .state
+            .cwd
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "—".to_string());
+        println!(
+            "{:<14} {:<8} {:<7} {:<18} {:<18} {}",
+            session.state.session_id, pid, status, profile, provider, cwd
+        );
+    }
+}
+
+pub(crate) fn print_runtime_session(session: &RuntimeSessionInfo) {
+    println!("Session:                  {}", session.state.session_id);
+    println!(
+        "Status:                   {}",
+        if session.active { "active" } else { "stale" }
+    );
+    if let Some(reason) = &session.stale_reason {
+        println!("Stale reason:             {}", reason);
+    }
+    if let Some(pid) = session.state.pid {
+        println!("PID:                      {}", pid);
+    }
+    println!(
+        "Profile:                  {}",
+        session
+            .state
+            .profile_alias
+            .as_ref()
+            .map(|alias| format!("{} ({alias})", session.state.profile_name))
+            .unwrap_or_else(|| session.state.profile_name.clone())
+    );
+    println!(
+        "Provider:                 {}",
+        session.state.provider_name.as_deref().unwrap_or("inline")
+    );
+    println!(
+        "Key:                      {}",
+        session.state.key_name.as_deref().unwrap_or("no-key")
+    );
+    println!("Base URL:                 {}", session.state.base_url);
+    if let Some(model) = &session.state.model {
+        println!("Model:                    {}", model);
+    }
+    if let Some(cwd) = &session.state.cwd {
+        println!("CWD:                      {}", cwd.display());
+    }
+    println!("State path:               {}", session.state_path.display());
+    println!(
+        "Settings path:            {}",
+        session.settings_path.display()
+    );
+    println!(
+        "Created:                  {}",
+        session.state.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    println!(
+        "Updated:                  {}",
+        session.state.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+}
+
+pub(crate) fn print_runtime_gc_summary(summary: &RuntimeGcSummary) {
+    println!("Runtime GC scanned:       {}", summary.scanned);
+    println!("Runtime GC removed:       {}", summary.removed);
+    println!("Runtime GC kept:          {}", summary.kept);
 }
 
 pub(crate) fn render_statusline(info: &StatuslineInfo) -> String {

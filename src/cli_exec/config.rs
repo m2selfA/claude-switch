@@ -2,6 +2,8 @@ use super::*;
 use anyhow::bail;
 use std::fs;
 
+use crate::cli_output::{print_auth_migration_plan, print_auth_migration_summary};
+
 pub(super) fn handle_config_command(
     manager: &ProfileManager,
     command: ConfigCommands,
@@ -15,6 +17,28 @@ pub(super) fn handle_config_command(
                 print_config_inspection(&inspection);
             }
         }
+        ConfigCommands::Settings { command } => match command {
+            ConfigSettingsCommands::Show { json } => {
+                let settings = manager.global_settings()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&settings)?);
+                } else {
+                    print_global_settings(&settings);
+                }
+            }
+            ConfigSettingsCommands::Set {
+                allow_local_runtime_hot_switch,
+                json,
+            } => {
+                manager.set_allow_local_runtime_hot_switch(allow_local_runtime_hot_switch)?;
+                let settings = manager.global_settings()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&settings)?);
+                } else {
+                    print_global_settings(&settings);
+                }
+            }
+        },
         ConfigCommands::Export {
             profiles,
             output,
@@ -89,6 +113,27 @@ pub(super) fn handle_config_command(
                     println!("{}", serde_json::to_string_pretty(&plan)?);
                 } else {
                     print_shim_recovery_plan(&plan);
+                }
+            }
+        }
+        ConfigCommands::MigrateAuth {
+            write,
+            json,
+            remote,
+        } => {
+            if write {
+                let summary = manager.migrate_auth(&remote)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    print_auth_migration_summary(&summary);
+                }
+            } else {
+                let plan = manager.plan_auth_migration(&remote)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    print_auth_migration_plan(&plan);
                 }
             }
         }

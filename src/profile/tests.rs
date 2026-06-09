@@ -3,16 +3,21 @@ use super::api_test::{
     is_anyrouter_url, patch_anyrouter_beta_header, strip_compat_suffix,
 };
 use super::tinyfish::{
-    build_lightweight_settings, tinyfish_command_succeeds_with_timeout, tinyfish_fetch_only_hooks,
-    tinyfish_full_hooks, tinyfish_hook_command, tinyfish_mode, tinyfish_mode_for_capabilities,
-    tinyfish_plugin_hooks, tinyfish_plugin_manifest, tinyfish_prompt,
+    TinyfishMode, TinyfishPluginVariant, TinyfishRoute, build_lightweight_runtime_artifacts,
+    build_lightweight_runtime_artifacts_with_local_gateway_mode, build_lightweight_settings,
+    tinyfish_command_succeeds_with_timeout, tinyfish_command_succeeds_with_timeout_with_path,
+    tinyfish_hook_command, tinyfish_hook_script, tinyfish_mode, tinyfish_plugin_hooks,
+    tinyfish_plugin_manifest, tinyfish_routes,
 };
 use super::url_match::{NATIVE_FETCH_URLS, NATIVE_SEARCH_URLS, url_matches};
 use super::*;
 use std::collections::HashMap;
+use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 #[cfg(not(windows))]
 const TINYFISH_TIMEOUT_TEST_PROGRAM: &str = "sh";
@@ -32,6 +37,103 @@ fn make_manager(tmp: &TempDir) -> ProfileManager {
         profiles_dir,
         registry_path,
     }
+}
+
+fn auth_migration_env_guard() -> MutexGuard<'static, ()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn process_launch_env_guard() -> MutexGuard<'static, ()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct PathOverrideGuard {
+    original: Option<OsString>,
+}
+
+impl PathOverrideGuard {
+    fn replace(paths: &[PathBuf]) -> Self {
+        let original = env::var_os("PATH");
+        let joined = env::join_paths(paths).expect("test PATH entries should be valid");
+        unsafe {
+            env::set_var("PATH", joined);
+        }
+        Self { original }
+    }
+}
+
+impl Drop for PathOverrideGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.original {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let original = env::var_os(key);
+        unsafe {
+            env::set_var(key, value.as_ref());
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.original {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn write_windows_probe_script(dir: &Path, name: &str, suffix: &str, output: &str) -> PathBuf {
+    let path = dir.join(format!("{name}{suffix}"));
+    fs::write(
+        &path,
+        format!(
+            "@echo off\r\nif /i \"%~1\"==\"--version\" (\r\n  echo {output}\r\n  exit /b 0\r\n)\r\necho unexpected args 1>&2\r\nexit /b 9\r\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[cfg(windows)]
+fn write_windows_volta_probe_shims(dir: &Path, output: &str) {
+    fs::write(
+        dir.join("volta.cmd"),
+        format!(
+            "@echo off\r\nif /i \"%~1\"==\"run\" if /i \"%~2\"==\"tinyfish\" if /i \"%~3\"==\"--version\" (\r\n  echo {output}\r\n  exit /b 0\r\n)\r\necho unexpected args 1>&2\r\nexit /b 9\r\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("tinyfish.cmd"),
+        "@echo off\r\nvolta run %~n0 %*\r\n",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -145,6 +247,17 @@ fn cmd_set_value<'a>(content: &'a str, var_name: &str) -> &'a str {
         .expect("expected set assignment to end with a quote")
 }
 
+fn inline_helper_token(settings: &serde_json::Value) -> Option<String> {
+    let helper = settings.get("apiKeyHelper")?.as_str()?;
+    ProfileManager::extract_inline_api_key_helper_token(helper)
+}
+
+fn assert_inline_helper_token(settings: &serde_json::Value, expected: &str) {
+    assert_eq!(inline_helper_token(settings).as_deref(), Some(expected));
+    let env = settings["env"].as_object().unwrap();
+    assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+}
+
 #[cfg(not(windows))]
 fn tinyfish_timeout_test_args() -> Vec<&'static str> {
     vec!["-c", "sleep 5"]
@@ -221,6 +334,16 @@ fn spawn_model_fetch_server(
         paths
     });
     (format!("http://{}", addr), handle)
+}
+
+fn gateway_cache_model_ids(json: &serde_json::Value) -> Vec<String> {
+    json.get("models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 // ── copy_dir_all ──────────────────────────────────────────────────────────
@@ -1294,6 +1417,207 @@ fn generate_aliases_when_empty_returns_hint() {
 }
 
 #[test]
+fn inline_api_key_helper_round_trips_bash_and_powershell_tokens() {
+    let bash =
+        ProfileManager::inline_api_key_helper_command("sk-don't-$break", TinyfishToolShell::Bash)
+            .unwrap();
+    assert_eq!(
+        ProfileManager::extract_inline_api_key_helper_token(&bash).as_deref(),
+        Some("sk-don't-$break")
+    );
+
+    let powershell = ProfileManager::inline_api_key_helper_command(
+        "sk-don't-$break",
+        TinyfishToolShell::PowerShell,
+    )
+    .unwrap();
+    assert_eq!(
+        ProfileManager::extract_inline_api_key_helper_token(&powershell).as_deref(),
+        Some("sk-don't-$break")
+    );
+}
+
+#[test]
+fn auth_token_from_settings_prefers_env_token_and_accepts_inline_helper() {
+    let env_settings = serde_json::json!({
+        "env": {
+            "ANTHROPIC_AUTH_TOKEN": "sk-env"
+        }
+    });
+    let env_object = env_settings.as_object().unwrap();
+    assert_eq!(
+        ProfileManager::auth_token_from_settings(env_object)
+            .unwrap()
+            .as_deref(),
+        Some("sk-env")
+    );
+
+    let helper_settings = serde_json::json!({
+        "apiKeyHelper": ProfileManager::inline_api_key_helper_command(
+            "sk-helper",
+            TinyfishToolShell::PowerShell,
+        )
+        .unwrap()
+    });
+    let helper_object = helper_settings.as_object().unwrap();
+    assert_eq!(
+        ProfileManager::auth_token_from_settings(helper_object)
+            .unwrap()
+            .as_deref(),
+        Some("sk-helper")
+    );
+}
+
+#[test]
+fn auth_migration_migrates_local_self_hosted_settings() {
+    let _guard = auth_migration_env_guard();
+    let original_home = env::var_os(CLAUDE_SWITCH_HOME_ENV);
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let settings_dir = home.join(".claude");
+    let settings_path = settings_dir.join("settings.json");
+    fs::create_dir_all(&settings_dir).unwrap();
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "sk-local",
+                "ANTHROPIC_BASE_URL": "http://localhost:11434/v1"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    unsafe {
+        env::set_var(CLAUDE_SWITCH_HOME_ENV, home);
+    }
+    let mgr = ProfileManager::new().unwrap();
+    let summary = mgr.migrate_auth(&[]).unwrap();
+    unsafe {
+        match original_home {
+            Some(value) => env::set_var(CLAUDE_SWITCH_HOME_ENV, value),
+            None => env::remove_var(CLAUDE_SWITCH_HOME_ENV),
+        }
+    }
+    assert_eq!(summary.plan.files_to_update_count, 1);
+    assert_eq!(summary.plan.files_already_ok, 0);
+
+    let migrated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        migrated["env"]["ANTHROPIC_BASE_URL"].as_str(),
+        Some("http://localhost:11434/v1")
+    );
+    assert_inline_helper_token(&migrated, "sk-local");
+}
+
+#[test]
+fn migrate_auth_preserves_unrelated_settings_content() {
+    let _guard = auth_migration_env_guard();
+    let original_home = env::var_os(CLAUDE_SWITCH_HOME_ENV);
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let claude_dir = home.join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    let settings_path = claude_dir.join("settings.json");
+    let original = serde_json::json!({
+        "theme": "dark",
+        "custom": {
+            "enabled": true,
+            "list": ["a", "b"]
+        },
+        "env": {
+            "ANTHROPIC_AUTH_TOKEN": "sk-preserve",
+            "ANTHROPIC_BASE_URL": "https://api.example.invalid",
+            "OTHER": "keep-me"
+        }
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&original).unwrap() + "\n",
+    )
+    .unwrap();
+
+    // Guarded by a process-wide mutex so this test is the only one mutating env.
+    unsafe {
+        env::set_var(CLAUDE_SWITCH_HOME_ENV, home);
+    }
+    let mgr = ProfileManager::new().unwrap();
+    let summary = mgr.migrate_auth(&[]).unwrap();
+    unsafe {
+        match original_home {
+            Some(value) => env::set_var(CLAUDE_SWITCH_HOME_ENV, value),
+            None => env::remove_var(CLAUDE_SWITCH_HOME_ENV),
+        }
+    }
+
+    assert_eq!(summary.plan.files_to_update_count, 1);
+    let migrated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let mut expected = original.clone();
+    let expected_object = expected.as_object_mut().unwrap();
+    let expected_env = expected_object
+        .get_mut("env")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    expected_env.remove("ANTHROPIC_AUTH_TOKEN");
+    expected_object.insert(
+        "apiKeyHelper".into(),
+        serde_json::Value::String(
+            ProfileManager::inline_api_key_helper_command(
+                "sk-preserve",
+                mgr.native_runtime_tool_shell(),
+            )
+            .unwrap(),
+        ),
+    );
+
+    assert_eq!(migrated, expected);
+}
+
+#[test]
+fn preferred_local_shim_bin_dir_prefers_varusers_when_on_path() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let varusers_bin = ProfileManager::sh_bin_dir_for_home(home);
+    let local_bin = ProfileManager::local_bin_dir_for_home(home);
+    fs::create_dir_all(&varusers_bin).unwrap();
+    fs::create_dir_all(&local_bin).unwrap();
+    let path_env = std::env::join_paths([local_bin.clone(), varusers_bin.clone()]).unwrap();
+
+    let selected =
+        ProfileManager::preferred_local_shim_bin_dir_for_home(home, Some(path_env.as_os_str()));
+
+    assert_eq!(selected.as_deref(), Some(varusers_bin.as_path()));
+}
+
+#[test]
+fn preferred_local_shim_bin_dir_falls_back_to_local_bin_when_varusers_not_on_path() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let varusers_bin = ProfileManager::sh_bin_dir_for_home(home);
+    let local_bin = ProfileManager::local_bin_dir_for_home(home);
+    fs::create_dir_all(&varusers_bin).unwrap();
+    fs::create_dir_all(&local_bin).unwrap();
+    let path_env = std::env::join_paths([local_bin.clone()]).unwrap();
+
+    let selected =
+        ProfileManager::preferred_local_shim_bin_dir_for_home(home, Some(path_env.as_os_str()));
+
+    assert_eq!(selected.as_deref(), Some(local_bin.as_path()));
+}
+
+#[test]
+fn preferred_local_shim_bin_dir_returns_none_when_no_candidate_dir_exists() {
+    let tmp = TempDir::new().unwrap();
+    let selected = ProfileManager::preferred_local_shim_bin_dir_for_home(tmp.path(), None);
+
+    assert!(selected.is_none());
+}
+
+#[test]
 fn recover_shims_parses_legacy_cmd_and_groups_provider_keys() {
     let tmp = TempDir::new().unwrap();
     let mgr = make_manager(&tmp);
@@ -1381,6 +1705,84 @@ fn recover_shims_parses_current_cmd_settings_variable() {
 }
 
 #[test]
+fn recover_shims_ignores_explicit_local_gateway_variants() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = Profile {
+        id: Uuid::new_v4().to_string(),
+        name: "local gateway".into(),
+        alias: Some("lgw".into()),
+        added: Utc::now(),
+        last_used: None,
+        kind: ProfileKind::Lightweight,
+        env: Some(LightweightEnv {
+            auth_token: Some("sk-local".into()),
+            base_url: Some("http://localhost:11434/v1".into()),
+            model: Some("qwen3".into()),
+            ..Default::default()
+        }),
+        launch_args: None,
+        provider_id: None,
+        key_id: None,
+        mcp_server_ids: Vec::new(),
+    };
+    let shim_dir = tmp.path().join("shims");
+    fs::create_dir_all(&shim_dir).unwrap();
+    fs::write(
+        shim_dir.join("claude-lgw.cmd"),
+        mgr.generate_cmd_content(&profile).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        shim_dir.join("claude-lgw-search-fetch.cmd"),
+        mgr.generate_cmd_content_for_local_gateway_mode(
+            &profile,
+            LocalGatewayToolMode::SearchFetch,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let summary = mgr.recover_shims(&shim_dir, false).unwrap();
+    assert_eq!(summary.plan.profiles_added, 1);
+    assert_eq!(summary.plan.files_recoverable, 1);
+    assert_eq!(mgr.list_profiles().unwrap().len(), 1);
+    assert!(mgr.get_profile("lgw").is_ok());
+}
+
+#[test]
+fn recover_shims_parses_current_shell_settings_variable() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = Profile {
+        id: Uuid::new_v4().to_string(),
+        name: "shell current".into(),
+        alias: Some("scur".into()),
+        added: Utc::now(),
+        last_used: None,
+        kind: ProfileKind::Lightweight,
+        env: Some(LightweightEnv {
+            auth_token: Some("sk-shell-current".into()),
+            base_url: Some("https://shell-current.example.invalid".into()),
+            model: Some("shell-current-model".into()),
+            ..Default::default()
+        }),
+        launch_args: Some(vec!["--dangerously-skip-permissions".into()]),
+        provider_id: None,
+        key_id: None,
+        mcp_server_ids: Vec::new(),
+    };
+    let content = mgr.generate_sh_content(&profile).unwrap();
+    let recovered = ProfileManager::parse_recoverable_shim("claude-scur", &content).unwrap();
+    assert_eq!(recovered.name, "shell current");
+    assert_eq!(recovered.alias, "scur");
+    assert_eq!(recovered.token, "sk-shell-current");
+    assert_eq!(recovered.base_url, "https://shell-current.example.invalid");
+    assert_eq!(recovered.env.model.as_deref(), Some("shell-current-model"));
+    assert!(recovered.launch_args.is_none());
+}
+
+#[test]
 fn recover_shims_parses_shell_settings_env() {
     let content = r#"#!/usr/bin/env bash
 # Generated by cswitch (claude-switch) — do not edit manually
@@ -1448,6 +1850,35 @@ fn remote_path_join_matches_target_os_separator() {
 }
 
 #[test]
+fn remote_unix_varusers_path_probe_parses_runner_output() {
+    assert!(
+        ProfileManager::probe_remote_unix_varusers_on_path_with_runner(
+            "host",
+            |_host, _command| Ok("1\n".to_string()),
+        )
+        .unwrap()
+    );
+    assert!(
+        !ProfileManager::probe_remote_unix_varusers_on_path_with_runner(
+            "host",
+            |_host, _command| Ok("0\n".to_string()),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn remote_unix_varusers_path_probe_rejects_unexpected_output() {
+    let err = ProfileManager::probe_remote_unix_varusers_on_path_with_runner(
+        "host",
+        |_host, _command| Ok("maybe\n".to_string()),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("unexpected output"));
+}
+
+#[test]
 fn managed_remote_name_filter_only_matches_generated_prefix() {
     assert!(ProfileManager::is_managed_remote_name(
         RemoteOs::Unix,
@@ -1498,6 +1929,42 @@ fn remote_shim_file_name_skips_full_profiles() {
 }
 
 #[test]
+fn remote_shim_file_names_include_local_gateway_variants_for_local_profiles() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile(
+            "lite",
+            Some("lite-alias"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let names = mgr
+        .remote_shim_file_names(&lite, RemoteOs::Windows)
+        .unwrap();
+    let file_names = names
+        .into_iter()
+        .map(|(file_name, _)| file_name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        file_names,
+        vec![
+            "claude-lite-alias.cmd".to_string(),
+            "claude-lite-alias-search-fetch.cmd".to_string(),
+            "claude-lite-alias-fetch-only.cmd".to_string(),
+            "claude-lite-alias-gateway.cmd".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn remote_upload_batch_includes_chmod_for_unix() {
     let desired = vec![
         ("claude-work".to_string(), "content".to_string()),
@@ -1516,15 +1983,19 @@ fn remote_upload_batch_includes_chmod_for_unix() {
 }
 
 #[test]
-fn remote_upload_batch_skips_chmod_for_sidecars() {
+fn remote_upload_batch_skips_chmod_for_nonexecutable_tinyfish_assets() {
     let desired = vec![
         (
-            "tinyfish-full/.claude-plugin/plugin.json".to_string(),
-            "{\"name\":\"tinyfish-full\"}".to_string(),
+            "tinyfish-router/.claude-plugin/plugin.json".to_string(),
+            "{\"name\":\"tinyfish-router\"}".to_string(),
         ),
         (
-            "tinyfish-full/hooks/hooks.json".to_string(),
+            "tinyfish-router/hooks/hooks.json".to_string(),
             "{\"hooks\":{}}".to_string(),
+        ),
+        (
+            "tinyfish-router/output-styles/route-default.md".to_string(),
+            "style".to_string(),
         ),
     ];
     let batch = ProfileManager::build_remote_upload_batch(
@@ -1534,14 +2005,45 @@ fn remote_upload_batch_skips_chmod_for_sidecars() {
         &desired,
         false,
     );
-    assert_eq!(batch.matches("put ").count(), 2);
+    assert_eq!(batch.matches("put ").count(), 3);
     assert!(batch.contains(
-            "\"/share/home/shark/.claude-switch/generated/plugins/tinyfish-full/.claude-plugin/plugin.json\""
+            "\"/share/home/shark/.claude-switch/generated/plugins/tinyfish-router/.claude-plugin/plugin.json\""
         ));
     assert!(batch.contains(
-        "\"/share/home/shark/.claude-switch/generated/plugins/tinyfish-full/hooks/hooks.json\""
+        "\"/share/home/shark/.claude-switch/generated/plugins/tinyfish-router/hooks/hooks.json\""
+    ));
+    assert!(batch.contains(
+        "\"/share/home/shark/.claude-switch/generated/plugins/tinyfish-router/output-styles/route-default.md\""
     ));
     assert!(!batch.contains("chmod 755"));
+}
+
+#[test]
+fn remote_upload_batch_chmods_tinyfish_scripts_on_unix() {
+    let desired = vec![
+        (
+            "tinyfish-router/scripts/hook-router.sh".to_string(),
+            "#!/usr/bin/env bash".to_string(),
+        ),
+        (
+            "tinyfish-router/scripts/statusline.sh".to_string(),
+            "#!/usr/bin/env bash".to_string(),
+        ),
+    ];
+    let batch = ProfileManager::build_remote_upload_batch(
+        std::path::Path::new("/tmp/cswitch-remote"),
+        "/share/home/shark/.claude-switch/generated/plugins",
+        RemoteOs::Unix,
+        &desired,
+        true,
+    );
+    assert_eq!(batch.matches("put ").count(), 2);
+    assert!(batch.contains(
+        "chmod 755 \"/share/home/shark/.claude-switch/generated/plugins/tinyfish-router/scripts/hook-router.sh\""
+    ));
+    assert!(batch.contains(
+        "chmod 755 \"/share/home/shark/.claude-switch/generated/plugins/tinyfish-router/scripts/statusline.sh\""
+    ));
 }
 
 #[test]
@@ -1759,6 +2261,26 @@ fn url_matches_no() {
 }
 
 #[test]
+fn local_runtime_base_url_detection_covers_localhost_and_lan_hosts() {
+    assert!(is_local_runtime_base_url("http://localhost:11434/v1"));
+    assert!(is_local_runtime_base_url("http://foo.localhost:11434/v1"));
+    assert!(is_local_runtime_base_url("http://127.0.0.1:11434/v1"));
+    assert!(is_local_runtime_base_url("http://[::1]:11434/v1"));
+    assert!(is_local_runtime_base_url("http://10.0.0.7/v1"));
+    assert!(is_local_runtime_base_url("http://192.168.1.9/v1"));
+    assert!(is_local_runtime_base_url("http://172.16.9.9/v1"));
+    assert!(is_local_runtime_base_url("http://172.31.9.9/v1"));
+    assert!(!is_local_runtime_base_url("https://localhost.run"));
+    assert!(!is_local_runtime_base_url(
+        "https://api-localhost.example.invalid"
+    ));
+    assert!(!is_local_runtime_base_url("http://172.15.9.9/v1"));
+    assert!(!is_local_runtime_base_url("http://172.32.9.9/v1"));
+    assert!(!is_local_runtime_base_url("https://api.anthropic.com"));
+    assert!(!is_local_runtime_base_url("https://relay.example.invalid"));
+}
+
+#[test]
 fn deepseek_has_search_but_not_fetch() {
     let base = "https://api.deepseek.com/anthropic";
     assert!(url_matches(base, NATIVE_SEARCH_URLS));
@@ -1780,35 +2302,157 @@ fn proxy_has_neither() {
 
 #[test]
 fn empty_base_url_uses_native_provider_defaults() {
-    assert_eq!(tinyfish_mode(""), TinyfishMode::None);
-    assert_eq!(tinyfish_mode("   "), TinyfishMode::None);
+    assert_eq!(tinyfish_mode("", "claude-sonnet-4"), TinyfishMode::None);
+    assert_eq!(tinyfish_mode("   ", "deepseek-chat"), TinyfishMode::None);
 }
 
 #[test]
 fn tinyfish_mode_accepts_canonical_native_urls() {
     assert_eq!(
-        tinyfish_mode("HTTPS://API.ANTHROPIC.COM:443/"),
+        tinyfish_mode("HTTPS://API.ANTHROPIC.COM:443/", "claude-sonnet-4"),
         TinyfishMode::None
     );
     assert_eq!(
-        tinyfish_mode("https://API.DEEPSEEK.COM:443/anthropic/"),
+        tinyfish_mode("https://API.DEEPSEEK.COM:443/anthropic/", "deepseek-chat"),
         TinyfishMode::FetchOnly
     );
 }
 
 #[test]
-fn tinyfish_mode_uses_search_only_for_fetch_native_only() {
+fn tinyfish_routes_use_provider_capabilities() {
     assert_eq!(
-        tinyfish_mode_for_capabilities(false, true),
-        TinyfishMode::SearchOnly
+        tinyfish_routes("https://api.deepseek.com/anthropic", "claude-sonnet-4"),
+        (TinyfishRoute::Native, TinyfishRoute::Tinyfish)
     );
-    let hooks =
-        tinyfish_plugin_hooks(TinyfishMode::SearchOnly, TinyfishToolShell::PowerShell).unwrap();
-    assert!(hooks.contains("WebSearch"));
-    assert!(!hooks.contains("WebFetch"));
-    let manifest = tinyfish_plugin_manifest(TinyfishMode::SearchOnly).unwrap();
+    assert_eq!(
+        tinyfish_routes("https://api.anthropic.com", "qwen-max"),
+        (TinyfishRoute::Tinyfish, TinyfishRoute::Tinyfish)
+    );
+}
+
+#[test]
+fn tinyfish_plugin_manifest_contains_router_metadata() {
+    let manifest = tinyfish_plugin_manifest(TinyfishPluginVariant::Router);
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
-    assert_eq!(manifest["name"].as_str(), Some("tinyfish-search-only"));
+    assert_eq!(manifest["name"].as_str(), Some("tinyfish-router"));
+    assert_eq!(manifest["displayName"].as_str(), Some("TinyFish Router"));
+    assert_eq!(manifest["outputStyles"].as_str(), Some("./output-styles"));
+}
+
+#[test]
+fn tinyfish_plugin_manifest_uses_mode_specific_names_for_static_local_gateway_plugins() {
+    let full: serde_json::Value =
+        serde_json::from_str(&tinyfish_plugin_manifest(TinyfishPluginVariant::Full)).unwrap();
+    assert_eq!(full["name"].as_str(), Some("tinyfish-full"));
+    assert_eq!(full["displayName"].as_str(), Some("TinyFish Full"));
+
+    let fetch_only: serde_json::Value =
+        serde_json::from_str(&tinyfish_plugin_manifest(TinyfishPluginVariant::FetchOnly)).unwrap();
+    assert_eq!(fetch_only["name"].as_str(), Some("tinyfish-fetch-only"));
+    assert_eq!(
+        fetch_only["displayName"].as_str(),
+        Some("TinyFish Fetch Only")
+    );
+}
+
+#[test]
+fn tinyfish_artifacts_use_default_models_before_forcing_router() {
+    let env = LightweightEnv {
+        base_url: Some("https://api.anthropic.com".into()),
+        default_sonnet_model: Some("claude-sonnet-4".into()),
+        ..Default::default()
+    };
+    let artifacts = build_lightweight_runtime_artifacts(
+        &env,
+        Some("sk-test"),
+        env.base_url.as_deref(),
+        TinyfishToolShell::PowerShell,
+    )
+    .unwrap();
+    assert!(!artifacts.tinyfish_enabled);
+    assert_eq!(artifacts.tinyfish_mode, TinyfishMode::None);
+    assert_eq!(artifacts.tinyfish_plugin_variant, None);
+    assert!(artifacts.tinyfish_plugin_hooks_json.is_none());
+}
+
+#[test]
+fn tinyfish_artifacts_fall_back_to_provider_defaults_when_model_missing() {
+    let deepseek_env = LightweightEnv {
+        base_url: Some("https://api.deepseek.com/anthropic".into()),
+        ..Default::default()
+    };
+    let deepseek_artifacts = build_lightweight_runtime_artifacts(
+        &deepseek_env,
+        Some("sk-test"),
+        deepseek_env.base_url.as_deref(),
+        TinyfishToolShell::PowerShell,
+    )
+    .unwrap();
+    assert!(deepseek_artifacts.tinyfish_enabled);
+    assert_eq!(deepseek_artifacts.tinyfish_mode, TinyfishMode::FetchOnly);
+    assert_eq!(
+        deepseek_artifacts.tinyfish_plugin_variant,
+        Some(TinyfishPluginVariant::Router)
+    );
+
+    let anyrouter_env = LightweightEnv {
+        base_url: Some("https://anyrouter.top".into()),
+        ..Default::default()
+    };
+    let anyrouter_artifacts = build_lightweight_runtime_artifacts(
+        &anyrouter_env,
+        Some("sk-test"),
+        anyrouter_env.base_url.as_deref(),
+        TinyfishToolShell::PowerShell,
+    )
+    .unwrap();
+    assert!(anyrouter_artifacts.tinyfish_enabled);
+    assert_eq!(anyrouter_artifacts.tinyfish_mode, TinyfishMode::None);
+    assert_eq!(
+        anyrouter_artifacts.tinyfish_plugin_variant,
+        Some(TinyfishPluginVariant::Router)
+    );
+
+    let proxy_env = LightweightEnv {
+        base_url: Some("https://new-api.example.com".into()),
+        ..Default::default()
+    };
+    let proxy_artifacts = build_lightweight_runtime_artifacts(
+        &proxy_env,
+        Some("sk-test"),
+        proxy_env.base_url.as_deref(),
+        TinyfishToolShell::PowerShell,
+    )
+    .unwrap();
+    assert!(proxy_artifacts.tinyfish_enabled);
+    assert_eq!(proxy_artifacts.tinyfish_mode, TinyfishMode::Full);
+    assert_eq!(
+        proxy_artifacts.tinyfish_plugin_variant,
+        Some(TinyfishPluginVariant::Router)
+    );
+}
+
+#[test]
+fn tinyfish_artifacts_enable_router_for_subagent_only_routing() {
+    let env = LightweightEnv {
+        base_url: Some("https://api.anthropic.com".into()),
+        subagent_model: Some("qwen3-max".into()),
+        ..Default::default()
+    };
+    let artifacts = build_lightweight_runtime_artifacts(
+        &env,
+        Some("sk-test"),
+        env.base_url.as_deref(),
+        TinyfishToolShell::PowerShell,
+    )
+    .unwrap();
+    assert!(artifacts.tinyfish_enabled);
+    assert_eq!(artifacts.tinyfish_mode, TinyfishMode::None);
+    assert_eq!(
+        artifacts.tinyfish_plugin_variant,
+        Some(TinyfishPluginVariant::Router)
+    );
+    assert!(artifacts.tinyfish_plugin_hooks_json.is_some());
 }
 
 #[test]
@@ -1848,6 +2492,145 @@ fn tinyfish_mode_disable_extra_is_case_insensitive() {
 }
 
 #[test]
+fn explicit_local_gateway_mode_overrides_router_routes() {
+    let env = LightweightEnv {
+        base_url: Some("http://localhost:11434/v1".into()),
+        model: Some("qwen3".into()),
+        extras: vec!["CLAUDE_SWITCH_TINYFISH=off".into()],
+        ..Default::default()
+    };
+    let artifacts = build_lightweight_runtime_artifacts_with_local_gateway_mode(
+        &env,
+        Some("sk-test"),
+        env.base_url.as_deref(),
+        TinyfishToolShell::PowerShell,
+        LocalGatewayToolMode::FetchOnly,
+    )
+    .unwrap();
+
+    assert_eq!(
+        artifacts.local_gateway_mode,
+        LocalGatewayToolMode::FetchOnly
+    );
+    assert!(artifacts.tinyfish_enabled);
+    assert_eq!(artifacts.tinyfish_mode, TinyfishMode::FetchOnly);
+    assert_eq!(
+        artifacts.tinyfish_plugin_variant,
+        Some(TinyfishPluginVariant::FetchOnly)
+    );
+}
+
+#[test]
+fn explicit_local_gateway_search_fetch_uses_static_full_plugin_variant() {
+    let env = LightweightEnv {
+        base_url: Some("http://localhost:11434/v1".into()),
+        model: Some("qwen3".into()),
+        ..Default::default()
+    };
+    let artifacts = build_lightweight_runtime_artifacts_with_local_gateway_mode(
+        &env,
+        Some("sk-test"),
+        env.base_url.as_deref(),
+        TinyfishToolShell::PowerShell,
+        LocalGatewayToolMode::SearchFetch,
+    )
+    .unwrap();
+
+    assert!(artifacts.tinyfish_enabled);
+    assert_eq!(artifacts.tinyfish_mode, TinyfishMode::Full);
+    assert_eq!(
+        artifacts.tinyfish_plugin_variant,
+        Some(TinyfishPluginVariant::Full)
+    );
+}
+
+#[test]
+fn explicit_local_gateway_mode_rejects_non_local_base_url() {
+    let env = LightweightEnv {
+        base_url: Some("https://api.anthropic.com".into()),
+        ..Default::default()
+    };
+    let error = build_lightweight_runtime_artifacts_with_local_gateway_mode(
+        &env,
+        Some("sk-test"),
+        env.base_url.as_deref(),
+        TinyfishToolShell::PowerShell,
+        LocalGatewayToolMode::SearchFetch,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("localhost/LAN self-hosted APIs"));
+}
+
+#[test]
+fn prepare_lightweight_launch_skips_tinyfish_router_when_profile_opts_out() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                base_url: Some("https://new-api.example.com".into()),
+                extras: vec!["CLAUDE_SWITCH_TINYFISH=off".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    let _prepared = mgr
+        .prepare_lightweight_launch_with_tinyfish_available(&mut cmd, &profile, true)
+        .unwrap();
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        !args.iter().any(|arg| arg == "--plugin-dir"),
+        "unexpected plugin args: {args:?}"
+    );
+}
+
+#[test]
+fn direct_lightweight_launch_skips_tinyfish_router_when_profile_opts_out() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                extras: vec!["CLAUDE_SWITCH_TINYFISH=off".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    mgr.prepare_direct_lightweight_launch_with_tinyfish_available(
+        &mut cmd,
+        &profile,
+        true,
+        LocalGatewayToolMode::Auto,
+    )
+    .unwrap();
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        !args.iter().any(|arg| arg == "--plugin-dir"),
+        "unexpected plugin args: {args:?}"
+    );
+    assert!(args.iter().any(|arg| arg == "--settings"));
+}
+
+#[test]
 fn reserved_tinyfish_extra_is_not_forwarded_to_env() {
     let env = LightweightEnv {
         extras: vec!["CLAUDE_SWITCH_TINYFISH=off".into(), "FOO=bar".into()],
@@ -1857,17 +2640,55 @@ fn reserved_tinyfish_extra_is_not_forwarded_to_env() {
         &env,
         Some("sk-test"),
         Some("https://new-api.example.com"),
-        TinyfishMode::Full,
+        true,
         TinyfishToolShell::PowerShell,
-    );
+        None,
+    )
+    .unwrap();
     let env_map = settings["env"].as_object().unwrap();
     assert!(!env_map.contains_key("CLAUDE_SWITCH_TINYFISH"));
     assert_eq!(env_map["FOO"].as_str(), Some("bar"));
 }
 
 #[test]
-fn tinyfish_full_hooks_use_requested_tool_shell() {
-    let hooks = tinyfish_full_hooks(TinyfishToolShell::PowerShell);
+fn build_lightweight_settings_uses_inline_api_key_helper_when_token_present() {
+    let settings = build_lightweight_settings(
+        &LightweightEnv::default(),
+        Some("sk-test"),
+        Some("https://new-api.example.com"),
+        false,
+        TinyfishToolShell::PowerShell,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        settings["env"]["ANTHROPIC_BASE_URL"].as_str(),
+        Some("https://new-api.example.com")
+    );
+    assert_inline_helper_token(&serde_json::Value::Object(settings), "sk-test");
+}
+
+#[test]
+fn build_lightweight_settings_omits_api_key_helper_override_without_token() {
+    let settings = build_lightweight_settings(
+        &LightweightEnv::default(),
+        None,
+        Some("https://new-api.example.com"),
+        false,
+        TinyfishToolShell::PowerShell,
+        None,
+    )
+    .unwrap();
+    assert!(!settings.contains_key("apiKeyHelper"));
+}
+
+#[test]
+fn tinyfish_plugin_hooks_use_requested_tool_shell() {
+    let hooks: serde_json::Value = serde_json::from_str(&tinyfish_plugin_hooks(
+        TinyfishPluginVariant::Router,
+        TinyfishToolShell::PowerShell,
+    ))
+    .unwrap();
     let pre_tool = hooks["hooks"]["PreToolUse"].as_array().unwrap();
     assert_eq!(pre_tool.len(), 2);
     let matchers: Vec<&str> = pre_tool
@@ -1884,9 +2705,18 @@ fn tinyfish_full_hooks_use_requested_tool_shell() {
         search_hook["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("which search provider to use")
+            .contains("hook-router.ps1")
     );
-    assert!(search_hook["hooks"][0]["shell"].as_str().unwrap() == "powershell");
+    assert!(
+        search_hook["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("PreToolUse WebSearch")
+    );
+    assert_eq!(
+        search_hook["hooks"][0]["shell"].as_str(),
+        Some("powershell")
+    );
     let fetch_hook = pre_tool
         .iter()
         .find(|h| h["matcher"].as_str() == Some("WebFetch"))
@@ -1895,64 +2725,107 @@ fn tinyfish_full_hooks_use_requested_tool_shell() {
         fetch_hook["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("which fetch provider to use")
+            .contains("hook-router.ps1")
     );
-    assert!(fetch_hook["hooks"][0]["shell"].as_str().unwrap() == "powershell");
-    let subagent = hooks["hooks"]["SubagentStart"].as_array().unwrap();
-    assert_eq!(subagent.len(), 1);
-    let subagent_cmd = subagent[0]["hooks"][0]["command"].as_str().unwrap();
-    assert!(subagent_cmd.contains("tinyfish search query \\\"<QUERY>\\\""));
-    assert!(subagent_cmd.contains("tinyfish fetch content get \\\"<URL>\\\""));
-    assert!(!subagent_cmd.contains("tinyfish search query QUERY"));
-    assert!(!subagent_cmd.contains("tinyfish fetch content get URL"));
-    assert!(subagent_cmd.contains("PowerShell tool"));
-}
-
-#[test]
-fn tinyfish_fetch_only_hooks_use_requested_tool_shell() {
-    let hooks = tinyfish_fetch_only_hooks(TinyfishToolShell::PowerShell);
-    let pre_tool = hooks["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(pre_tool.len(), 1);
-    assert_eq!(pre_tool[0]["matcher"].as_str().unwrap(), "WebFetch");
     assert!(
-        pre_tool[0]["hooks"][0]["command"]
+        fetch_hook["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("which fetch provider to use")
+            .contains("PreToolUse WebFetch")
     );
-    assert!(pre_tool[0]["hooks"][0]["shell"].as_str().unwrap() == "powershell");
+    assert_eq!(fetch_hook["hooks"][0]["shell"].as_str(), Some("powershell"));
+    let session_start = hooks["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(session_start.len(), 1);
+    let session_cmd = session_start[0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(session_cmd.contains("hook-router.ps1"));
+    assert!(session_cmd.ends_with(" SessionStart"));
     let subagent = hooks["hooks"]["SubagentStart"].as_array().unwrap();
     assert_eq!(subagent.len(), 1);
     let subagent_cmd = subagent[0]["hooks"][0]["command"].as_str().unwrap();
-    assert!(subagent_cmd.contains("tinyfish fetch content get \\\"<URL>\\\""));
-    assert!(!subagent_cmd.contains("tinyfish search query \\\"<QUERY>\\\""));
-    assert!(!subagent_cmd.contains("tinyfish fetch content get URL"));
-    assert!(!subagent_cmd.contains("tinyfish search query QUERY"));
-    assert!(subagent_cmd.contains("PowerShell tool"));
+    assert!(subagent_cmd.contains("hook-router.ps1"));
+    assert!(subagent_cmd.ends_with(" SubagentStart"));
 }
 
 #[test]
-fn tinyfish_bash_hook_command_escapes_apostrophes() {
-    let command = tinyfish_hook_command(
+fn tinyfish_plugin_hooks_use_bash_script_without_shell_override() {
+    let hooks: serde_json::Value = serde_json::from_str(&tinyfish_plugin_hooks(
+        TinyfishPluginVariant::Router,
         TinyfishToolShell::Bash,
-        "PreToolUse",
-        Some("allow"),
-        "don't break",
+    ))
+    .unwrap();
+    let pre_tool = hooks["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre_tool.len(), 2);
+    let search_hook = pre_tool
+        .iter()
+        .find(|h| h["matcher"].as_str() == Some("WebSearch"))
+        .unwrap();
+    assert!(
+        search_hook["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hook-router.sh")
     );
-    assert!(command.starts_with("printf '%s\\n' '"));
-    assert!(command.contains("don'\\''t break"));
+    assert!(search_hook["hooks"][0].get("shell").is_none());
 }
 
 #[test]
-fn tinyfish_powershell_hook_command_escapes_apostrophes() {
-    let command = tinyfish_hook_command(
+fn tinyfish_dynamic_hook_scripts_quote_placeholder_arguments() {
+    let powershell =
+        tinyfish_hook_script(TinyfishToolShell::PowerShell, TinyfishPluginVariant::Router);
+    assert!(powershell.contains("tinyfish search query \"\"<query>\"\""));
+    assert!(powershell.contains("tinyfish fetch content get \"\"<url>\"\""));
+
+    let bash = tinyfish_hook_script(TinyfishToolShell::Bash, TinyfishPluginVariant::Router);
+    assert!(bash.contains("tinyfish search query \"<query>\""));
+    assert!(bash.contains("tinyfish fetch content get \"<url>\""));
+}
+
+#[test]
+fn tinyfish_static_hook_scripts_quote_placeholder_arguments() {
+    let powershell_full =
+        tinyfish_hook_script(TinyfishToolShell::PowerShell, TinyfishPluginVariant::Full);
+    assert!(powershell_full.contains("tinyfish search query \"\"<query>\"\""));
+    assert!(powershell_full.contains("tinyfish fetch content get \"\"<url>\"\""));
+
+    let powershell_fetch_only = tinyfish_hook_script(
         TinyfishToolShell::PowerShell,
-        "PreToolUse",
-        Some("allow"),
-        "don't break",
+        TinyfishPluginVariant::FetchOnly,
     );
-    assert!(command.starts_with("Write-Output '"));
-    assert!(command.contains("don''t break"));
+    assert!(powershell_fetch_only.contains("tinyfish fetch content get \"\"<url>\"\""));
+
+    let bash_full = tinyfish_hook_script(TinyfishToolShell::Bash, TinyfishPluginVariant::Full);
+    assert!(bash_full.contains("tinyfish search query \"<query>\""));
+    assert!(bash_full.contains("tinyfish fetch content get \"<url>\""));
+
+    let bash_fetch_only =
+        tinyfish_hook_script(TinyfishToolShell::Bash, TinyfishPluginVariant::FetchOnly);
+    assert!(bash_fetch_only.contains("tinyfish fetch content get \"<url>\""));
+}
+
+#[test]
+fn tinyfish_bash_hook_command_uses_script_path_and_tool_name() {
+    assert_eq!(
+        tinyfish_hook_command(
+            TinyfishToolShell::Bash,
+            "${CLAUDE_PLUGIN_ROOT}/scripts/hook-router.sh",
+            "PreToolUse",
+            Some("WebFetch"),
+        ),
+        "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook-router.sh\" PreToolUse WebFetch"
+    );
+}
+
+#[test]
+fn tinyfish_powershell_hook_command_uses_script_path_and_tool_name() {
+    assert_eq!(
+        tinyfish_hook_command(
+            TinyfishToolShell::PowerShell,
+            "${CLAUDE_PLUGIN_ROOT}/scripts/hook-router.ps1",
+            "PreToolUse",
+            Some("WebSearch"),
+        ),
+        "& \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-router.ps1\" PreToolUse WebSearch"
+    );
 }
 
 #[test]
@@ -1967,47 +2840,100 @@ fn tinyfish_available_probe_times_out() {
     assert!(started.elapsed() < Duration::from_secs(4));
 }
 
+#[cfg(windows)]
 #[test]
-fn tinyfish_prompt_variants_are_platform_specific() {
-    let bash_prompt = tinyfish_prompt(TinyfishMode::Full, TinyfishToolShell::Bash).unwrap();
-    let powershell_prompt =
-        tinyfish_prompt(TinyfishMode::Full, TinyfishToolShell::PowerShell).unwrap();
-    assert!(bash_prompt.contains("run via the Bash tool"));
-    assert!(!bash_prompt.contains("PowerShell"));
-    assert!(powershell_prompt.contains("run via the PowerShell tool"));
-    assert!(!powershell_prompt.contains("run via Bash"));
+fn build_local_command_prefers_windows_pathext_candidate_over_extensionless_match() {
+    let _env_guard = process_launch_env_guard();
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let _extensionless = dir.join("tinyfish");
+    fs::write(&_extensionless, "not-runnable").unwrap();
+    let cmd_path = write_windows_probe_script(dir, "tinyfish", ".cmd", "0.1.6");
+    let _path_guard = PathOverrideGuard::replace(&[dir.to_path_buf()]);
+    let _pathext_guard = EnvVarGuard::set("PATHEXT", ".BAT;.CMD");
+
+    let cmd = super::build_local_command("tinyfish");
+
+    assert!(
+        PathBuf::from(cmd.get_program())
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&cmd_path.to_string_lossy())
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_local_command_supports_cmd_suffix_resolution() {
+    let _env_guard = process_launch_env_guard();
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let _script = write_windows_probe_script(dir, "tinyfish", ".cmd", "0.1.6");
+    let _path_guard = PathOverrideGuard::replace(&[dir.to_path_buf()]);
+    let _pathext_guard = EnvVarGuard::set("PATHEXT", ".BAT;.CMD");
+
+    let output = ProfileManager::run_local_command("tinyfish", &["--version"]).unwrap();
+
+    assert_eq!(output, "0.1.6");
+}
+
+#[cfg(windows)]
+#[test]
+fn command_exists_supports_bat_suffix_resolution() {
+    let _env_guard = process_launch_env_guard();
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let _script = write_windows_probe_script(dir, "tinyfish", ".bat", "0.1.6");
+    let _path_guard = PathOverrideGuard::replace(&[dir.to_path_buf()]);
+    let _pathext_guard = EnvVarGuard::set("PATHEXT", ".BAT");
+
+    assert!(ProfileManager::command_exists("tinyfish"));
+}
+
+#[cfg(windows)]
+#[test]
+fn tinyfish_probe_supports_windows_script_suffixes() {
+    let _env_guard = process_launch_env_guard();
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let _script = write_windows_probe_script(dir, "tinyfish", ".cmd", "0.1.6");
+    let _path_guard = PathOverrideGuard::replace(&[dir.to_path_buf()]);
+    let _pathext_guard = EnvVarGuard::set("PATHEXT", ".BAT;.CMD");
+
+    assert!(tinyfish_command_succeeds_with_timeout(
+        "tinyfish",
+        &["--version"],
+        Duration::from_secs(1),
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn tinyfish_probe_can_refresh_child_path_for_volta_style_shims() {
+    let _env_guard = process_launch_env_guard();
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let empty_bin = dir.join("empty-bin");
+    fs::create_dir_all(&empty_bin).unwrap();
+    write_windows_volta_probe_shims(dir, "0.1.6");
+    let _path_guard = PathOverrideGuard::replace(std::slice::from_ref(&empty_bin));
+    let _pathext_guard = EnvVarGuard::set("PATHEXT", ".BAT;.CMD");
+    let refreshed_path = env::join_paths([dir.to_path_buf()]).unwrap();
+
+    assert!(!tinyfish_command_succeeds_with_timeout(
+        "tinyfish",
+        &["--version"],
+        Duration::from_secs(1),
+    ));
+    assert!(tinyfish_command_succeeds_with_timeout_with_path(
+        "tinyfish",
+        &["--version"],
+        Duration::from_secs(1),
+        Some(refreshed_path),
+    ));
 }
 
 #[test]
-fn tinyfish_prompt_file_names_are_shared_by_mode_and_shell() {
-    assert_eq!(
-        ProfileManager::tinyfish_prompt_file_name(
-            TinyfishMode::Full,
-            TinyfishToolShell::PowerShell
-        )
-        .as_deref(),
-        Some("tinyfish-full.powershell.txt")
-    );
-    assert_eq!(
-        ProfileManager::tinyfish_prompt_file_name(TinyfishMode::FetchOnly, TinyfishToolShell::Bash)
-            .as_deref(),
-        Some("tinyfish-fetch-only.bash.txt")
-    );
-    assert_eq!(
-        ProfileManager::tinyfish_prompt_file_name(
-            TinyfishMode::SearchOnly,
-            TinyfishToolShell::PowerShell
-        )
-        .as_deref(),
-        Some("tinyfish-search-only.powershell.txt")
-    );
-    assert_eq!(
-        ProfileManager::tinyfish_prompt_file_name(
-            TinyfishMode::None,
-            TinyfishToolShell::PowerShell
-        ),
-        None
-    );
+fn legacy_tinyfish_prompt_names_remain_managed_for_cleanup() {
     assert!(ProfileManager::is_managed_generated_prompt_name(
         "tinyfish-full.powershell.txt"
     ));
@@ -2031,14 +2957,16 @@ fn build_lightweight_settings_windows_tinyfish_allows_bash_and_powershell() {
         &LightweightEnv::default(),
         Some("sk-test"),
         Some("https://new-api.example.com"),
-        TinyfishMode::Full,
+        true,
         TinyfishToolShell::PowerShell,
-    );
+        None,
+    )
+    .unwrap();
     let allow = settings["permissions"]["allow"].as_array().unwrap();
     let allow_values: Vec<&str> = allow.iter().map(|v| v.as_str().unwrap()).collect();
     assert!(allow_values.contains(&"Bash(tinyfish:*)"));
     assert!(allow_values.contains(&"PowerShell(tinyfish:*)"));
-    assert!(settings.get("hooks").is_none());
+    assert!(settings.get("statusLine").is_none());
 }
 
 #[test]
@@ -2047,14 +2975,33 @@ fn build_lightweight_settings_unix_tinyfish_allows_only_bash() {
         &LightweightEnv::default(),
         Some("sk-test"),
         Some("https://new-api.example.com"),
-        TinyfishMode::Full,
+        true,
         TinyfishToolShell::Bash,
-    );
+        None,
+    )
+    .unwrap();
     let allow = settings["permissions"]["allow"].as_array().unwrap();
     let allow_values: Vec<&str> = allow.iter().map(|v| v.as_str().unwrap()).collect();
     assert!(allow_values.contains(&"Bash(tinyfish:*)"));
     assert!(!allow_values.contains(&"PowerShell(tinyfish:*)"));
-    assert!(settings.get("hooks").is_none());
+    assert!(settings.get("statusLine").is_none());
+}
+
+#[test]
+fn build_lightweight_settings_adds_statusline_command_when_requested() {
+    let settings = build_lightweight_settings(
+        &LightweightEnv::default(),
+        Some("sk-test"),
+        Some("https://new-api.example.com"),
+        true,
+        TinyfishToolShell::PowerShell,
+        Some("C:\\tmp\\statusline.ps1"),
+    )
+    .unwrap();
+    assert_eq!(settings["statusLine"]["type"].as_str(), Some("command"));
+    let command = settings["statusLine"]["command"].as_str().unwrap();
+    assert!(command.contains("powershell -NoProfile -ExecutionPolicy Bypass"));
+    assert!(command.contains("C:/tmp/statusline.ps1"));
 }
 
 #[test]
@@ -2063,14 +3010,16 @@ fn build_lightweight_settings_native_provider_omits_tinyfish_permissions() {
         &LightweightEnv::default(),
         Some("sk-test"),
         Some("https://anyrouter.top"),
-        TinyfishMode::None,
+        false,
         TinyfishToolShell::PowerShell,
-    );
+        None,
+    )
+    .unwrap();
     assert!(settings.get("permissions").is_none());
 }
 
 #[test]
-fn sync_local_tinyfish_artifacts_writes_shared_plugins_and_prompt() {
+fn sync_local_tinyfish_artifacts_writes_shared_router_plugin_files() {
     let tmp = TempDir::new().unwrap();
     let mgr = make_manager(&tmp);
     mgr.create_lightweight_profile(
@@ -2099,10 +3048,7 @@ fn sync_local_tinyfish_artifacts_writes_shared_plugins_and_prompt() {
 
     mgr.sync_local_tinyfish_artifacts(&profiles).unwrap();
 
-    let prompt_path =
-        mgr.local_tinyfish_prompt_path(TinyfishMode::Full, native_tinyfish_tool_shell());
-    assert!(prompt_path.exists());
-    let plugin_path = mgr.local_tinyfish_plugin_root(TinyfishMode::Full);
+    let plugin_path = mgr.local_tinyfish_plugin_root(TinyfishPluginVariant::Router);
     assert!(plugin_path.exists());
     assert!(
         plugin_path
@@ -2111,22 +3057,81 @@ fn sync_local_tinyfish_artifacts_writes_shared_plugins_and_prompt() {
             .exists()
     );
     assert!(plugin_path.join("hooks").join("hooks.json").exists());
+    assert!(
+        mgr.local_tinyfish_output_style_path(TinyfishPluginVariant::Router)
+            .exists()
+    );
+    assert!(
+        mgr.local_tinyfish_hook_script_path(
+            TinyfishPluginVariant::Router,
+            native_tinyfish_tool_shell()
+        )
+        .exists()
+    );
+    assert!(
+        mgr.local_tinyfish_statusline_script_path(
+            TinyfishPluginVariant::Router,
+            native_tinyfish_tool_shell()
+        )
+        .exists()
+    );
     let manifest: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(plugin_path.join(".claude-plugin").join("plugin.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(manifest["name"].as_str(), Some("tinyfish-full"));
-    assert_eq!(manifest["displayName"].as_str(), Some("TinyFish Full"));
-    let prompt_files: Vec<_> = fs::read_dir(mgr.generated_prompts_dir())
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(prompt_files.len(), 1);
-    assert_eq!(
-        prompt_files[0],
-        ProfileManager::tinyfish_prompt_file_name(TinyfishMode::Full, native_tinyfish_tool_shell())
+    assert_eq!(manifest["name"].as_str(), Some("tinyfish-router"));
+    assert_eq!(manifest["displayName"].as_str(), Some("TinyFish Router"));
+    let prompt_files: Vec<_> = if mgr.generated_prompts_dir().exists() {
+        fs::read_dir(mgr.generated_prompts_dir())
             .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assert!(prompt_files.is_empty());
+}
+
+#[test]
+fn sync_local_tinyfish_artifacts_writes_static_local_gateway_plugin_files() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    mgr.create_lightweight_profile(
+        "local-prof",
+        Some("local-prof"),
+        LightweightEnv {
+            auth_token: Some("sk-local".into()),
+            base_url: Some("http://localhost:11434/v1".into()),
+            model: Some("qwen3".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let profiles = mgr.list_profiles().unwrap();
+
+    mgr.sync_local_tinyfish_artifacts(&profiles).unwrap();
+
+    let full_plugin = mgr.local_tinyfish_plugin_root(TinyfishPluginVariant::Full);
+    let fetch_only_plugin = mgr.local_tinyfish_plugin_root(TinyfishPluginVariant::FetchOnly);
+    let router_plugin = mgr.local_tinyfish_plugin_root(TinyfishPluginVariant::Router);
+    assert!(full_plugin.exists());
+    assert!(fetch_only_plugin.exists());
+    assert!(!router_plugin.exists());
+
+    let full_manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(full_plugin.join(".claude-plugin").join("plugin.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(full_manifest["name"].as_str(), Some("tinyfish-full"));
+
+    let fetch_only_manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(fetch_only_plugin.join(".claude-plugin").join("plugin.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fetch_only_manifest["name"].as_str(),
+        Some("tinyfish-fetch-only")
     );
 }
 
@@ -2134,15 +3139,27 @@ fn sync_local_tinyfish_artifacts_writes_shared_plugins_and_prompt() {
 fn sync_local_tinyfish_artifacts_removes_stale_managed_plugin_dirs() {
     let tmp = TempDir::new().unwrap();
     let mgr = make_manager(&tmp);
-    let stale_plugin = mgr.generated_plugins_dir().join("tinyfish-full");
+    let stale_plugin = mgr.generated_plugins_dir().join("tinyfish-router");
     fs::create_dir_all(stale_plugin.join("hooks")).unwrap();
     fs::write(stale_plugin.join("hooks").join("hooks.json"), "{}").unwrap();
+    let stale_full_plugin = mgr.generated_plugins_dir().join("tinyfish-full");
+    fs::create_dir_all(stale_full_plugin.join("hooks")).unwrap();
+    fs::write(stale_full_plugin.join("hooks").join("hooks.json"), "{}").unwrap();
+    let stale_fetch_only_plugin = mgr.generated_plugins_dir().join("tinyfish-fetch-only");
+    fs::create_dir_all(stale_fetch_only_plugin.join("hooks")).unwrap();
+    fs::write(
+        stale_fetch_only_plugin.join("hooks").join("hooks.json"),
+        "{}",
+    )
+    .unwrap();
     let unmanaged_plugin = mgr.generated_plugins_dir().join("notes");
     fs::create_dir_all(&unmanaged_plugin).unwrap();
 
     mgr.sync_local_tinyfish_artifacts(&[]).unwrap();
 
     assert!(!stale_plugin.exists());
+    assert!(!stale_full_plugin.exists());
+    assert!(!stale_fetch_only_plugin.exists());
     assert!(unmanaged_plugin.exists());
 }
 
@@ -2173,31 +3190,27 @@ fn sync_local_tinyfish_artifacts_keeps_legacy_tinyfish_settings_files() {
 }
 
 #[test]
-fn generated_plugin_file_names_are_shared_by_mode_and_shell() {
+fn generated_plugin_dir_name_tracks_managed_tinyfish_variants() {
     assert_eq!(
-        ProfileManager::tinyfish_plugin_dir_name(TinyfishMode::Full).as_deref(),
-        Some("tinyfish-full")
+        ProfileManager::tinyfish_plugin_dir_name(TinyfishPluginVariant::Router),
+        "tinyfish-router"
     );
     assert_eq!(
-        ProfileManager::tinyfish_plugin_dir_name(TinyfishMode::FetchOnly).as_deref(),
-        Some("tinyfish-fetch-only")
+        ProfileManager::tinyfish_plugin_dir_name(TinyfishPluginVariant::Full),
+        "tinyfish-full"
     );
     assert_eq!(
-        ProfileManager::tinyfish_plugin_dir_name(TinyfishMode::SearchOnly).as_deref(),
-        Some("tinyfish-search-only")
+        ProfileManager::tinyfish_plugin_dir_name(TinyfishPluginVariant::FetchOnly),
+        "tinyfish-fetch-only"
     );
-    assert_eq!(
-        ProfileManager::tinyfish_plugin_dir_name(TinyfishMode::None),
-        None
-    );
+    assert!(ProfileManager::is_managed_generated_plugin_dir_name(
+        "tinyfish-router"
+    ));
     assert!(ProfileManager::is_managed_generated_plugin_dir_name(
         "tinyfish-full"
     ));
     assert!(ProfileManager::is_managed_generated_plugin_dir_name(
         "tinyfish-fetch-only"
-    ));
-    assert!(ProfileManager::is_managed_generated_plugin_dir_name(
-        "tinyfish-search-only"
     ));
     assert!(!ProfileManager::is_managed_generated_plugin_dir_name(
         "notes"
@@ -2781,6 +3794,7 @@ fn config_import_rejects_profiles_with_missing_provider_references() {
         }],
         providers: Vec::new(),
         mcp_servers: Vec::new(),
+        settings: Some(GlobalSettings::default()),
         secrets_included: true,
     };
     let content = serde_json::to_string(&bundle).unwrap();
@@ -2866,10 +3880,7 @@ fn provider_backed_cmd_settings_use_updated_provider_key() {
     for var_name in ["_SETTINGS", "_TF_SETTINGS"] {
         let json = unescape_generated_cmd_set_value(cmd_set_value(&content, var_name));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed["env"]["ANTHROPIC_AUTH_TOKEN"].as_str(),
-            Some("new-token!bang%20caret^\"value")
-        );
+        assert_inline_helper_token(&parsed, "new-token!bang%20caret^\"value");
         assert_eq!(
             parsed["env"]["ANTHROPIC_BASE_URL"].as_str(),
             Some("https://proxy.example.com/path!section/%5E/^v2")
@@ -2898,21 +3909,41 @@ fn generate_cmd_content_uses_plugin_dir_and_inline_tf_settings() {
     assert!(content.contains("goto build_settings"));
     assert!(content.contains(":build_settings"));
     assert!(content.contains("if defined _TF goto launch_with_hooks_plain"));
-    assert!(content.contains("set \"_SETTINGS={\\\"env\\\":{"));
-    assert!(content.contains("set \"_TF_SETTINGS={\\\"env\\\":{"));
+    assert!(content.contains("set \"_SETTINGS="));
+    assert!(content.contains("set \"_TF_SETTINGS="));
     assert!(content.contains("set \"_TF=\""));
     assert!(content.contains(
-        "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-full\""
+        "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-router\""
     ));
-    assert!(content.contains("set \"_TF_PROMPT_FILE=%USERPROFILE%\\.claude-switch\\generated\\prompts\\tinyfish-full.powershell.txt\""));
     assert!(content.contains("--plugin-dir \"%_TF_PLUGIN_DIR%\""));
-    assert!(content.contains("--append-system-prompt-file \"%_TF_PROMPT_FILE%\""));
+    assert!(!content.contains("_TF_PROMPT_FILE="));
+    assert!(!content.contains("--append-system-prompt-file"));
     assert!(!content.contains("SubagentStart"));
     assert!(!content.contains("PreToolUse"));
     assert!(content.contains("PowerShell(tinyfish:*)"));
-    assert_eq!(content.matches("\\\"ANTHROPIC_AUTH_TOKEN\\\"").count(), 2);
+    assert_eq!(content.matches("\\\"apiKeyHelper\\\"").count(), 2);
     assert!(content.contains("--settings \"%_SETTINGS%\""));
     assert!(!content.contains("_TF_SETTINGS_FILE="));
+
+    let base_json: serde_json::Value = serde_json::from_str(&unescape_generated_cmd_set_value(
+        cmd_set_value(&content, "_SETTINGS"),
+    ))
+    .unwrap();
+    let tf_json: serde_json::Value = serde_json::from_str(&unescape_generated_cmd_set_value(
+        cmd_set_value(&content, "_TF_SETTINGS"),
+    ))
+    .unwrap();
+    assert_inline_helper_token(&base_json, "sk-test");
+    assert_inline_helper_token(&tf_json, "sk-test");
+    assert!(base_json.get("permissions").is_none());
+    assert!(base_json.get("statusLine").is_none());
+    assert!(tf_json["permissions"]["allow"].as_array().is_some());
+    assert!(
+        tf_json["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("statusline.ps1")
+    );
 }
 
 #[test]
@@ -2936,10 +3967,7 @@ fn generate_cmd_content_assigns_parseable_json_settings() {
     for var_name in ["_SETTINGS", "_TF_SETTINGS"] {
         let json = unescape_generated_cmd_set_value(cmd_set_value(&content, var_name));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed["env"]["ANTHROPIC_AUTH_TOKEN"].as_str(),
-            Some("sk-test!bang%20caret^value")
-        );
+        assert_inline_helper_token(&parsed, "sk-test!bang%20caret^value");
         assert_eq!(
             parsed["env"]["ANTHROPIC_BASE_URL"].as_str(),
             Some("https://new-api.example.com/path!section/%5E/^v2")
@@ -2950,7 +3978,7 @@ fn generate_cmd_content_assigns_parseable_json_settings() {
 }
 
 #[test]
-fn generate_cmd_content_includes_tf_prompt() {
+fn generate_cmd_content_enables_tinyfish_router_when_available() {
     let tmp = TempDir::new().unwrap();
     let mgr = make_manager(&tmp);
     let lite = mgr
@@ -2967,15 +3995,145 @@ fn generate_cmd_content_includes_tf_prompt() {
         .unwrap();
     let content = mgr.generate_cmd_content(&lite).unwrap();
     assert!(content.contains("where tinyfish >nul 2>&1 && set \"_TF=1\""));
-    assert!(content.contains("set \"_TF_PROMPT_FILE=%USERPROFILE%\\.claude-switch\\generated\\prompts\\tinyfish-full.powershell.txt\""));
     assert!(content.contains(
-        "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-full\""
+        "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-router\""
     ));
     assert!(content.contains("--plugin-dir \"%_TF_PLUGIN_DIR%\""));
-    assert!(content.contains("--append-system-prompt-file \"%_TF_PROMPT_FILE%\""));
+    assert!(!content.contains("_TF_PROMPT_FILE="));
+    assert!(!content.contains("--append-system-prompt-file"));
     assert!(!content.contains("--append-system-prompt \"%_TF_PROMPT%\""));
     assert!(!content.contains("rate limited by tinyfish"));
     assert!(!content.contains("run via Bash"));
+    assert!(content.contains("statusline.ps1"));
+}
+
+#[test]
+fn generate_cmd_content_for_local_gateway_search_fetch_embeds_mode_and_fail_closed_legacy() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile(
+            "local-prof",
+            Some("lp"),
+            LightweightEnv {
+                auth_token: Some("sk-test".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let content = mgr
+        .generate_cmd_content_for_local_gateway_mode(&lite, LocalGatewayToolMode::SearchFetch)
+        .unwrap();
+
+    assert!(content.contains(":: Local gateway mode: search-fetch"));
+    assert!(content.contains("--local-gateway-mode search-fetch"));
+    assert!(content.contains(":tinyfish_required"));
+    assert!(content.contains("TinyFish is required for this shim variant"));
+    assert!(content.contains("set \"_TF_SETTINGS="));
+    assert!(content.contains(
+        "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-full\""
+    ));
+    let tf_json: serde_json::Value = serde_json::from_str(&unescape_generated_cmd_set_value(
+        cmd_set_value(&content, "_TF_SETTINGS"),
+    ))
+    .unwrap();
+    assert_eq!(
+        tf_json["env"]["CLAUDE_SWITCH_TINYFISH_MODE"].as_str(),
+        Some("search-fetch")
+    );
+    assert!(
+        tf_json["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("tinyfish-full/scripts/statusline.ps1")
+    );
+}
+
+#[test]
+fn generate_cmd_content_for_local_default_is_self_contained_and_tinyfish_free() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile(
+            "local-prof",
+            Some("lp"),
+            LightweightEnv {
+                auth_token: Some("sk-test".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let content = mgr.generate_cmd_content(&lite).unwrap();
+
+    assert!(!content.contains(":: Local gateway mode:"));
+    assert!(!content.contains("shim launch --probe"));
+    assert!(!content.contains("CLAUDE_SWITCH_SHIM_MODE"));
+    assert!(!content.contains("tinyfish"));
+    assert!(!content.contains("_PROFILE_ID="));
+    assert!(content.contains(":build_settings"));
+    assert!(content.contains("set \"_SETTINGS="));
+    assert!(content.contains("claude --settings \"%_SETTINGS%\""));
+}
+
+#[test]
+fn generate_remote_sh_content_for_local_default_is_self_contained_and_tinyfish_free() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile(
+            "local-shell",
+            Some("ls"),
+            LightweightEnv {
+                auth_token: Some("sk-test".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let content = mgr
+        .generate_remote_sh_content_for_local_gateway_mode(&lite, LocalGatewayToolMode::Auto)
+        .unwrap();
+
+    assert!(!content.contains("# Local gateway mode:"));
+    assert!(!content.contains("shim launch --probe"));
+    assert!(!content.contains("CLAUDE_SWITCH_SHIM_MODE"));
+    assert!(!content.contains("tinyfish"));
+    assert!(!content.contains("PROFILE_ID="));
+    assert!(content.contains("BASE_SETTINGS="));
+    assert!(content.contains("exec claude"));
+}
+
+#[test]
+fn generate_sh_content_for_local_gateway_fetch_only_uses_static_plugin_dir() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile(
+            "local-fetch",
+            Some("lf"),
+            LightweightEnv {
+                auth_token: Some("sk-test".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let content = mgr
+        .generate_sh_content_for_local_gateway_mode(&lite, LocalGatewayToolMode::FetchOnly)
+        .unwrap();
+
+    assert!(
+        content.contains(
+            "TF_PLUGIN_DIR=\"$HOME/.claude-switch/generated/plugins/tinyfish-fetch-only\""
+        )
+    );
+    assert!(content.contains("--local-gateway-mode fetch-only"));
 }
 
 #[test]
@@ -2996,47 +4154,44 @@ fn generate_sh_content_switches_between_base_and_hook_settings() {
         .unwrap();
     let content = mgr.generate_sh_content(&lite).unwrap();
     assert!(content.contains("command -v tinyfish"));
-    assert!(content.contains("TF_SP_ARGS=("));
-    assert!(content.contains("SETTINGS_ENV="));
     assert!(content.contains("BASE_SETTINGS="));
     assert!(content.contains("TF_SETTINGS="));
     assert!(content.contains("SETTINGS_ARG=(--settings \"$BASE_SETTINGS\")"));
     assert!(
-        content.contains("TF_PLUGIN_DIR=\"$HOME/.claude-switch/generated/plugins/tinyfish-full\"")
+        content
+            .contains("TF_PLUGIN_DIR=\"$HOME/.claude-switch/generated/plugins/tinyfish-router\"")
     );
-    assert!(content.contains(
-        "TF_PROMPT_FILE=\"$HOME/.claude-switch/generated/prompts/tinyfish-full.bash.txt\""
-    ));
     assert!(content.contains("TF_PLUGIN_ARGS=(--plugin-dir \"$TF_PLUGIN_DIR\")"));
-    assert!(content.contains("TF_SP_ARGS=(--append-system-prompt-file \"$TF_PROMPT_FILE\")"));
     assert!(content.contains("SETTINGS_ARG=(--settings \"$TF_SETTINGS\")"));
-    assert!(content.contains("BASE_SETTINGS=\"${SETTINGS_ENV}\""));
-    assert!(!content.contains("HOOK_SETTINGS="));
+    assert!(!content.contains("TF_PROMPT_FILE="));
+    assert!(!content.contains("--append-system-prompt-file"));
     assert!(content.contains("Bash(tinyfish:*)"));
-    assert_eq!(content.matches("\"ANTHROPIC_AUTH_TOKEN\"").count(), 1);
+    assert_eq!(content.matches("\"apiKeyHelper\"").count(), 2);
     assert!(!content.contains("run via Bash"));
     assert!(!content.contains("PowerShell tool"));
 
-    let settings_env_line = find_line(&content, "SETTINGS_ENV=");
-    let settings_env =
-        unquote_single_quoted_shell_literal(settings_env_line.trim_start_matches("SETTINGS_ENV="));
     let base_settings_line = find_line(&content, "BASE_SETTINGS=");
-    let base_tail = unquote_single_quoted_shell_literal(
-        base_settings_line.trim_start_matches("BASE_SETTINGS=\"${SETTINGS_ENV}\""),
+    let base_settings_json = unquote_single_quoted_shell_literal(
+        base_settings_line.trim_start_matches("BASE_SETTINGS="),
     );
     let tf_settings_line = find_line(&content, "TF_SETTINGS=");
-    let tf_tail = unquote_single_quoted_shell_literal(
-        tf_settings_line.trim_start_matches("TF_SETTINGS=\"${SETTINGS_ENV}\""),
-    );
-
-    let base_settings_json = format!("{settings_env}{base_tail}");
-    let tf_settings_json = format!("{settings_env}{tf_tail}");
+    let tf_settings_json =
+        unquote_single_quoted_shell_literal(tf_settings_line.trim_start_matches("TF_SETTINGS="));
     let base_json: serde_json::Value = serde_json::from_str(&base_settings_json).unwrap();
     let tf_json: serde_json::Value = serde_json::from_str(&tf_settings_json).unwrap();
+    assert_inline_helper_token(&base_json, "sk-test");
+    assert_inline_helper_token(&tf_json, "sk-test");
     assert!(base_json.get("permissions").is_none());
+    assert!(base_json.get("statusLine").is_none());
     let allow = tf_json["permissions"]["allow"].as_array().unwrap();
     assert_eq!(allow.len(), 1);
     assert_eq!(allow[0].as_str(), Some("Bash(tinyfish:*)"));
+    assert!(
+        tf_json["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("statusline.sh")
+    );
 }
 
 #[test]
@@ -3057,17 +4212,27 @@ fn generate_cmd_content_deepseek_fetch_only_prompt() {
         .unwrap();
     let content = mgr.generate_cmd_content(&lite).unwrap();
     assert!(content.contains(
-            "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-fetch-only\""
-        ));
-    assert!(content.contains("set \"_TF_PROMPT_FILE=%USERPROFILE%\\.claude-switch\\generated\\prompts\\tinyfish-fetch-only.powershell.txt\""));
+        "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-router\""
+    ));
     assert!(content.contains("--plugin-dir \"%_TF_PLUGIN_DIR%\""));
-    assert!(content.contains("--append-system-prompt-file \"%_TF_PROMPT_FILE%\""));
+    assert!(!content.contains("_TF_PROMPT_FILE="));
+    assert!(!content.contains("--append-system-prompt-file"));
     assert!(!content.contains("WebFetch"));
     assert!(!content.contains("WebSearch"));
+    let tf_json: serde_json::Value = serde_json::from_str(&unescape_generated_cmd_set_value(
+        cmd_set_value(&content, "_TF_SETTINGS"),
+    ))
+    .unwrap();
+    assert!(
+        tf_json["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("statusline.ps1")
+    );
 }
 
 #[test]
-fn generate_cmd_content_native_provider_skips_tinyfish() {
+fn generate_cmd_content_anyrouter_keeps_router_plugin_without_prompt_files() {
     let tmp = TempDir::new().unwrap();
     let mgr = make_manager(&tmp);
     let lite = mgr
@@ -3083,9 +4248,22 @@ fn generate_cmd_content_native_provider_skips_tinyfish() {
         )
         .unwrap();
     let content = mgr.generate_cmd_content(&lite).unwrap();
-    assert!(!content.contains("_TF_PLUGIN_DIR="));
+    assert!(content.contains(
+        "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-router\""
+    ));
     assert!(!content.contains("_TF_PROMPT_FILE="));
-    assert!(!content.contains("tinyfish:*)"));
+    assert!(!content.contains("--append-system-prompt-file"));
+    let tf_json: serde_json::Value = serde_json::from_str(&unescape_generated_cmd_set_value(
+        cmd_set_value(&content, "_TF_SETTINGS"),
+    ))
+    .unwrap();
+    assert!(
+        tf_json["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("PowerShell(tinyfish:*)"))
+    );
 }
 
 #[test]
@@ -3132,17 +4310,17 @@ fn generated_cmd_subagent_hook_does_not_trigger_cmd_parse_error() {
         .unwrap();
     let mut content = mgr.generate_cmd_content(&lite).unwrap();
     content = content.replace(
-            "claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\" --append-system-prompt-file \"%_TF_PROMPT_FILE%\" %_LAUNCH_ARGS% %_R%",
-            "echo launched hooks extras",
-        );
+        "claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\" %_LAUNCH_ARGS% %_R%",
+        "echo launched hooks extras",
+    );
     content = content.replace(
         "claude --settings \"%_SETTINGS%\" %_LAUNCH_ARGS% %_R%",
         "echo launched extras",
     );
     content = content.replace(
-            "claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\" --append-system-prompt-file \"%_TF_PROMPT_FILE%\" %_R%",
-            "echo launched hooks plain",
-        );
+        "claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\" %_R%",
+        "echo launched hooks plain",
+    );
     content = content.replace(
         "claude --settings \"%_SETTINGS%\" %_R%",
         "echo launched plain",
@@ -3173,4 +4351,1209 @@ fn remove_remote_plugin_dir_reports_runner_errors() {
         |_| anyhow::bail!("permission denied"),
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn runtime_session_switch_updates_only_target_session() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let provider_base_url = "https://shared.example.invalid".to_string();
+    let provider = mgr
+        .add_provider_with_key_name("Relay One", &provider_base_url, "Alpha", "sk-alpha")
+        .unwrap();
+    let beta = mgr.add_key(&provider.id, "Beta", "sk-beta").unwrap();
+    let other_provider = mgr
+        .add_provider_with_key_name("Relay Two", &provider_base_url, "Gamma", "sk-gamma")
+        .unwrap();
+    let profile = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                default_opus_model: Some("old-opus-model".into()),
+                default_sonnet_model: Some("old-sonnet-model".into()),
+                default_haiku_model: Some("old-haiku-model".into()),
+                model: Some("old-current-model".into()),
+                subagent_model: Some("old-subagent-model".into()),
+                extras: vec![
+                    "CLAUDE_CODE_USE_BEDROCK=1".into(),
+                    "ANTHROPIC_VERTEX_PROJECT_ID=vertex-project".into(),
+                    "VERTEX_REGION_CLAUDE_4_6_SONNET=us-central1".into(),
+                    "MAX_THINKING_TOKENS=8000".into(),
+                    "CUSTOM_FLAG=yes".into(),
+                    "malformed-extra".into(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let started_at = ProfileManager::runtime_process_started_at(std::process::id());
+
+    let first_id = mgr.next_runtime_session_id();
+    let mut first = mgr.runtime_session_state_from_profile(
+        first_id.clone(),
+        &profile,
+        Some(&provider),
+        provider.keys.values().next(),
+        ("sk-alpha", &provider.base_url),
+        Some(PathBuf::from("/repo/one")),
+    );
+    first.pid = Some(std::process::id());
+    first.process_started_at = started_at;
+    mgr.ensure_runtime_session_dir(&first_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&first_id), &first)
+        .unwrap();
+    mgr.write_runtime_settings_in_place(
+        &mgr.runtime_settings_path(&first_id),
+        &mgr.build_runtime_settings_json(&first).unwrap(),
+    )
+    .unwrap();
+
+    let second_id = mgr.next_runtime_session_id();
+    let mut second = mgr.runtime_session_state_from_profile(
+        second_id.clone(),
+        &profile,
+        Some(&other_provider),
+        other_provider.keys.values().next(),
+        ("sk-gamma", &other_provider.base_url),
+        Some(PathBuf::from("/repo/two")),
+    );
+    second.pid = Some(std::process::id());
+    second.process_started_at = started_at;
+    mgr.ensure_runtime_session_dir(&second_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&second_id), &second)
+        .unwrap();
+    mgr.write_runtime_settings_in_place(
+        &mgr.runtime_settings_path(&second_id),
+        &mgr.build_runtime_settings_json(&second).unwrap(),
+    )
+    .unwrap();
+    mgr.write_runtime_settings_in_place(
+        &mgr.runtime_gateway_models_path(&second_id),
+        &serde_json::json!({
+            "baseUrl": provider_base_url.trim_end_matches('/'),
+            "fetchedAt": 1,
+            "models": [{ "id": "old-current-model" }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let updated = mgr
+        .switch_runtime_session(&first_id, &provider.id, &beta.id, "claude-3-7-opus")
+        .unwrap();
+    let untouched = mgr.load_runtime_session(&second_id).unwrap();
+
+    assert_eq!(updated.key_id.as_deref(), Some(beta.id.as_str()));
+    assert_eq!(updated.key_name.as_deref(), Some("Beta"));
+    assert_eq!(updated.auth_token, "sk-beta");
+    assert_eq!(
+        updated.default_opus_model.as_deref(),
+        Some("claude-3-7-opus")
+    );
+    assert_eq!(
+        updated.default_sonnet_model.as_deref(),
+        Some("claude-3-7-opus")
+    );
+    assert_eq!(
+        updated.default_haiku_model.as_deref(),
+        Some("claude-3-7-opus")
+    );
+    assert_eq!(updated.model.as_deref(), Some("claude-3-7-opus"));
+    assert_eq!(updated.subagent_model.as_deref(), Some("claude-3-7-opus"));
+    assert_eq!(
+        updated.extras,
+        vec![
+            "MAX_THINKING_TOKENS=8000".to_string(),
+            "CUSTOM_FLAG=yes".to_string(),
+            "malformed-extra".to_string(),
+        ]
+    );
+    assert_eq!(untouched.key_name.as_deref(), Some("Gamma"));
+    assert_eq!(untouched.auth_token, "sk-gamma");
+    assert_eq!(
+        untouched.default_opus_model.as_deref(),
+        Some("old-opus-model")
+    );
+    assert_eq!(
+        untouched.default_sonnet_model.as_deref(),
+        Some("old-sonnet-model")
+    );
+    assert_eq!(
+        untouched.default_haiku_model.as_deref(),
+        Some("old-haiku-model")
+    );
+    assert_eq!(untouched.model.as_deref(), Some("old-current-model"));
+    assert_eq!(
+        untouched.subagent_model.as_deref(),
+        Some("old-subagent-model")
+    );
+    let settings = fs::read_to_string(mgr.runtime_settings_path(&first_id)).unwrap();
+    let settings_json: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    let env = settings_json["env"].as_object().unwrap();
+    assert_eq!(
+        env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+            .and_then(serde_json::Value::as_str),
+        Some("claude-3-7-opus")
+    );
+    assert_eq!(
+        env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+            .and_then(serde_json::Value::as_str),
+        Some("claude-3-7-opus")
+    );
+    assert_eq!(
+        env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+            .and_then(serde_json::Value::as_str),
+        Some("claude-3-7-opus")
+    );
+    assert_eq!(
+        env.get("ANTHROPIC_MODEL")
+            .and_then(serde_json::Value::as_str),
+        Some("claude-3-7-opus")
+    );
+    assert_eq!(
+        env.get("CLAUDE_CODE_SUBAGENT_MODEL")
+            .and_then(serde_json::Value::as_str),
+        Some("claude-3-7-opus")
+    );
+    assert_eq!(
+        env.get("MAX_THINKING_TOKENS")
+            .and_then(serde_json::Value::as_str),
+        Some("8000")
+    );
+    assert_eq!(
+        env.get("CUSTOM_FLAG").and_then(serde_json::Value::as_str),
+        Some("yes")
+    );
+    assert!(!env.contains_key("CLAUDE_CODE_USE_BEDROCK"));
+    assert!(!env.contains_key("ANTHROPIC_VERTEX_PROJECT_ID"));
+    assert!(!env.keys().any(|key| key.starts_with("VERTEX_REGION_")));
+    assert!(settings.contains("claude-3-7-opus"));
+    assert!(!settings.contains("old-opus-model"));
+    assert!(!settings.contains("old-sonnet-model"));
+    assert!(!settings.contains("old-haiku-model"));
+    assert!(!settings.contains("old-subagent-model"));
+    assert!(!settings.contains("CLAUDE_CODE_USE_BEDROCK"));
+    assert!(!settings.contains("ANTHROPIC_VERTEX_PROJECT_ID"));
+    assert!(settings.contains("runtime auth"));
+    let cache_path = mgr.global_gateway_models_path();
+    let cache_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_path).unwrap()).unwrap();
+    assert_eq!(
+        cache_json["baseUrl"].as_str(),
+        Some(provider_base_url.trim_end_matches('/'))
+    );
+    assert!(
+        gateway_cache_model_ids(&cache_json)
+            .iter()
+            .any(|model| model == "claude-3-7-opus")
+    );
+    let shadow_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(mgr.runtime_gateway_models_path(&first_id)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        gateway_cache_model_ids(&shadow_json),
+        vec!["claude-3-7-opus"]
+    );
+    assert_eq!(
+        gateway_cache_model_ids(&cache_json),
+        vec!["claude-3-7-opus", "old-current-model"]
+    );
+}
+
+#[test]
+fn runtime_settings_embed_platform_correct_api_key_helper_command() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                model: Some("claude-3-7-sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let state = mgr.runtime_session_state_from_profile(
+        "proc_helpercheck".into(),
+        &profile,
+        None,
+        None,
+        ("sk-inline", "https://api.example.invalid"),
+        None,
+    );
+
+    let settings: serde_json::Value =
+        serde_json::from_str(&mgr.build_runtime_settings_json(&state).unwrap()).unwrap();
+    let helper = settings["apiKeyHelper"].as_str().unwrap();
+    assert_eq!(
+        settings.get("model").and_then(serde_json::Value::as_str),
+        Some("claude-3-7-sonnet")
+    );
+    let env = settings["env"].as_object().unwrap();
+    assert_eq!(
+        env.get("ANTHROPIC_CUSTOM_MODEL_OPTION")
+            .and_then(serde_json::Value::as_str),
+        Some("claude-3-7-sonnet")
+    );
+    assert_eq!(
+        env.get("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME")
+            .and_then(serde_json::Value::as_str),
+        Some("Gateway: claude-3-7-sonnet")
+    );
+    assert_eq!(
+        env.get("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION")
+            .and_then(serde_json::Value::as_str),
+        Some("Runtime gateway model via https://api.example.invalid")
+    );
+    assert!(settings.get("availableModels").is_none());
+    assert!(settings.get("modelOverrides").is_none());
+
+    #[cfg(target_os = "windows")]
+    {
+        assert!(helper.starts_with("powershell -NoProfile -Command \"& '"));
+        assert!(helper.contains("runtime auth proc_helpercheck"));
+        assert!(helper.ends_with('"'));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert!(helper.starts_with('"'));
+        assert!(helper.contains("runtime auth proc_helpercheck"));
+    }
+}
+
+#[test]
+fn runtime_gateway_cache_refresh_writes_shadow_and_global_cache_from_discovery() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                model: Some("chosen-model[1m]".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (base_url, handle) = spawn_model_fetch_server(vec![(
+        "HTTP/1.1 200 OK",
+        "{\"data\":[{\"id\":\"gateway-a\"},{\"id\":\"gateway-b\"}]}",
+    )]);
+    let session = mgr.runtime_session_state_from_profile(
+        "proc_cachewrite".into(),
+        &profile,
+        None,
+        None,
+        ("sk-inline", &base_url),
+        None,
+    );
+    mgr.ensure_runtime_session_dir(&session.session_id).unwrap();
+
+    mgr.refresh_runtime_gateway_models_cache_for_session(&session)
+        .unwrap();
+
+    let shadow_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(mgr.runtime_gateway_models_path(&session.session_id)).unwrap(),
+    )
+    .unwrap();
+    let global_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(mgr.global_gateway_models_path()).unwrap())
+            .unwrap();
+    assert_eq!(shadow_json["baseUrl"].as_str(), Some(base_url.as_str()));
+    assert_eq!(global_json["baseUrl"].as_str(), Some(base_url.as_str()));
+    assert_eq!(
+        gateway_cache_model_ids(&shadow_json),
+        vec!["chosen-model", "gateway-a", "gateway-b"]
+    );
+    assert_eq!(
+        gateway_cache_model_ids(&global_json),
+        vec!["chosen-model", "gateway-a", "gateway-b"]
+    );
+    assert_eq!(handle.join().unwrap(), vec!["/v1/models".to_string()]);
+}
+
+#[test]
+fn runtime_gateway_cache_refresh_falls_back_to_session_models_when_discovery_fails() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                default_opus_model: Some("fallback-opus".into()),
+                default_sonnet_model: Some("fallback-sonnet".into()),
+                default_haiku_model: Some("fallback-haiku".into()),
+                model: Some("fallback-current[1m]".into()),
+                subagent_model: Some("fallback-subagent".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (base_url, handle) = spawn_model_fetch_server(vec![(
+        "HTTP/1.1 401 Unauthorized",
+        "{\"error\":{\"message\":\"unauthorized\"}}",
+    )]);
+    let session = mgr.runtime_session_state_from_profile(
+        "proc_cachefallback".into(),
+        &profile,
+        None,
+        None,
+        ("sk-inline", &base_url),
+        None,
+    );
+    mgr.ensure_runtime_session_dir(&session.session_id).unwrap();
+
+    mgr.refresh_runtime_gateway_models_cache_for_session(&session)
+        .unwrap();
+
+    let shadow_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(mgr.runtime_gateway_models_path(&session.session_id)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        gateway_cache_model_ids(&shadow_json),
+        vec![
+            "fallback-current",
+            "fallback-opus",
+            "fallback-sonnet",
+            "fallback-haiku",
+            "fallback-subagent",
+        ]
+    );
+    assert_eq!(handle.join().unwrap(), vec!["/v1/models".to_string()]);
+}
+
+#[test]
+fn runtime_gateway_cache_refresh_merges_same_gateway_active_session_models() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                model: Some("alpha[1m]".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (base_url, handle) = spawn_model_fetch_server(vec![(
+        "HTTP/1.1 401 Unauthorized",
+        "{\"error\":{\"message\":\"unauthorized\"}}",
+    )]);
+    let started_at = ProfileManager::runtime_process_started_at(std::process::id());
+
+    let first_id = mgr.next_runtime_session_id();
+    let mut first = mgr.runtime_session_state_from_profile(
+        first_id.clone(),
+        &profile,
+        None,
+        None,
+        ("sk-alpha", &base_url),
+        None,
+    );
+    first.pid = Some(std::process::id());
+    first.process_started_at = started_at;
+    mgr.ensure_runtime_session_dir(&first_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&first_id), &first)
+        .unwrap();
+
+    let second_id = mgr.next_runtime_session_id();
+    let mut second = mgr.runtime_session_state_from_profile(
+        second_id.clone(),
+        &profile,
+        None,
+        None,
+        ("sk-beta", &base_url),
+        None,
+    );
+    second.model = Some("beta".into());
+    second.pid = Some(std::process::id());
+    second.process_started_at = started_at;
+    mgr.ensure_runtime_session_dir(&second_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&second_id), &second)
+        .unwrap();
+    mgr.write_runtime_settings_in_place(
+        &mgr.runtime_gateway_models_path(&second_id),
+        &serde_json::json!({
+            "baseUrl": base_url.trim_end_matches('/'),
+            "fetchedAt": 1,
+            "models": [{ "id": "beta" }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    mgr.refresh_runtime_gateway_models_cache_for_session(&first)
+        .unwrap();
+
+    let global_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(mgr.global_gateway_models_path()).unwrap())
+            .unwrap();
+    assert_eq!(
+        global_json["baseUrl"].as_str(),
+        Some(base_url.trim_end_matches('/'))
+    );
+    assert_eq!(gateway_cache_model_ids(&global_json), vec!["alpha", "beta"]);
+    assert_eq!(handle.join().unwrap(), vec!["/v1/models".to_string()]);
+}
+
+#[test]
+fn runtime_session_switch_rejects_conflicting_gateway_url() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let provider = mgr
+        .add_provider_with_key_name(
+            "Relay One",
+            "https://relay-one.example.invalid",
+            "Alpha",
+            "sk-alpha",
+        )
+        .unwrap();
+    let beta = mgr.add_key(&provider.id, "Beta", "sk-beta").unwrap();
+    let other_provider = mgr
+        .add_provider_with_key_name(
+            "Relay Two",
+            "https://relay-two.example.invalid",
+            "Gamma",
+            "sk-gamma",
+        )
+        .unwrap();
+    let profile = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                base_url: Some("https://api.anthropic.com".into()),
+                subagent_model: Some("qwen3-max".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let started_at = ProfileManager::runtime_process_started_at(std::process::id());
+
+    let first_id = mgr.next_runtime_session_id();
+    let mut first = mgr.runtime_session_state_from_profile(
+        first_id.clone(),
+        &profile,
+        Some(&provider),
+        provider.keys.values().next(),
+        ("sk-alpha", &provider.base_url),
+        None,
+    );
+    first.pid = Some(std::process::id());
+    first.process_started_at = started_at;
+    mgr.ensure_runtime_session_dir(&first_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&first_id), &first)
+        .unwrap();
+
+    let second_id = mgr.next_runtime_session_id();
+    let mut second = mgr.runtime_session_state_from_profile(
+        second_id.clone(),
+        &profile,
+        Some(&other_provider),
+        other_provider.keys.values().next(),
+        ("sk-gamma", &other_provider.base_url),
+        None,
+    );
+    second.pid = Some(std::process::id());
+    second.process_started_at = started_at;
+    mgr.ensure_runtime_session_dir(&second_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&second_id), &second)
+        .unwrap();
+
+    let error = mgr
+        .switch_runtime_session(&first_id, &provider.id, &beta.id, "claude-3-7-opus")
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("single global gateway cache"));
+    assert!(message.contains(&second_id));
+
+    let unchanged = mgr.load_runtime_session(&first_id).unwrap();
+    assert_eq!(unchanged.key_name.as_deref(), Some("Alpha"));
+    assert_eq!(unchanged.auth_token, "sk-alpha");
+}
+
+#[test]
+fn list_runtime_sessions_marks_missing_pid_as_stale() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    let session_id = mgr.next_runtime_session_id();
+    let state = mgr.runtime_session_state_from_profile(
+        session_id.clone(),
+        &profile,
+        None,
+        None,
+        ("sk-inline", "https://api.example.invalid"),
+        None,
+    );
+    mgr.ensure_runtime_session_dir(&session_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&session_id), &state)
+        .unwrap();
+    mgr.write_runtime_settings_in_place(
+        &mgr.runtime_settings_path(&session_id),
+        &mgr.build_runtime_settings_json(&state).unwrap(),
+    )
+    .unwrap();
+
+    let sessions = mgr.list_runtime_sessions().unwrap();
+    let session = sessions
+        .iter()
+        .find(|entry| entry.state.session_id == session_id)
+        .unwrap();
+    assert!(!session.active);
+    assert!(
+        session
+            .stale_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing pid")
+    );
+}
+
+#[test]
+fn generate_cmd_auto_shim_tries_dynamic_launch_before_legacy() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    let content = mgr.generate_cmd_content(&lite).unwrap();
+
+    assert!(content.contains("if \"%~1\"==\"\" goto dispatch_launch"));
+    assert!(content.contains(":dispatch_launch"));
+    assert!(content.contains("shim launch --probe"));
+    assert!(content.contains("shim launch --profile-id"));
+    assert!(content.contains("dynamic_unavailable"));
+    assert!(content.contains("falling back to legacy shim"));
+    assert!(content.contains("claude --settings"));
+    assert!(
+        content.find(":dispatch_launch").unwrap() < content.find("shim launch --probe").unwrap()
+    );
+    assert!(content.find(":build_settings").unwrap() > content.find(":dispatch_launch").unwrap());
+}
+
+#[test]
+fn generate_sh_auto_shim_tries_dynamic_launch_before_legacy() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    let content = mgr.generate_sh_content(&lite).unwrap();
+
+    assert!(content.contains("shim launch --probe"));
+    assert!(content.contains("shim launch --profile-id \"$PROFILE_ID\""));
+    assert!(content.contains("falling back to legacy shim"));
+    assert!(content.contains("exec claude"));
+}
+
+#[test]
+fn recover_shims_parses_shell_settings_variables() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "shell-profile",
+            Some("shell-profile"),
+            LightweightEnv {
+                auth_token: Some("sk-shell".into()),
+                base_url: Some("https://api.shell.invalid".into()),
+                model: Some("claude-3-7-sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let content = mgr.generate_sh_content(&profile).unwrap();
+    let recovered =
+        ProfileManager::parse_recoverable_shim("claude-shell-profile", &content).unwrap();
+
+    assert_eq!(recovered.alias, "shell-profile");
+    assert_eq!(recovered.token, "sk-shell");
+    assert_eq!(recovered.base_url, "https://api.shell.invalid");
+    assert_eq!(recovered.env.model.as_deref(), Some("claude-3-7-sonnet"));
+}
+
+#[test]
+fn prepare_lightweight_launch_appends_one_runtime_settings_arg() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    let _prepared = mgr.prepare_lightweight_launch(&mut cmd, &profile).unwrap();
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let settings_indexes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == "--settings").then_some(idx))
+        .collect::<Vec<_>>();
+
+    assert_eq!(settings_indexes, vec![0]);
+    assert!(args[settings_indexes[0] + 1].ends_with("settings.json"));
+}
+
+#[test]
+fn prepare_lightweight_launch_attaches_tinyfish_router_for_native_profile_when_tinyfish_available()
+{
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                base_url: Some("https://api.anthropic.com".into()),
+                subagent_model: Some("qwen3-max".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    let _prepared = mgr
+        .prepare_lightweight_launch_with_tinyfish_available(&mut cmd, &profile, true)
+        .unwrap();
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let plugin_dir_indexes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == "--plugin-dir").then_some(idx))
+        .collect::<Vec<_>>();
+
+    assert_eq!(plugin_dir_indexes.len(), 1);
+    assert_eq!(
+        args[plugin_dir_indexes[0] + 1],
+        mgr.local_tinyfish_plugin_root(TinyfishPluginVariant::Router)
+            .to_string_lossy()
+    );
+}
+
+#[test]
+fn prepare_lightweight_launch_keeps_plugin_dirs_separate_from_settings_path() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let server = mgr
+        .add_mcp_server(McpServerInput {
+            name: "github".into(),
+            server_type: "stdio".into(),
+            command: Some("npx".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let profile = mgr
+        .create_lightweight_profile("work", Some("work-mcp"), LightweightEnv::default())
+        .unwrap();
+    let linked = mgr
+        .set_profile_mcps(&profile.id, std::slice::from_ref(&server.id))
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    let _prepared = mgr
+        .prepare_lightweight_launch_with_tinyfish_available(&mut cmd, &linked, false)
+        .unwrap();
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let settings_indexes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == "--settings").then_some(idx))
+        .collect::<Vec<_>>();
+    let plugin_dir_indexes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == "--plugin-dir").then_some(idx))
+        .collect::<Vec<_>>();
+
+    assert_eq!(settings_indexes.len(), 1);
+    assert_eq!(plugin_dir_indexes.len(), 1);
+    assert!(plugin_dir_indexes[0] < settings_indexes[0]);
+    assert!(args[settings_indexes[0] + 1].ends_with("settings.json"));
+    assert_ne!(args[settings_indexes[0] + 1], "--plugin-dir");
+}
+
+#[test]
+fn prepare_lightweight_launch_rejects_conflicting_active_gateway_session() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let active_profile = mgr
+        .create_lightweight_profile(
+            "gateway-a",
+            Some("gateway-a"),
+            LightweightEnv {
+                auth_token: Some("sk-a".into()),
+                base_url: Some("https://gateway-a.example.invalid".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let target_profile = mgr
+        .create_lightweight_profile(
+            "gateway-b",
+            Some("gateway-b"),
+            LightweightEnv {
+                auth_token: Some("sk-b".into()),
+                base_url: Some("https://gateway-b.example.invalid".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let started_at = ProfileManager::runtime_process_started_at(std::process::id());
+    let active_session_id = mgr.next_runtime_session_id();
+    let mut active_session = mgr.runtime_session_state_from_profile(
+        active_session_id.clone(),
+        &active_profile,
+        None,
+        None,
+        ("sk-a", "https://gateway-a.example.invalid"),
+        None,
+    );
+    active_session.pid = Some(std::process::id());
+    active_session.process_started_at = started_at;
+    mgr.ensure_runtime_session_dir(&active_session_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&active_session_id), &active_session)
+        .unwrap();
+
+    let mut cmd = std::process::Command::new("claude");
+    let error = mgr
+        .prepare_lightweight_launch_with_tinyfish_available(&mut cmd, &target_profile, false)
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("single global gateway cache"));
+    assert!(message.contains(&active_session_id));
+
+    let managed_dirs = fs::read_dir(mgr.runtime_root_dir())
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry.path().is_dir()
+                && ProfileManager::is_managed_runtime_dir_name(&entry.file_name().to_string_lossy())
+        })
+        .count();
+    assert_eq!(managed_dirs, 1);
+}
+
+#[test]
+fn launch_claude_cleans_up_runtime_session_when_spawn_fails() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    mgr.create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    let empty_bin = tmp.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).unwrap();
+    let _env_guard = process_launch_env_guard();
+    let _path_guard = PathOverrideGuard::replace(std::slice::from_ref(&empty_bin));
+
+    let error = mgr
+        .launch_claude(
+            "work",
+            &[],
+            LaunchOptions {
+                use_stored_args: false,
+                local_gateway_mode: RequestedLocalGatewayMode::Omitted,
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("Failed to launch claude"));
+
+    let runtime_root = mgr.runtime_root_dir();
+    let managed_dirs = if runtime_root.exists() {
+        fs::read_dir(&runtime_root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry.path().is_dir()
+                    && ProfileManager::is_managed_runtime_dir_name(
+                        &entry.file_name().to_string_lossy(),
+                    )
+            })
+            .count()
+    } else {
+        0
+    };
+    assert_eq!(managed_dirs, 0);
+}
+
+#[test]
+fn export_import_config_bundle_round_trips_global_settings() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    mgr.set_allow_local_runtime_hot_switch(true).unwrap();
+
+    let exported = mgr.export_config_bundle(&[], false).unwrap();
+    let bundle: ConfigBundle = serde_json::from_str(&exported).unwrap();
+    assert!(
+        bundle
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.allow_local_runtime_hot_switch)
+    );
+
+    let imported_tmp = TempDir::new().unwrap();
+    let imported_mgr = make_manager(&imported_tmp);
+    imported_mgr.import_config_bundle(&exported, false).unwrap();
+    assert!(imported_mgr.allow_local_runtime_hot_switch().unwrap());
+}
+
+#[test]
+fn import_old_config_bundle_without_settings_preserves_local_global_settings() {
+    let source_tmp = TempDir::new().unwrap();
+    let source_mgr = make_manager(&source_tmp);
+    let exported = source_mgr.export_config_bundle(&[], false).unwrap();
+    let mut bundle_json: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    bundle_json.as_object_mut().unwrap().remove("settings");
+    let legacy_bundle = serde_json::to_string(&bundle_json).unwrap();
+
+    let dest_tmp = TempDir::new().unwrap();
+    let dest_mgr = make_manager(&dest_tmp);
+    dest_mgr.set_allow_local_runtime_hot_switch(true).unwrap();
+
+    dest_mgr
+        .import_config_bundle(&legacy_bundle, false)
+        .unwrap();
+
+    assert!(dest_mgr.allow_local_runtime_hot_switch().unwrap());
+}
+
+#[test]
+fn direct_lightweight_launch_for_local_base_url_uses_inline_settings_only() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    mgr.prepare_default_local_direct_lightweight_launch(&mut cmd, &profile)
+        .unwrap();
+
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let settings_indexes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == "--settings").then_some(idx))
+        .collect::<Vec<_>>();
+
+    assert_eq!(settings_indexes, vec![0]);
+    let settings: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+    assert_eq!(
+        settings["env"]["ANTHROPIC_BASE_URL"].as_str(),
+        Some("http://localhost:11434/v1")
+    );
+    assert_inline_helper_token(&settings, "sk-local");
+    assert!(settings["env"]["CLAUDE_SWITCH_TINYFISH_MODE"].is_null());
+    assert!(settings.get("permissions").is_none());
+    assert!(settings.get("statusLine").is_none());
+    assert!(!args[1].contains("runtime auth"));
+    assert!(!mgr.runtime_root_dir().exists());
+}
+
+#[test]
+fn explicit_local_gateway_auto_attaches_router_when_tinyfish_available() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    mgr.prepare_direct_lightweight_launch_with_tinyfish_available(
+        &mut cmd,
+        &profile,
+        true,
+        LocalGatewayToolMode::Auto,
+    )
+    .unwrap();
+
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let plugin_dir_indexes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == "--plugin-dir").then_some(idx))
+        .collect::<Vec<_>>();
+
+    assert_eq!(plugin_dir_indexes.len(), 1);
+    assert_eq!(
+        args[plugin_dir_indexes[0] + 1],
+        mgr.local_tinyfish_plugin_root(TinyfishPluginVariant::Router)
+            .to_string_lossy()
+    );
+}
+
+#[test]
+fn direct_local_gateway_gateway_only_mode_disables_tinyfish_plugin() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    mgr.prepare_direct_lightweight_launch_with_tinyfish_available(
+        &mut cmd,
+        &profile,
+        true,
+        LocalGatewayToolMode::GatewayOnly,
+    )
+    .unwrap();
+
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(!args.iter().any(|arg| arg == "--plugin-dir"));
+    let settings: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+    assert_eq!(
+        settings["env"]["CLAUDE_SWITCH_TINYFISH_MODE"].as_str(),
+        Some("gateway-only")
+    );
+    assert!(settings.get("permissions").is_none());
+    assert!(settings.get("statusLine").is_none());
+}
+
+#[test]
+fn direct_local_gateway_search_fetch_requires_tinyfish() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    let error = mgr
+        .prepare_direct_lightweight_launch_with_tinyfish_available(
+            &mut cmd,
+            &profile,
+            false,
+            LocalGatewayToolMode::SearchFetch,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("TinyFish is required"));
+}
+
+#[test]
+fn direct_local_gateway_search_fetch_attaches_static_full_plugin_when_tinyfish_available() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    mgr.prepare_direct_lightweight_launch_with_tinyfish_available(
+        &mut cmd,
+        &profile,
+        true,
+        LocalGatewayToolMode::SearchFetch,
+    )
+    .unwrap();
+
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let plugin_dir_indexes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == "--plugin-dir").then_some(idx))
+        .collect::<Vec<_>>();
+
+    assert_eq!(plugin_dir_indexes.len(), 1);
+    assert_eq!(
+        args[plugin_dir_indexes[0] + 1],
+        mgr.local_tinyfish_plugin_root(TinyfishPluginVariant::Full)
+            .to_string_lossy()
+    );
+}
+
+#[test]
+fn direct_local_gateway_fetch_only_attaches_static_fetch_only_plugin_when_tinyfish_available() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    mgr.prepare_direct_lightweight_launch_with_tinyfish_available(
+        &mut cmd,
+        &profile,
+        true,
+        LocalGatewayToolMode::FetchOnly,
+    )
+    .unwrap();
+
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let plugin_dir_indexes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == "--plugin-dir").then_some(idx))
+        .collect::<Vec<_>>();
+
+    assert_eq!(plugin_dir_indexes.len(), 1);
+    assert_eq!(
+        args[plugin_dir_indexes[0] + 1],
+        mgr.local_tinyfish_plugin_root(TinyfishPluginVariant::FetchOnly)
+            .to_string_lossy()
+    );
+}
+
+#[test]
+fn local_lite_profiles_bypass_runtime_even_when_legacy_override_is_enabled() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    mgr.set_allow_local_runtime_hot_switch(true).unwrap();
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cmd = std::process::Command::new("claude");
+
+    mgr.prepare_default_local_direct_lightweight_launch(&mut cmd, &profile)
+        .unwrap();
+
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(args.iter().any(|arg| arg == "--settings"));
+    assert!(!args.iter().any(|arg| arg.ends_with("settings.json")));
+    assert!(!args.iter().any(|arg| arg == "--plugin-dir"));
+    assert!(!mgr.runtime_root_dir().exists());
+}
+
+#[test]
+fn runtime_session_switch_rejects_local_self_hosted_provider_when_policy_disabled() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let provider = mgr
+        .add_provider_with_key_name(
+            "Local LLM",
+            "http://localhost:11434/v1",
+            "Default",
+            "sk-local",
+        )
+        .unwrap();
+    let key = provider.keys.values().next().unwrap().clone();
+    let relay = mgr
+        .add_provider_with_key_name(
+            "Relay",
+            "https://relay.example.invalid",
+            "Default",
+            "sk-relay",
+        )
+        .unwrap();
+    let profile = mgr
+        .create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    let session_id = mgr.next_runtime_session_id();
+    let mut session = mgr.runtime_session_state_from_profile(
+        session_id.clone(),
+        &profile,
+        Some(&relay),
+        relay.keys.values().next(),
+        ("sk-relay", &relay.base_url),
+        None,
+    );
+    session.pid = Some(std::process::id());
+    session.process_started_at = ProfileManager::runtime_process_started_at(std::process::id());
+    mgr.ensure_runtime_session_dir(&session_id).unwrap();
+    mgr.write_runtime_state_atomic(&mgr.runtime_state_path(&session_id), &session)
+        .unwrap();
+
+    let error = mgr
+        .switch_runtime_session(&session_id, &provider.id, &key.id, "qwen3")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("local/self-hosted API"));
+    assert!(error.contains("bypass runtime sessions"));
 }

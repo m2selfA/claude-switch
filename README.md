@@ -81,16 +81,20 @@ cswitch
 | `cswitch add --alias <a> <name>` | Add with a short CLI-friendly alias |
 | `cswitch use <name> [-- <claude-args>]` | Launch Claude Code with a profile; stored launch args are enabled by default |
 | `cswitch use --no-extras <name>` | Launch without the profile's stored launch args |
+| `cswitch use --local-gateway-mode <mode> <name> [-- <claude-args>]` | For localhost/LAN lightweight profiles, choose `auto`, `search-fetch`, `fetch-only`, or `gateway-only` for that launch |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
 | `cswitch aliases [--local] [--remote <host>]... [--verbose]` | Generate/sync local shell aliases and launchers, and/or sync remote launchers plus any required TinyFish prompt/plugin companion files via sftp (`--remote` is repeatable) |
 | `cswitch doctor [--json] [--strict]` | Diagnose registry links, generated artifacts, MCP entries, and local runtime availability |
 | `cswitch config inspect [--json]` | Show registry paths, generated artifact paths, and object counts |
+| `cswitch config settings show [--json]` | Show persisted global claude-switch settings |
+| `cswitch config settings set [--allow-local-runtime-hot-switch] [--json]` | Update the legacy localhost/LAN runtime override toggle |
 | `cswitch config export [--profile <profile>]... [-o <file>] [--include-secrets]` | Export a portable config bundle; secrets are redacted unless explicitly included |
 | `cswitch config import <file> [--replace] [--dry-run] [--json]` | Import a portable config bundle, or preview the add/update plan without writing |
 | `cswitch config validate <file> [--json] [--strict]` | Validate a config bundle before importing it |
 | `cswitch config recover-shims <shim-dir> [--write] [--replace] [--json]` | Recover registry profiles/providers from generated `claude-*` shim files |
+| `cswitch config migrate-auth [--write] [--json] [--remote <host>]...` | Preview or migrate Claude token-based settings auth to `apiKeyHelper`, locally and optionally on remotes |
 | `cswitch statusline [--profile <profile>] [--dir <path>] [--json]` | Print a compact current-profile summary for prompts/status bars |
 | `cswitch shell hook [--shell <auto\|powershell\|bash\|zsh\|fish>]` | Print a shell wrapper that auto-selects project profiles from marker files |
 | `cswitch shell current [--dir <path>]` | Resolve the project profile selected by `.cswitch-profile` or `.claudeprofile` |
@@ -113,6 +117,10 @@ cswitch
 | `cswitch mcp export [<mcp>...] [--all] [-o <file>]` | Export saved MCP servers as Claude-compatible `mcp.json` content |
 | `cswitch mcp import <file> [--replace]` | Import MCP servers from a Claude-compatible `mcp.json` / `.mcp.json` file |
 | `cswitch mcp validate [<mcp>...] [--all] [--strict]` | Validate saved MCP server entries and report missing commands, stale fields, deprecated SSE, and disabled servers |
+| `cswitch process list` | List runtime-managed lightweight Claude sessions |
+| `cswitch process inspect <session-id>` | Show PID, provider, paths, and timestamps for one runtime-managed session |
+| `cswitch process switch <session-id> --provider <id> --key <id> --model <id>` | Hot-switch a running runtime-managed session to a different provider/key/model |
+| `cswitch process gc` | Remove stale runtime session directories |
 | `cswitch --help` | Full CLI help |
 
 ## Interactive TUI
@@ -125,8 +133,9 @@ Run `cswitch` with no arguments to open the TUI.
 |---|---|
 | `Ctrl+P/N` | Navigate lists and selections |
 | `↑/↓` | Compatibility navigation keys |
-| `Enter` | Launch Claude with selected profile and stored launch args |
+| `Enter` | Launch the selected profile with stored launch args |
 | `Shift+Enter` | Launch without stored launch args |
+| `g` | For localhost/LAN lightweight profiles, open the explicit local gateway mode picker |
 | `/` | Search profiles by name or alias |
 | `t` | Add lightweight profile from provider/key |
 | `T` | Batch-test all non-official provider keys from Profile Manager using one editable Anthropic prompt, with per-base-URL spacing and sorted results |
@@ -151,6 +160,23 @@ Run `cswitch` with no arguments to open the TUI.
 
 `j/k` is still accepted in some pure list views for compatibility, but it is no longer the documented primary navigation scheme.
 
+For localhost/LAN lightweight profiles, plain `cswitch use <name>` and the unsuffixed generated shim stay on the self-contained inline-settings path by default. Use `g` in the TUI or `--local-gateway-mode auto` when you explicitly want the dynamic TinyFish auto-routing behavior back.
+
+From Public Site provider-test results, `Shift+S` opens the runtime process switch picker. The Anthropic outcome popup also exposes the same action on `s`.
+
+## Runtime-managed sessions
+
+For provider-backed lightweight profiles that are not local/self-hosted, `cswitch` can keep a runtime session directory under `~/.claude-switch/runtime/` and hot-switch an already running Claude process to a different provider, key, or model without restarting it.
+
+```bash
+cswitch process list
+cswitch process inspect rt_12345678
+cswitch process switch rt_12345678 --provider prov_12345678 --key key_12345678 --model claude-sonnet-4-20250514
+cswitch process gc
+```
+
+Local/self-hosted lightweight profiles on `localhost`, `*.localhost`, `127.*`, `::1`, `10.*`, `192.168.*`, and `172.16-31.*` bypass runtime sessions by default. They launch directly with an inline `apiKeyHelper`; use explicit local gateway modes when you need TinyFish-assisted search/fetch routing.
+
 ## Shell aliases
 
 Generate aliases so you can launch profiles directly:
@@ -173,9 +199,9 @@ claude-work       # launch with the "work" profile
 claude-personal   # launch with the "personal" profile
 ```
 
-On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs generated `.cmd` launchers into `~/.local/bin` (`%USERPROFILE%\.local\bin`). For ordinary lightweight profiles the `.cmd` stays self-contained; for TinyFish-enhanced profiles `cswitch` also maintains companion prompt/plugin files under `~/.claude-switch/generated/`. Profiles with selected MCP servers receive generated Claude plugin directories under `~/.claude-switch/generated/mcps/`, and the launcher passes them through `--plugin-dir` so MCP selections can combine cleanly with TinyFish plugins. Each generated TinyFish plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. The launchers support `--no-extras`, and all generated files are added, updated, and cleaned up automatically when profiles change.
+On Windows, `cswitch aliases` outputs PowerShell functions for your `$PROFILE`, **and** syncs generated `.cmd` launchers into `~/.local/bin` (`%USERPROFILE%\.local\bin`). Ordinary lightweight profiles stay self-contained. Localhost/LAN lightweight profiles also default to a self-contained inline-settings launcher with no TinyFish plugin content unless you use an explicit local gateway mode (`claude-<alias>-search-fetch`, `claude-<alias>-fetch-only`, `claude-<alias>-gateway`, or `cswitch use --local-gateway-mode ...`). Profiles with selected MCP servers receive generated Claude plugin directories under `~/.claude-switch/generated/mcps/`, and the launcher passes them through `--plugin-dir` so MCP selections can combine cleanly with TinyFish plugins when needed. Each generated TinyFish plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. The launchers support `--no-extras`, and all generated files are added, updated, and cleaned up automatically when profiles change.
 
-On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs generated bash launchers there instead of printing aliases. Non-TinyFish lightweight profiles remain self-contained; TinyFish-enhanced profiles also use managed companion prompt/plugin files under `~/.claude-switch/generated/`. Profiles with selected MCP servers receive generated Claude plugin directories under `~/.claude-switch/generated/mcps/`, and the launcher passes them through `--plugin-dir` so MCP selections can combine cleanly with TinyFish plugins. Each generated TinyFish plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. Each script is executable, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
+On Linux/macOS, if `~/.varusers/bin/` exists, `cswitch aliases` syncs generated bash launchers there instead of printing aliases. Non-TinyFish lightweight profiles remain self-contained. Localhost/LAN lightweight profiles also default to a self-contained inline-settings launcher with no TinyFish plugin content unless you use an explicit local gateway mode (`claude-<alias>-search-fetch`, `claude-<alias>-fetch-only`, `claude-<alias>-gateway`, or `cswitch use --local-gateway-mode ...`). Profiles with selected MCP servers receive generated Claude plugin directories under `~/.claude-switch/generated/mcps/`, and the launcher passes them through `--plugin-dir` so MCP selections can combine cleanly with TinyFish plugins when needed. Each generated TinyFish plugin includes both `.claude-plugin/plugin.json` and `hooks/hooks.json`. Set `CLAUDE_SWITCH_TINYFISH=off` in a lightweight profile extra to suppress TinyFish injection for that profile. Each script is executable, supports `--no-extras`, and is automatically maintained when profiles change. If the directory doesn't exist, the command falls back to printing bash/zsh aliases as before.
 
 ## Project auto-switch
 
@@ -202,6 +228,17 @@ Use `cswitch shell current --dir <path>` to debug which profile a project marker
 ## Diagnostics
 
 `cswitch doctor` checks the registry, provider/key references, profile directories, MCP links, generated MCP plugin folders, and whether `claude` is on `PATH`. It reports warnings without failing by default; add `--strict` to make warnings or errors return a non-zero exit code. `cswitch config inspect --json` is intended for scripts that need the exact storage paths and object counts.
+
+`cswitch config settings show` / `set` exposes the persisted global policy toggle for the legacy localhost/LAN runtime override. The toggle is kept for compatibility, but local/self-hosted lightweight profiles still launch directly and do not regain dynamic process hot-switch support.
+
+`cswitch config migrate-auth` previews a migration from token-based Claude settings auth to `apiKeyHelper`. Add `--write` to apply it, and repeat `--remote <host>` to migrate `~/.claude/settings.json` on remote machines as well.
+
+```bash
+cswitch config settings show
+cswitch config settings set --allow-local-runtime-hot-switch
+cswitch config migrate-auth
+cswitch config migrate-auth --write --remote my-host
+```
 
 For automation or smoke tests, set `CLAUDE_SWITCH_HOME` to an isolated user-home root. `cswitch` will read/write `$CLAUDE_SWITCH_HOME/.claude-switch` and place generated local shims under that same root, instead of touching the real home directory.
 
@@ -284,7 +321,7 @@ Stored in `~/.claude-switch/profiles/<alias-or-name>/`. Launch sets `CLAUDE_CONF
 
 ### Lightweight profiles
 
-No dedicated profile directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` on launch. For ordinary profiles this remains an inline settings payload; for TinyFish-enhanced profiles `cswitch` also materializes managed prompt/plugin files under `~/.claude-switch/generated/`, with plugins written as standard Claude plugin directories containing `.claude-plugin/plugin.json` and `hooks/hooks.json`, while TinyFish-specific permissions remain inline in `--settings`. If a lightweight profile selects MCP servers, `cswitch` generates a separate profile-scoped plugin under `~/.claude-switch/generated/mcps/` containing `.mcp.json` plus a compatibility `mcp.json`, then passes it to Claude with `--plugin-dir`. Token and base URL can also come from a linked shared provider/key.
+No dedicated profile directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` on launch. For ordinary profiles this remains an inline settings payload. Localhost/LAN lightweight profiles also stay on that inline-settings path by default, while explicit local gateway modes can still materialize managed TinyFish plugin files under `~/.claude-switch/generated/`. Other TinyFish-enhanced profiles likewise use managed plugin files written as standard Claude plugin directories containing `.claude-plugin/plugin.json` and `hooks/hooks.json`, while TinyFish-specific permissions remain inline in `--settings`. If a lightweight profile selects MCP servers, `cswitch` generates a separate profile-scoped plugin under `~/.claude-switch/generated/mcps/` containing `.mcp.json` plus a compatibility `mcp.json`, then passes it to Claude with `--plugin-dir`. Token and base URL can also come from a linked shared provider/key.
 
 `extras` may also include the reserved control entry `CLAUDE_SWITCH_TINYFISH=off` to keep a profile on the normal inline-settings path even when its `base_url` would otherwise trigger TinyFish plugin generation.
 

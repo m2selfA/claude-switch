@@ -20,7 +20,23 @@ impl ProfileManager {
         }
         let (remote_os, remote_home) = Self::probe_remote_os_and_home(host)?;
         let remote_bin_dir = match remote_os {
-            RemoteOs::Unix => format!("{}/.varusers/bin", remote_home.trim_end_matches('/')),
+            RemoteOs::Unix => {
+                let varusers_on_path = match Self::probe_remote_unix_varusers_on_path(host) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        progress(&format!(
+                            "[remote:{host}] warning: failed to probe remote PATH for ~/.varusers/bin ({}); falling back to ~/.local/bin",
+                            err
+                        ));
+                        false
+                    }
+                };
+                if varusers_on_path {
+                    format!("{}/.varusers/bin", remote_home.trim_end_matches('/'))
+                } else {
+                    format!("{}/.local/bin", remote_home.trim_end_matches('/'))
+                }
+            }
             RemoteOs::Windows => {
                 format!("{}\\.local\\bin", remote_home.trim_end_matches(['\\', '/']))
             }
@@ -30,6 +46,9 @@ impl ProfileManager {
             Self::join_remote_path(&remote_generated_root, remote_os, "prompts");
         let remote_plugins_dir =
             Self::join_remote_path(&remote_generated_root, remote_os, "plugins");
+        progress(&format!(
+            "[remote:{host}] note: remote auto shims require a compatible remote cswitch on PATH for runtime switching; otherwise they fall back to legacy launch."
+        ));
         if verbose {
             progress(&format!(
                 "[remote:{host}] detected {:?}, home: {}, shim dir: {}",
@@ -49,15 +68,15 @@ impl ProfileManager {
             RemoteOs::Windows => TinyfishToolShell::PowerShell,
         };
         let mut desired_shims: Vec<(String, String)> = Vec::new();
-        let mut desired_prompts: Vec<(String, String)> = Vec::new();
-        let mut desired_plugins: Vec<(String, String)> = Vec::new();
+        let mut desired_plugin_assets: Vec<(String, String)> = Vec::new();
+        let mut desired_plugin_scripts: Vec<(String, String)> = Vec::new();
         let mut desired_mcps: Vec<(String, String)> = Vec::new();
-        let mut desired_prompt_names = std::collections::HashSet::new();
         let mut desired_plugin_names = std::collections::HashSet::new();
         let mut desired_mcp_names = std::collections::HashSet::new();
         for profile in &profiles {
-            let alias_name = profile.alias.as_deref().unwrap_or(&profile.name);
-            let Some(file_name) = Self::remote_shim_file_name(profile, remote_os) else {
+            let remote_shim_names = self.remote_shim_file_names(profile, remote_os)?;
+            if remote_shim_names.is_empty() {
+                let alias_name = profile.alias.as_deref().unwrap_or(&profile.name);
                 skipped_full_profiles.push(alias_name.to_string());
                 if verbose {
                     progress(&format!(
@@ -66,46 +85,91 @@ impl ProfileManager {
                     ));
                 }
                 continue;
-            };
-            let content = match remote_os {
-                RemoteOs::Windows => self.generate_cmd_content(profile)?,
-                RemoteOs::Unix => self.generate_sh_content(profile)?,
-            };
-            desired_shims.push((file_name, content));
+            }
+            for (file_name, local_gateway_mode) in remote_shim_names {
+                let content = match remote_os {
+                    RemoteOs::Windows => self.generate_remote_cmd_content_for_local_gateway_mode(
+                        profile,
+                        local_gateway_mode,
+                    )?,
+                    RemoteOs::Unix => self.generate_remote_sh_content_for_local_gateway_mode(
+                        profile,
+                        local_gateway_mode,
+                    )?,
+                };
+                desired_shims.push((file_name, content));
+            }
 
             if profile.kind == ProfileKind::Lightweight
                 && let Some(env) = profile.env.as_ref()
             {
                 let (token, url) = self.resolve_credentials(profile)?;
-                let artifacts = build_lightweight_runtime_artifacts(
-                    env,
-                    token.as_deref(),
-                    url.as_deref(),
-                    remote_tool_shell,
-                )?;
-                let tinyfish_mode = artifacts.tinyfish_mode;
-                if let (Some(plugin_manifest_json), Some(plugin_hooks_json), Some(prompt_text)) = (
-                    artifacts.tinyfish_plugin_manifest_json,
-                    artifacts.tinyfish_plugin_hooks_json,
-                    artifacts.tinyfish_prompt_text,
-                ) {
-                    let prompt_name =
-                        Self::tinyfish_prompt_file_name(tinyfish_mode, remote_tool_shell)
-                            .expect("TinyFish prompt file name should exist for non-native mode");
-                    if desired_prompt_names.insert(prompt_name.clone()) {
-                        desired_prompts.push((prompt_name, prompt_text));
+                for local_gateway_mode in self.local_gateway_shim_modes(profile)? {
+                    if self.uses_simplified_local_default_shim(profile, local_gateway_mode)? {
+                        continue;
                     }
-                    let plugin_name = Self::tinyfish_plugin_dir_name(tinyfish_mode)
-                        .expect("TinyFish plugin dir name should exist for non-native mode");
-                    if desired_plugin_names.insert(plugin_name) {
-                        desired_plugins.push((
-                            Self::tinyfish_plugin_manifest_relative_path(tinyfish_mode, remote_os),
-                            plugin_manifest_json,
-                        ));
-                        desired_plugins.push((
-                            Self::tinyfish_plugin_hooks_relative_path(tinyfish_mode, remote_os),
-                            plugin_hooks_json,
-                        ));
+                    let artifacts = build_lightweight_runtime_artifacts_with_local_gateway_mode(
+                        env,
+                        token.as_deref(),
+                        url.as_deref(),
+                        remote_tool_shell,
+                        local_gateway_mode,
+                    )?;
+                    if let (
+                        Some(plugin_variant),
+                        Some(plugin_manifest_json),
+                        Some(plugin_hooks_json),
+                        Some(output_style_text),
+                        Some(hook_script_text),
+                        Some(statusline_script_text),
+                    ) = (
+                        artifacts.tinyfish_plugin_variant,
+                        artifacts.tinyfish_plugin_manifest_json,
+                        artifacts.tinyfish_plugin_hooks_json,
+                        artifacts.tinyfish_output_style_text,
+                        artifacts.tinyfish_hook_script_text,
+                        artifacts.tinyfish_statusline_script_text,
+                    ) {
+                        let plugin_name = Self::tinyfish_plugin_dir_name(plugin_variant);
+                        if desired_plugin_names.insert(plugin_name) {
+                            desired_plugin_assets.push((
+                                Self::tinyfish_plugin_manifest_relative_path(
+                                    plugin_variant,
+                                    remote_os,
+                                ),
+                                plugin_manifest_json,
+                            ));
+                            desired_plugin_assets.push((
+                                Self::tinyfish_plugin_hooks_relative_path(
+                                    plugin_variant,
+                                    remote_os,
+                                ),
+                                plugin_hooks_json,
+                            ));
+                            desired_plugin_assets.push((
+                                Self::tinyfish_output_style_relative_path(
+                                    plugin_variant,
+                                    remote_os,
+                                ),
+                                output_style_text,
+                            ));
+                            desired_plugin_scripts.push((
+                                Self::tinyfish_hook_script_relative_path(
+                                    plugin_variant,
+                                    remote_os,
+                                    remote_tool_shell,
+                                ),
+                                hook_script_text,
+                            ));
+                            desired_plugin_scripts.push((
+                                Self::tinyfish_statusline_script_relative_path(
+                                    plugin_variant,
+                                    remote_os,
+                                    remote_tool_shell,
+                                ),
+                                statusline_script_text,
+                            ));
+                        }
                     }
                 }
 
@@ -129,10 +193,9 @@ impl ProfileManager {
         }
         if verbose {
             progress(&format!(
-                "[remote:{host}] building {} remote shim(s), {} TinyFish prompt file(s), {} TinyFish plugin file(s), {} MCP plugin file(s); skipping {} full profile(s)...",
+                "[remote:{host}] building {} remote shim(s), {} TinyFish plugin file(s), {} MCP plugin file(s); skipping {} full profile(s)...",
                 desired_shims.len(),
-                desired_prompts.len(),
-                desired_plugins.len(),
+                desired_plugin_assets.len() + desired_plugin_scripts.len(),
                 desired_mcps.len(),
                 skipped_full_profiles.len()
             ));
@@ -198,10 +261,13 @@ impl ProfileManager {
         let mut removed = 0usize;
         let mut details = Vec::new();
 
-        if !desired_prompts.is_empty() || !managed_existing_prompts.is_empty() {
+        if !managed_existing_prompts.is_empty() {
             Self::ensure_remote_dir(host, &remote_prompts_dir)?;
         }
-        if !desired_plugins.is_empty() || !managed_existing_plugins.is_empty() {
+        if !desired_plugin_assets.is_empty()
+            || !desired_plugin_scripts.is_empty()
+            || !managed_existing_plugins.is_empty()
+        {
             Self::ensure_remote_dir(host, &remote_plugins_dir)?;
         }
         if !desired_mcps.is_empty() || !managed_existing_mcps.is_empty() {
@@ -217,34 +283,29 @@ impl ProfileManager {
         if !desired_shims.is_empty() {
             Self::upload_remote_files(host, &remote_bin_dir, remote_os, &desired_shims, true)?;
         }
-        if verbose && !desired_prompts.is_empty() {
-            progress(&format!(
-                "[remote:{host}] uploading {} shared TinyFish prompt file(s)...",
-                desired_prompts.len()
-            ));
-        }
-        if !desired_prompts.is_empty() {
-            Self::upload_remote_files(
-                host,
-                &remote_prompts_dir,
-                remote_os,
-                &desired_prompts,
-                false,
-            )?;
-        }
-        if verbose && !desired_plugins.is_empty() {
+        let desired_plugin_file_count = desired_plugin_assets.len() + desired_plugin_scripts.len();
+        if verbose && desired_plugin_file_count > 0 {
             progress(&format!(
                 "[remote:{host}] uploading {} shared TinyFish plugin file(s)...",
-                desired_plugins.len()
+                desired_plugin_file_count
             ));
         }
-        if !desired_plugins.is_empty() {
+        if !desired_plugin_assets.is_empty() {
             Self::upload_remote_files(
                 host,
                 &remote_plugins_dir,
                 remote_os,
-                &desired_plugins,
+                &desired_plugin_assets,
                 false,
+            )?;
+        }
+        if !desired_plugin_scripts.is_empty() {
+            Self::upload_remote_files(
+                host,
+                &remote_plugins_dir,
+                remote_os,
+                &desired_plugin_scripts,
+                true,
             )?;
         }
         if verbose && !desired_mcps.is_empty() {
@@ -272,22 +333,10 @@ impl ProfileManager {
             }
         }
 
-        for (file_name, _) in &desired_prompts {
-            let remote_path = Self::join_remote_path(&remote_prompts_dir, remote_os, file_name);
-            if managed_existing_prompts.contains(file_name) {
-                updated += 1;
-                if verbose {
-                    details.push(format!("  = {}:{}", host, remote_path));
-                }
-            } else {
-                added += 1;
-                if verbose {
-                    details.push(format!("  + {}:{}", host, remote_path));
-                }
-            }
-        }
-
-        for (file_name, _) in &desired_plugins {
+        for (file_name, _) in desired_plugin_assets
+            .iter()
+            .chain(desired_plugin_scripts.iter())
+        {
             let remote_path = Self::join_remote_path(&remote_plugins_dir, remote_os, file_name);
             let plugin_dir_name = file_name
                 .split(['/', '\\'])
@@ -334,10 +383,7 @@ impl ProfileManager {
             .filter(|name| !desired_shim_names.contains(name.as_str()))
             .cloned()
             .collect();
-        let stale_prompt_count = managed_existing_prompts
-            .iter()
-            .filter(|name| !desired_prompts.iter().any(|(desired, _)| desired == *name))
-            .count();
+        let stale_prompt_count = managed_existing_prompts.len();
         let stale_plugin_count = managed_existing_plugins
             .iter()
             .filter(|name| !desired_plugin_names.contains(*name))
@@ -376,14 +422,7 @@ impl ProfileManager {
             }
         }
 
-        let desired_prompt_names: std::collections::HashSet<&str> = desired_prompts
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        for stale in managed_existing_prompts
-            .iter()
-            .filter(|name| !desired_prompt_names.contains(name.as_str()))
-        {
+        for stale in &managed_existing_prompts {
             let remote_path = Self::join_remote_path(&remote_prompts_dir, remote_os, stale);
             if verbose {
                 progress(&format!(
