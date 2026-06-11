@@ -4090,6 +4090,286 @@ fn scoped_config_export_includes_only_selected_provider_keys() {
 }
 
 #[test]
+fn paseo_export_default_fragment_uses_wrapper_commands_and_slugged_provider_ids() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let first = mgr
+        .create_lightweight_profile("Alpha Beta", None, LightweightEnv::default())
+        .unwrap();
+    let second = mgr
+        .create_lightweight_profile("Alpha_Beta", Some("alpha-beta"), LightweightEnv::default())
+        .unwrap();
+
+    let exported = mgr
+        .export_paseo_config(
+            &[],
+            &PaseoExportOptions {
+                model_policy: PaseoModelPolicy::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&exported.content).unwrap();
+    let providers = json["agents"]["providers"].as_object().unwrap();
+
+    let first_provider = providers.get("csw-alpha-beta").unwrap();
+    assert_eq!(
+        first_provider["command"],
+        serde_json::json!(["cswitch", "use", "--no-extras", first.id, "--"])
+    );
+    assert_eq!(first_provider["extends"], "claude");
+    assert_eq!(first_provider["label"], "Alpha Beta");
+
+    let second_provider = providers.get("csw-alpha-beta-2").unwrap();
+    assert_eq!(
+        second_provider["command"],
+        serde_json::json!(["cswitch", "use", "--no-extras", second.id, "--"])
+    );
+    assert_eq!(second_provider["label"], "Alpha_Beta");
+}
+
+#[test]
+fn paseo_export_self_contained_lightweight_uses_settings_and_plugin_dirs() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let marketplace_dir = tmp.path().join("marketplace");
+    write_test_plugin_marketplace(&marketplace_dir);
+    mgr.add_plugin_marketplace(marketplace_dir.to_string_lossy().as_ref(), false)
+        .unwrap();
+    mgr.install_hosted_plugin("app@local-market", true).unwrap();
+
+    let server = mgr
+        .add_mcp_server(McpServerInput {
+            name: "filesystem".into(),
+            server_type: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("local-model[1m]".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    mgr.set_profile_plugins(&profile.id, &[String::from("app@local-market")])
+        .unwrap();
+    mgr.set_profile_mcps(&profile.id, std::slice::from_ref(&server.id))
+        .unwrap();
+
+    let exported = mgr
+        .export_paseo_config(
+            std::slice::from_ref(&profile.id),
+            &PaseoExportOptions {
+                secret_mode: PaseoSecretMode::SelfContained,
+                model_policy: PaseoModelPolicy::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&exported.content).unwrap();
+    let providers = json["agents"]["providers"].as_object().unwrap();
+    let provider = providers.get("csw-local").unwrap();
+    let command = provider["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    let hosted_plugin_root = mgr
+        .plugin_install_root("local-market", "app")
+        .display()
+        .to_string();
+    let mcp_plugin_root = mgr
+        .local_profile_mcp_plugin_root(&profile)
+        .display()
+        .to_string();
+
+    assert_eq!(command[0], "claude");
+    assert!(command.contains(&"--settings"));
+    assert!(command.contains(&"--plugin-dir"));
+    assert!(command.contains(&hosted_plugin_root.as_str()));
+    assert!(command.contains(&mcp_plugin_root.as_str()));
+
+    let settings_arg = command
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--settings").then_some(pair[1]))
+        .unwrap();
+    let settings_json: serde_json::Value = serde_json::from_str(settings_arg).unwrap();
+    assert_eq!(
+        settings_json["env"]["ANTHROPIC_BASE_URL"].as_str(),
+        Some("http://localhost:11434/v1")
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        settings_json["apiKeyHelper"].as_str(),
+        Some("powershell -NoProfile -Command \"echo 'sk-local'\"")
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        settings_json["apiKeyHelper"].as_str(),
+        Some("sh -lc \"echo \\\"sk-local\\\"\"")
+    );
+    assert_eq!(provider.get("env"), None);
+    assert!(exported.warnings.is_empty());
+}
+
+#[test]
+fn paseo_export_full_config_self_contains_full_profile() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let source_dir = tmp.path().join("source-profile");
+    make_claude_dir(&source_dir);
+    fs::write(
+        source_dir.join("settings.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.example.invalid",
+                "ANTHROPIC_MODEL": "claude-full"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let profile = mgr
+        .add_profile_from("work", Some("wrk"), &source_dir)
+        .unwrap();
+
+    let exported = mgr
+        .export_paseo_config(
+            std::slice::from_ref(&profile.id),
+            &PaseoExportOptions {
+                output_shape: PaseoOutputShape::FullConfig,
+                secret_mode: PaseoSecretMode::SelfContained,
+                model_policy: PaseoModelPolicy::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&exported.content).unwrap();
+    assert_eq!(
+        json["$schema"].as_str(),
+        Some("https://paseo.sh/schemas/paseo.config.v1.json")
+    );
+    assert_eq!(json["version"].as_i64(), Some(1));
+
+    let provider = json["agents"]["providers"]["csw-wrk"].as_object().unwrap();
+    let profile_dir = mgr.profile_dir(&profile).display().to_string();
+    assert_eq!(provider["command"], serde_json::json!(["claude"]));
+    assert_eq!(
+        provider["env"]["CLAUDE_CONFIG_DIR"].as_str(),
+        Some(profile_dir.as_str())
+    );
+}
+
+#[test]
+fn paseo_export_models_use_additional_models_for_claude_and_models_for_gateway() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+
+    let claude_like = mgr
+        .create_lightweight_profile(
+            "claude-like",
+            Some("claude-like"),
+            LightweightEnv {
+                auth_token: None,
+                base_url: Some("https://api.anthropic.com".into()),
+                model: Some("claude-sonnet-4[1m]".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let claude_export = mgr
+        .export_paseo_config(
+            std::slice::from_ref(&claude_like.id),
+            &PaseoExportOptions::default(),
+        )
+        .unwrap();
+    let claude_json: serde_json::Value = serde_json::from_str(&claude_export.content).unwrap();
+    let claude_provider = claude_json["agents"]["providers"]["csw-claude-like"]
+        .as_object()
+        .unwrap();
+    assert!(claude_provider.get("models").is_none());
+    assert_eq!(
+        claude_provider["additionalModels"][0]["id"].as_str(),
+        Some("claude-sonnet-4")
+    );
+
+    let (base_url, handle) = spawn_model_fetch_server(vec![(
+        "HTTP/1.1 200 OK",
+        "{\"data\":[{\"id\":\"deepseek-chat\"},{\"id\":\"deepseek-reasoner\"}]}",
+    )]);
+    let gateway = mgr
+        .create_lightweight_profile(
+            "gateway",
+            Some("gateway"),
+            LightweightEnv {
+                auth_token: Some("sk-gateway".into()),
+                base_url: Some(base_url.clone()),
+                model: Some("deepseek-chat[1m]".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let gateway_export = mgr
+        .export_paseo_config(
+            std::slice::from_ref(&gateway.id),
+            &PaseoExportOptions::default(),
+        )
+        .unwrap();
+    let gateway_json: serde_json::Value = serde_json::from_str(&gateway_export.content).unwrap();
+    let gateway_provider = gateway_json["agents"]["providers"]["csw-gateway"]
+        .as_object()
+        .unwrap();
+    assert!(gateway_provider.get("additionalModels").is_none());
+    let models = gateway_provider["models"].as_array().unwrap();
+    assert_eq!(models[0]["id"].as_str(), Some("deepseek-chat"));
+    assert_eq!(models[0]["isDefault"].as_bool(), Some(true));
+    assert_eq!(models[1]["id"].as_str(), Some("deepseek-reasoner"));
+    assert_eq!(handle.join().unwrap(), vec!["/v1/models".to_string()]);
+}
+
+#[test]
+fn paseo_export_strict_model_discovery_fails_on_warning() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let profile = mgr
+        .create_lightweight_profile(
+            "strict",
+            Some("strict"),
+            LightweightEnv {
+                auth_token: None,
+                base_url: Some("https://api.anthropic.com".into()),
+                model: Some("claude-opus-4[1m]".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let err = mgr
+        .export_paseo_config(
+            std::slice::from_ref(&profile.id),
+            &PaseoExportOptions {
+                strict_model_discovery: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("strict model discovery"), "{err}");
+}
+
+#[test]
 fn config_import_rejects_profiles_with_missing_provider_references() {
     let tmp = TempDir::new().unwrap();
     let mgr = make_manager(&tmp);

@@ -338,9 +338,12 @@ fn parses_diagnostics_and_shell_commands() {
         "export",
         "--profile",
         "work",
+        "--format",
+        "paseo",
         "--output",
         "bundle.json",
         "--include-secrets",
+        "--with-extras",
     ])
     .unwrap();
     match cli.command {
@@ -349,14 +352,58 @@ fn parses_diagnostics_and_shell_commands() {
                 ConfigCommands::Export {
                     profiles,
                     output,
+                    format,
+                    providers_only,
+                    full_config,
                     include_secrets,
+                    with_extras,
+                    strict_model_discovery,
                 },
         }) => {
             assert_eq!(profiles, vec!["work"]);
             assert_eq!(output, Some(PathBuf::from("bundle.json")));
+            assert_eq!(format, ConfigExportFormat::Paseo);
+            assert!(!providers_only);
+            assert!(!full_config);
             assert!(include_secrets);
+            assert!(with_extras);
+            assert!(!strict_model_discovery);
         }
         _ => panic!("unexpected config export parse result"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "cswitch",
+        "paseo",
+        "export",
+        "--profile",
+        "work",
+        "--providers-only",
+        "--strict-model-discovery",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Commands::Paseo {
+            command:
+                PaseoCommands::Export {
+                    profiles,
+                    output,
+                    providers_only,
+                    full_config,
+                    include_secrets,
+                    with_extras,
+                    strict_model_discovery,
+                },
+        }) => {
+            assert_eq!(profiles, vec!["work"]);
+            assert_eq!(output, None);
+            assert!(providers_only);
+            assert!(!full_config);
+            assert!(!include_secrets);
+            assert!(!with_extras);
+            assert!(strict_model_discovery);
+        }
+        _ => panic!("unexpected paseo export parse result"),
     }
 
     let cli =

@@ -13,7 +13,7 @@ Two isolation modes:
 ### Cargo (requires Rust)
 
 ```bash
-cargo install cswitch --version 0.8.1
+cargo install cswitch --version 0.8.2
 ```
 
 ### Pre-built binaries
@@ -102,10 +102,12 @@ cswitch
 | `cswitch config settings set --plugin-github-mirror-base-url <url> [--json]` | Set the preferred HTTPS mirror for GitHub-backed hosted plugin fetches |
 | `cswitch config settings set --clear-plugin-github-mirror-base-url [--json]` | Disable the hosted-plugin GitHub mirror override |
 | `cswitch config export [--profile <profile>]... [-o <file>] [--include-secrets]` | Export a portable config bundle; secrets are redacted unless explicitly included |
+| `cswitch config export --format paseo [--profile <profile>]... [-o <file>] [--providers-only\|--full-config] [--include-secrets] [--with-extras] [--strict-model-discovery]` | Export selected profiles as Paseo `agents.providers` JSON |
 | `cswitch config import <file> [--replace] [--dry-run] [--json]` | Import a portable config bundle, or preview the add/update plan without writing |
 | `cswitch config validate <file> [--json] [--strict]` | Validate a config bundle before importing it |
 | `cswitch config recover-shims <shim-dir> [--write] [--replace] [--json]` | Recover registry profiles/providers from generated `claude-*` shim files |
 | `cswitch config migrate-auth [--write] [--json] [--remote <host>]...` | Preview or migrate Claude token-based settings auth to `apiKeyHelper`, locally and optionally on remotes |
+| `cswitch paseo export [--profile <profile>]... [-o <file>] [--providers-only\|--full-config] [--include-secrets] [--with-extras] [--strict-model-discovery]` | Export selected profiles directly as Paseo `agents.providers` JSON |
 | `cswitch statusline [--profile <profile>] [--dir <path>] [--json]` | Print a compact current-profile summary for prompts/status bars |
 | `cswitch shell hook [--shell <auto\|powershell\|bash\|zsh\|fish>]` | Print a shell wrapper that auto-selects project profiles from marker files |
 | `cswitch shell current [--dir <path>]` | Resolve the project profile selected by `.cswitch-profile` or `.claudeprofile` |
@@ -311,6 +313,32 @@ Full profile directories are not copied by config bundles; they only contain the
 ```bash
 cswitch config recover-shims ./shims
 cswitch config recover-shims ./shims --write --replace
+```
+
+## Paseo export
+
+`cswitch paseo export` and `cswitch config export --format paseo` turn saved profiles into Paseo-compatible provider entries. By default they emit an `agents` fragment:
+
+```json
+{
+  "agents": {
+    "providers": {
+      "csw-work": {
+        "extends": "claude",
+        "label": "work",
+        "command": ["cswitch", "use", "--no-extras", "<profile-id>", "--"]
+      }
+    }
+  }
+}
+```
+
+Use `--providers-only` to emit just the providers map, or `--full-config` to wrap the export with Paseo `$schema` and `version`. Without `--include-secrets`, exported providers stay on the `cswitch use` wrapper path and do not write API keys into the Paseo JSON. With `--include-secrets`, `claude-switch` prefers a self-contained `claude ... --settings ... --plugin-dir ...` command when the profile can be flattened safely; otherwise it warns on stderr and falls back to the wrapper form. `--strict-model-discovery` turns model-discovery warnings into a hard failure.
+
+```bash
+cswitch paseo export --profile work -o paseo-providers.json
+cswitch config export --format paseo --providers-only --profile work
+cswitch paseo export --include-secrets --with-extras --full-config -o paseo.config.json
 ```
 
 ## MCP import/export

@@ -20,6 +20,7 @@ mod mcp_config;
 mod mcp_registry;
 mod mcp_secrets;
 mod mcp_validation;
+mod paseo;
 mod plugins;
 mod profiles;
 mod providers;
@@ -34,6 +35,7 @@ mod types;
 mod url_match;
 pub use self::api_test::*;
 pub(crate) use self::launch::LaunchOptions;
+pub use self::paseo::*;
 pub(crate) use self::tinyfish::tinyfish_available;
 use self::tinyfish::{
     LightweightRuntimeArtifacts, TinyfishToolShell, build_lightweight_runtime_artifacts,

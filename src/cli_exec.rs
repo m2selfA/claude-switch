@@ -7,6 +7,7 @@ use std::io::{self, Write};
 
 mod config;
 mod mcp;
+mod paseo;
 mod plugin;
 mod process;
 mod provider;
@@ -458,6 +459,8 @@ pub(crate) fn run() -> Result<()> {
         }
 
         Some(Commands::Config { command }) => config::handle_config_command(&manager, command)?,
+
+        Some(Commands::Paseo { command }) => paseo::handle_paseo_command(&manager, command)?,
 
         Some(Commands::Statusline { profile, dir, json }) => {
             let info = manager.statusline_info(profile.as_deref(), dir.as_deref())?;

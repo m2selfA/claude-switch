@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -112,6 +112,12 @@ pub(crate) enum Commands {
         command: ConfigCommands,
     },
 
+    /// Export claude-switch profiles as Paseo agent providers
+    Paseo {
+        #[command(subcommand)]
+        command: PaseoCommands,
+    },
+
     /// Print a compact current-profile summary for shell prompts and status bars
     Statusline {
         /// Profile name, alias, or id to summarize
@@ -191,9 +197,24 @@ pub(crate) enum ConfigCommands {
         /// Output JSON file; omitted prints to stdout
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Output format: bundle (default) or paseo
+        #[arg(long, value_enum, default_value_t = ConfigExportFormat::Bundle)]
+        format: ConfigExportFormat,
+        /// Output only the providers map instead of the default agents fragment
+        #[arg(long, conflicts_with = "full_config")]
+        providers_only: bool,
+        /// Output a full Paseo config stub with $schema and version
+        #[arg(long, conflicts_with = "providers_only")]
+        full_config: bool,
         /// Include API tokens and provider keys in the export
         #[arg(long)]
         include_secrets: bool,
+        /// Preserve the profile's stored launch args in exported Paseo commands
+        #[arg(long)]
+        with_extras: bool,
+        /// Fail when Paseo model discovery falls back or is omitted
+        #[arg(long)]
+        strict_model_discovery: bool,
     },
 
     /// Import a portable config bundle produced by `cswitch config export`
@@ -249,6 +270,40 @@ pub(crate) enum ConfigCommands {
         /// Also migrate ~/.claude/settings.json on remote hosts; repeatable
         #[arg(long)]
         remote: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ConfigExportFormat {
+    Bundle,
+    Paseo,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum PaseoCommands {
+    /// Export profiles as Paseo agent providers
+    Export {
+        /// Profile names, aliases, or ids to include; omitted means all profiles
+        #[arg(long = "profile")]
+        profiles: Vec<String>,
+        /// Output JSON file; omitted prints to stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Output only the providers map instead of the default agents fragment
+        #[arg(long, conflicts_with = "full_config")]
+        providers_only: bool,
+        /// Output a full Paseo config stub with $schema and version
+        #[arg(long, conflicts_with = "providers_only")]
+        full_config: bool,
+        /// Include secrets and prefer self-contained exported providers
+        #[arg(long)]
+        include_secrets: bool,
+        /// Preserve the profile's stored launch args in exported Paseo commands
+        #[arg(long)]
+        with_extras: bool,
+        /// Fail when model discovery falls back or is omitted
+        #[arg(long)]
+        strict_model_discovery: bool,
     },
 }
 

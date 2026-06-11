@@ -49,11 +49,37 @@ pub(super) fn handle_config_command(
         ConfigCommands::Export {
             profiles,
             output,
+            format,
+            providers_only,
+            full_config,
             include_secrets,
-        } => {
-            let content = manager.export_config_bundle(&profiles, include_secrets)?;
-            write_or_print(&content, output.as_ref(), "Config bundle exported")?;
-        }
+            with_extras,
+            strict_model_discovery,
+        } => match format {
+            ConfigExportFormat::Bundle => {
+                if providers_only || full_config || with_extras || strict_model_discovery {
+                    bail!(
+                        "--providers-only, --full-config, --with-extras, and --strict-model-discovery require --format paseo."
+                    );
+                }
+                let content = manager.export_config_bundle(&profiles, include_secrets)?;
+                write_or_print(&content, output.as_ref(), "Config bundle exported")?;
+            }
+            ConfigExportFormat::Paseo => {
+                super::paseo::export_paseo(
+                    manager,
+                    super::paseo::PaseoCliExportArgs {
+                        profiles: &profiles,
+                        output: output.as_ref(),
+                        providers_only,
+                        full_config,
+                        include_secrets,
+                        with_extras,
+                        strict_model_discovery,
+                    },
+                )?;
+            }
+        },
         ConfigCommands::Import {
             input,
             replace,
