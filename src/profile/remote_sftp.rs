@@ -610,4 +610,42 @@ impl ProfileManager {
         result?;
         Ok(())
     }
+
+    pub(super) fn remove_remote_tree(
+        host: &str,
+        remote_path: &str,
+        remote_os: RemoteOs,
+    ) -> Result<()> {
+        match Self::list_remote_files(host, remote_path, remote_os) {
+            Ok(children) => {
+                for child in children {
+                    let child_path = Self::join_remote_path(remote_path, remote_os, &child);
+                    Self::remove_remote_tree(host, &child_path, remote_os)?;
+                }
+                let sftp_path = if matches!(remote_os, RemoteOs::Windows) {
+                    remote_path.replace('\\', "/")
+                } else {
+                    remote_path.to_string()
+                };
+                match Self::run_remote_sftp_commands(
+                    host,
+                    &format!("rmdir {}\n", Self::sftp_quote(&sftp_path)),
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(error) if Self::is_benign_sftp_missing_error(&error) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) if Self::is_benign_sftp_missing_error(&error) => {
+                match Self::remove_remote_file(host, remote_path, remote_os) {
+                    Ok(_) => Ok(()),
+                    Err(remove_error) if Self::is_benign_sftp_missing_error(&remove_error) => {
+                        Ok(())
+                    }
+                    Err(remove_error) => Err(remove_error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
 }

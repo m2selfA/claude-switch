@@ -58,6 +58,7 @@ impl ProfileManager {
             resolved_url.as_deref(),
             local_gateway_mode,
         )?;
+        self.append_profile_hosted_plugin_args(cmd, profile)?;
         if artifacts.local_gateway_mode.requires_tinyfish() && !tinyfish_router_available {
             bail!(
                 "TinyFish is required for local gateway mode '{}' but the 'tinyfish' command is unavailable.",
@@ -160,6 +161,7 @@ impl ProfileManager {
             .context("Lightweight profile env missing during launch")?;
         let (resolved_token, resolved_url) = self.resolve_credentials(profile)?;
         let tool_shell = native_tinyfish_tool_shell();
+        self.append_profile_hosted_plugin_args(cmd, profile)?;
 
         let mcp_servers = self.profile_mcp_servers(profile)?;
         if !mcp_servers.is_empty() {
@@ -232,6 +234,7 @@ impl ProfileManager {
             resolved_url.as_deref(),
             LocalGatewayToolMode::Auto,
         )?;
+        self.append_profile_hosted_plugin_args(cmd, profile)?;
         let tinyfish_enabled = artifacts.tinyfish_enabled && tinyfish_router_available;
         let tinyfish_plugin_variant = if tinyfish_enabled {
             Some(
@@ -424,6 +427,7 @@ impl ProfileManager {
                     profile.name
                 );
             }
+            self.append_profile_hosted_plugin_args(&mut cmd, &profile)?;
             cmd.env("CLAUDE_CONFIG_DIR", &profile_dir);
         }
 

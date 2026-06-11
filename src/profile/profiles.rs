@@ -117,6 +117,96 @@ impl ProfileManager {
         Ok(())
     }
 
+    fn profile_name_in_use(registry: &Registry, name: &str) -> bool {
+        registry
+            .profiles
+            .values()
+            .any(|profile| profile.name == name)
+    }
+
+    fn profile_alias_in_use(registry: &Registry, alias: &str) -> bool {
+        registry
+            .profiles
+            .values()
+            .any(|profile| profile.alias.as_deref() == Some(alias))
+    }
+
+    fn derive_alias_from_name(name: &str) -> Option<String> {
+        let mut alias = String::new();
+        let mut last_was_sep = false;
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() {
+                alias.push(ch.to_ascii_lowercase());
+                last_was_sep = false;
+            } else if (ch == '-' || ch == '_' || ch.is_ascii_whitespace())
+                && !alias.is_empty()
+                && !last_was_sep
+            {
+                alias.push('-');
+                last_was_sep = true;
+            }
+        }
+        let alias = alias.trim_matches(['-', '_']).to_string();
+        (!alias.is_empty()).then_some(alias)
+    }
+
+    fn suggest_duplicate_name_in_registry(registry: &Registry, source_name: &str) -> String {
+        let base = format!("{source_name} (copy)");
+        if !Self::profile_name_in_use(registry, &base) {
+            return base;
+        }
+
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{source_name} (copy {suffix})");
+            if !Self::profile_name_in_use(registry, &candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn suggest_duplicate_alias_in_registry(
+        registry: &Registry,
+        source_alias: Option<&str>,
+        new_name: &str,
+    ) -> Option<String> {
+        let base = source_alias
+            .map(str::to_string)
+            .or_else(|| Self::derive_alias_from_name(new_name))?;
+        if !Self::profile_alias_in_use(registry, &base) {
+            return Some(base);
+        }
+
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{base}-{suffix}");
+            if !Self::profile_alias_in_use(registry, &candidate) {
+                return Some(candidate);
+            }
+            suffix += 1;
+        }
+    }
+
+    pub fn suggest_duplicate_name(&self, query: &str) -> Result<String> {
+        let registry = self.load_registry()?;
+        let (_, source) = Self::find_profile_in_registry(&registry, query)?;
+        Ok(Self::suggest_duplicate_name_in_registry(
+            &registry,
+            &source.name,
+        ))
+    }
+
+    pub fn suggest_duplicate_alias(&self, query: &str, new_name: &str) -> Result<Option<String>> {
+        let registry = self.load_registry()?;
+        let (_, source) = Self::find_profile_in_registry(&registry, query)?;
+        Ok(Self::suggest_duplicate_alias_in_registry(
+            &registry,
+            source.alias.as_deref(),
+            new_name,
+        ))
+    }
+
     // ── Public CRUD ──────────────────────────────────────────────────────────
 
     pub fn list_profiles(&self) -> Result<Vec<Profile>> {
@@ -244,6 +334,64 @@ impl ProfileManager {
         self.save_registry(&registry)
     }
 
+    pub(crate) fn duplicate_profile_with_alias_override(
+        &self,
+        query: &str,
+        new_name: &str,
+        new_alias: Option<&str>,
+        auto_suggest_alias: bool,
+    ) -> Result<Profile> {
+        let registry = self.load_registry()?;
+        let (_, source) = Self::find_profile_in_registry(&registry, query)?;
+        if new_name.trim().is_empty() {
+            bail!("Profile name cannot be empty.");
+        }
+
+        let alias = if auto_suggest_alias && new_alias.is_none() {
+            Self::suggest_duplicate_alias_in_registry(&registry, source.alias.as_deref(), new_name)
+        } else {
+            match new_alias {
+                Some(alias) => {
+                    Self::validate_alias(alias)?;
+                    Some(alias.to_string())
+                }
+                None => None,
+            }
+        };
+        Self::check_profile_unique_in_registry(&registry, "", new_name, alias.as_deref())?;
+
+        let mut duplicated = source.clone();
+        duplicated.id = Uuid::new_v4().to_string();
+        duplicated.name = new_name.to_string();
+        duplicated.alias = alias;
+        duplicated.added = Utc::now();
+        duplicated.last_used = None;
+
+        if duplicated.kind == ProfileKind::Full {
+            let src_dir = self.profile_dir(&source);
+            if !src_dir.exists() {
+                bail!(
+                    "Source profile directory '{}' does not exist.",
+                    src_dir.display()
+                );
+            }
+            let dest_dir = self.profile_dir(&duplicated);
+            copy_dir_all(&src_dir, &dest_dir)?;
+        }
+
+        self.upsert_profile(&duplicated)?;
+        Ok(duplicated)
+    }
+
+    pub fn duplicate_profile(
+        &self,
+        query: &str,
+        new_name: &str,
+        new_alias: Option<&str>,
+    ) -> Result<Profile> {
+        self.duplicate_profile_with_alias_override(query, new_name, new_alias, new_alias.is_none())
+    }
+
     /// Rename a profile (change name and/or alias). Checks uniqueness.
     pub fn rename_profile(
         &self,
@@ -315,6 +463,7 @@ impl ProfileManager {
             provider_id: None,
             key_id: None,
             mcp_server_ids: Vec::new(),
+            plugin_ids: Vec::new(),
         };
         let mut registry = self.load_registry()?;
         registry
@@ -353,6 +502,7 @@ impl ProfileManager {
             provider_id: existing.provider_id.clone(),
             key_id: existing.key_id.clone(),
             mcp_server_ids: existing.mcp_server_ids.clone(),
+            plugin_ids: existing.plugin_ids.clone(),
         };
 
         let mut registry = self.load_registry()?;
@@ -385,6 +535,7 @@ impl ProfileManager {
             provider_id: None,
             key_id: None,
             mcp_server_ids: Vec::new(),
+            plugin_ids: Vec::new(),
         })
     }
 

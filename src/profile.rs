@@ -20,6 +20,7 @@ mod mcp_config;
 mod mcp_registry;
 mod mcp_secrets;
 mod mcp_validation;
+mod plugins;
 mod profiles;
 mod providers;
 mod remote_alias_sync;

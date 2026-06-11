@@ -21,9 +21,10 @@ use std::{
 };
 
 use crate::profile::{
-    LightweightEnv, McpServer, ModelDiscoverySuccess, Profile, ProfileKind, ProfileManager,
-    Provider, ProviderKey, RuntimeSessionInfo, discover_models, discover_models_with_timeout,
-    fetch_models, test_anthropic_message, test_anthropic_message_with_timeout,
+    HostedPluginCatalogItem, InstalledPlugin, LightweightEnv, McpServer, ModelDiscoverySuccess,
+    Profile, ProfileKind, ProfileManager, Provider, ProviderKey, RuntimeSessionInfo,
+    discover_models, discover_models_with_timeout, fetch_models, test_anthropic_message,
+    test_anthropic_message_with_timeout,
 };
 pub(super) use crate::profile::{McpServerInput, McpServerUpdate};
 mod chrome;
@@ -35,6 +36,8 @@ mod lite_rendering;
 mod lite_utils;
 mod mcp_actions;
 mod mcp_rendering;
+mod plugin_actions;
+mod plugin_rendering;
 mod process_switch;
 mod process_switch_rendering;
 mod profile_actions;

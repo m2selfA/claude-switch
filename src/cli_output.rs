@@ -50,6 +50,10 @@ pub(crate) fn print_config_inspection(inspection: &ConfigInspection) {
         inspection.generated_root.display()
     );
     println!(
+        "Plugins root:             {}",
+        inspection.plugins_root.display()
+    );
+    println!(
         "Runtime root:             {}",
         inspection.runtime_root.display()
     );
@@ -62,6 +66,15 @@ pub(crate) fn print_config_inspection(inspection: &ConfigInspection) {
     println!("Provider keys:            {}", inspection.provider_keys);
     println!("MCP servers:              {}", inspection.mcp_servers);
     println!("Linked MCP refs:          {}", inspection.linked_mcp_refs);
+    println!(
+        "Plugin marketplaces:      {}",
+        inspection.plugin_marketplaces
+    );
+    println!("Installed plugins:        {}", inspection.installed_plugins);
+    println!(
+        "Linked plugin refs:       {}",
+        inspection.linked_plugin_refs
+    );
     println!(
         "Generated MCP plugins:    {}",
         inspection.generated_mcp_plugins
@@ -94,6 +107,13 @@ pub(crate) fn print_global_settings(settings: &GlobalSettings) {
         settings.allow_local_runtime_hot_switch
     );
     println!(
+        "Plugin GitHub mirror:    {}",
+        settings
+            .plugin_github_mirror_base_url
+            .as_deref()
+            .unwrap_or("disabled")
+    );
+    println!(
         "Note: local/self-hosted lite profiles always bypass runtime sessions and use an inline apiKeyHelper."
     );
 }
@@ -111,6 +131,18 @@ pub(crate) fn print_config_import_summary(summary: &ConfigImportSummary, input: 
     println!(
         "MCP servers:              {} added, {} updated, {} conflicted",
         summary.mcp_servers_added, summary.mcp_servers_updated, summary.mcp_servers_conflicted
+    );
+    println!(
+        "Plugin marketplaces:      {} added, {} updated, {} conflicted",
+        summary.plugin_marketplaces_added,
+        summary.plugin_marketplaces_updated,
+        summary.plugin_marketplaces_conflicted
+    );
+    println!(
+        "Installed plugins:        {} added, {} updated, {} conflicted",
+        summary.installed_plugins_added,
+        summary.installed_plugins_updated,
+        summary.installed_plugins_conflicted
     );
 }
 
@@ -136,6 +168,18 @@ pub(crate) fn print_config_import_plan(plan: &ConfigImportPlan, input: &Path) {
         plan.summary.mcp_servers_updated,
         plan.summary.mcp_servers_conflicted
     );
+    println!(
+        "Plugin marketplaces:      {} add, {} update, {} conflict",
+        plan.summary.plugin_marketplaces_added,
+        plan.summary.plugin_marketplaces_updated,
+        plan.summary.plugin_marketplaces_conflicted
+    );
+    println!(
+        "Installed plugins:        {} add, {} update, {} conflict",
+        plan.summary.installed_plugins_added,
+        plan.summary.installed_plugins_updated,
+        plan.summary.installed_plugins_conflicted
+    );
     print_plan_items("Profiles to add", &plan.profiles_add);
     print_plan_items("Profiles to update", &plan.profiles_update);
     print_plan_items("Profiles with conflicts", &plan.profiles_conflict);
@@ -145,6 +189,24 @@ pub(crate) fn print_config_import_plan(plan: &ConfigImportPlan, input: &Path) {
     print_plan_items("MCP servers to add", &plan.mcp_servers_add);
     print_plan_items("MCP servers to update", &plan.mcp_servers_update);
     print_plan_items("MCP servers with conflicts", &plan.mcp_servers_conflict);
+    print_plan_items("Plugin marketplaces to add", &plan.plugin_marketplaces_add);
+    print_plan_items(
+        "Plugin marketplaces to update",
+        &plan.plugin_marketplaces_update,
+    );
+    print_plan_items(
+        "Plugin marketplaces with conflicts",
+        &plan.plugin_marketplaces_conflict,
+    );
+    print_plan_items("Installed plugins to add", &plan.installed_plugins_add);
+    print_plan_items(
+        "Installed plugins to update",
+        &plan.installed_plugins_update,
+    );
+    print_plan_items(
+        "Installed plugins with conflicts",
+        &plan.installed_plugins_conflict,
+    );
 }
 
 pub(crate) fn print_plan_items(label: &str, items: &[String]) {
@@ -161,8 +223,12 @@ pub(crate) fn print_config_bundle_validation(validation: &ConfigBundleValidation
     println!("Config bundle:            {}", input.display());
     println!("Schema:                   {}", validation.schema);
     println!(
-        "Objects:                  {} profile(s), {} provider(s), {} MCP server(s)",
-        validation.profiles, validation.providers, validation.mcp_servers
+        "Objects:                  {} profile(s), {} provider(s), {} MCP server(s), {} marketplace(s), {} installed plugin(s)",
+        validation.profiles,
+        validation.providers,
+        validation.mcp_servers,
+        validation.plugin_marketplaces,
+        validation.installed_plugins
     );
     println!("Secrets included:         {}", validation.secrets_included);
     println!(

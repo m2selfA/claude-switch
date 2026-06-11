@@ -7,6 +7,7 @@ use std::io::{self, Write};
 
 mod config;
 mod mcp;
+mod plugin;
 mod process;
 mod provider;
 
@@ -255,6 +256,31 @@ pub(crate) fn run() -> Result<()> {
             sync_shims(&manager);
         }
 
+        Some(Commands::Duplicate {
+            source,
+            new_name,
+            alias,
+        }) => {
+            let source_profile = manager.get_profile(&source)?;
+            match manager.duplicate_profile(&source, &new_name, alias.as_deref()) {
+                Ok(duplicated) => {
+                    println!(
+                        "Profile '{}' duplicated as '{}'.",
+                        source_profile.name, duplicated.name
+                    );
+                    if let Some(alias) = duplicated.alias.as_deref() {
+                        println!("  Alias: {}", alias);
+                    }
+                    println!("  Launch with: cswitch use {}", duplicated.name);
+                    sync_shims(&manager);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
             Ok(_) => {
                 println!("Profile '{}' removed.", name);
@@ -460,6 +486,8 @@ pub(crate) fn run() -> Result<()> {
         }
 
         Some(Commands::Mcp { command }) => mcp::handle_mcp_command(&manager, command)?,
+
+        Some(Commands::Plugin { command }) => plugin::handle_plugin_command(&manager, command)?,
 
         Some(Commands::Process { command }) => process::handle_process_command(&manager, command)?,
 

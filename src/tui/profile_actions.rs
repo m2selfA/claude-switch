@@ -6,6 +6,19 @@ use crate::profile::{
 };
 
 impl App {
+    fn start_selected_profile_duplicate(&mut self) -> Result<()> {
+        let Some(profile) = self.selected_profile().cloned() else {
+            return Ok(());
+        };
+        self.lite_name = self.manager.suggest_duplicate_name(&profile.id)?;
+        self.input_buffer = self.lite_name.clone();
+        self.cursor_pos = self.input_buffer.len();
+        self.mode = Mode::DuplicateProfileName {
+            profile_id: profile.id,
+        };
+        Ok(())
+    }
+
     fn open_local_gateway_launch_picker(
         &mut self,
         profile: &Profile,
@@ -161,6 +174,10 @@ impl App {
                 self.start_selected_profile_mcp_picker()?;
             }
 
+            KeyCode::Char('P') => {
+                self.start_selected_profile_plugin_picker()?;
+            }
+
             KeyCode::Char('g') => {
                 if let Some(p) = self.selected_profile().cloned() {
                     self.open_local_gateway_launch_picker(&p, true)?;
@@ -170,6 +187,13 @@ impl App {
             KeyCode::Char('a') => {
                 self.mode = Mode::AddFullName;
                 self.input_buffer.clear();
+            }
+
+            KeyCode::Char('c') if self.selected_profile().is_some() => {
+                match self.start_selected_profile_duplicate() {
+                    Ok(()) => {}
+                    Err(e) => self.mode = Mode::Message(e.to_string(), true),
+                }
             }
 
             KeyCode::Char('d') | KeyCode::Delete if self.selected_profile().is_some() => {
@@ -305,6 +329,113 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    pub(super) fn handle_duplicate_profile_name(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        let profile_id = match &self.mode {
+            Mode::DuplicateProfileName { profile_id } => profile_id.clone(),
+            _ => return Ok(()),
+        };
+        let return_mode = self.mode.clone();
+
+        match code {
+            KeyCode::Enter => {
+                let name = self.input_buffer.trim().to_string();
+                if name.is_empty() {
+                    self.show_message(
+                        "Profile name cannot be empty.".into(),
+                        true,
+                        Some(return_mode),
+                    );
+                    return Ok(());
+                }
+                self.lite_name = name.clone();
+                match self.manager.suggest_duplicate_alias(&profile_id, &name) {
+                    Ok(alias) => {
+                        self.input_buffer = alias.unwrap_or_default();
+                        self.cursor_pos = self.input_buffer.len();
+                        self.mode = Mode::DuplicateProfileAlias { profile_id };
+                    }
+                    Err(e) => self.show_message(e.to_string(), true, Some(return_mode)),
+                }
+            }
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
+            _ => {
+                emacs_edit(
+                    code,
+                    modifiers,
+                    &mut self.input_buffer,
+                    &mut self.cursor_pos,
+                    true,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn handle_duplicate_profile_alias(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        let profile_id = match &self.mode {
+            Mode::DuplicateProfileAlias { profile_id } => profile_id.clone(),
+            _ => return Ok(()),
+        };
+        let return_mode = self.mode.clone();
+
+        match code {
+            KeyCode::Enter => {
+                let alias = self.input_buffer.trim().to_string();
+                let alias_opt = if alias.is_empty() {
+                    None
+                } else {
+                    Some(alias.as_str())
+                };
+                match self.manager.duplicate_profile_with_alias_override(
+                    &profile_id,
+                    &self.lite_name,
+                    alias_opt,
+                    false,
+                ) {
+                    Ok(profile) => {
+                        self.sync_shims();
+                        self.refresh()?;
+                        self.select_by_id(&profile.id);
+                        self.mode =
+                            Mode::Message(format!("Profile '{}' duplicated.", profile.name), false);
+                    }
+                    Err(e) => self.show_message(e.to_string(), true, Some(return_mode)),
+                }
+            }
+            _ if Self::is_cancel_key(code, modifiers) => self.mode = Mode::Normal,
+            _ => {
+                if let KeyCode::Char(c) = code {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        emacs_edit(
+                            code,
+                            modifiers,
+                            &mut self.input_buffer,
+                            &mut self.cursor_pos,
+                            true,
+                        );
+                    }
+                } else {
+                    emacs_edit(
+                        code,
+                        modifiers,
+                        &mut self.input_buffer,
+                        &mut self.cursor_pos,
+                        false,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn handle_search_key(

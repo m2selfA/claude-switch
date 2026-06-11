@@ -29,6 +29,10 @@ impl ProfileManager {
             .iter()
             .map(|profile| profile.mcp_server_ids.len())
             .sum();
+        let linked_plugin_refs = profiles
+            .iter()
+            .map(|profile| profile.plugin_ids.len())
+            .sum();
 
         #[cfg(target_os = "windows")]
         let cmd_shims_dir = Self::cmd_bin_dir().ok();
@@ -55,6 +59,7 @@ impl ProfileManager {
             registry_path: self.registry_path.clone(),
             profiles_dir: self.profiles_dir.clone(),
             generated_root: self.generated_root_dir(),
+            plugins_root: self.plugins_root_dir(),
             runtime_root,
             profiles: profiles.len(),
             lightweight_profiles,
@@ -63,6 +68,9 @@ impl ProfileManager {
             provider_keys,
             mcp_servers: registry.mcp_servers.len(),
             linked_mcp_refs,
+            plugin_marketplaces: registry.plugin_marketplaces.len(),
+            installed_plugins: registry.installed_plugins.len(),
+            linked_plugin_refs,
             generated_mcp_plugins: Self::count_named_entries(
                 &self.generated_mcps_dir(),
                 Self::is_managed_generated_mcp_dir_name,
@@ -252,6 +260,36 @@ impl ProfileManager {
                     ));
                 }
             }
+            for plugin_id in &profile.plugin_ids {
+                match registry.installed_plugins.get(plugin_id) {
+                    Some(installed) => {
+                        let plugin_root = self.plugin_install_root(
+                            &installed.marketplace_name,
+                            &installed.plugin_name,
+                        );
+                        if !plugin_root.exists() {
+                            report.items.push(Self::diagnostic(
+                                DiagnosticLevel::Warn,
+                                "plugins",
+                                format!(
+                                    "profile '{}' hosted plugin '{}' is missing on disk",
+                                    profile.name, installed.id
+                                ),
+                                Some("reinstall or update the hosted plugin".to_string()),
+                            ));
+                        }
+                    }
+                    None => report.items.push(Self::diagnostic(
+                        DiagnosticLevel::Error,
+                        "plugins",
+                        format!(
+                            "profile '{}' references missing hosted plugin '{}'",
+                            profile.name, plugin_id
+                        ),
+                        Some("unlink the stale plugin or reinstall it".to_string()),
+                    )),
+                }
+            }
             if profile.kind == ProfileKind::Lightweight && !profile.mcp_server_ids.is_empty() {
                 let plugin_root = self.local_profile_mcp_plugin_root(profile);
                 if !plugin_root.join(".mcp.json").exists() || !plugin_root.join("mcp.json").exists()
@@ -413,6 +451,8 @@ impl ProfileManager {
                 key_id: None,
                 mcp_servers: 0,
                 mcp_names: Vec::new(),
+                plugins: 0,
+                plugin_names: Vec::new(),
                 project_marker: false,
             });
         };
@@ -438,6 +478,13 @@ impl ProfileManager {
             .map(|server| server.name.clone())
             .collect::<Vec<_>>();
         mcp_names.sort();
+        let mut plugin_names = profile
+            .plugin_ids
+            .iter()
+            .filter_map(|id| registry.installed_plugins.get(id))
+            .map(|plugin| plugin.id.clone())
+            .collect::<Vec<_>>();
+        plugin_names.sort();
 
         Ok(StatuslineInfo {
             profile_id: Some(profile.id.clone()),
@@ -450,6 +497,8 @@ impl ProfileManager {
             key_id: profile.key_id.clone(),
             mcp_servers: mcp_names.len(),
             mcp_names,
+            plugins: plugin_names.len(),
+            plugin_names,
             project_marker,
         })
     }

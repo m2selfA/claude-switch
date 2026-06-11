@@ -29,6 +29,32 @@ fn parses_nested_provider_commands() {
 }
 
 #[test]
+fn parses_duplicate_command() {
+    let cli = Cli::try_parse_from([
+        "cswitch",
+        "duplicate",
+        "work",
+        "work copy",
+        "--alias",
+        "work-copy",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Some(Commands::Duplicate {
+            source,
+            new_name,
+            alias,
+        }) => {
+            assert_eq!(source, "work");
+            assert_eq!(new_name, "work copy");
+            assert_eq!(alias.as_deref(), Some("work-copy"));
+        }
+        _ => panic!("unexpected duplicate parse result"),
+    }
+}
+
+#[test]
 fn parses_config_settings_commands() {
     let cli = Cli::try_parse_from(["cswitch", "config", "settings", "show", "--json"]).unwrap();
     match cli.command {
@@ -58,6 +84,7 @@ fn parses_config_settings_commands() {
                         ConfigSettingsCommands::Set {
                             allow_local_runtime_hot_switch,
                             json,
+                            ..
                         },
                 },
         }) => {

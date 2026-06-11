@@ -837,6 +837,7 @@ fn public_site_model_from_profile_prefers_haiku_and_strips_1m_suffix() {
         provider_id: None,
         key_id: None,
         mcp_server_ids: Vec::new(),
+        plugin_ids: Vec::new(),
     };
 
     let (source, model) = public_site_model_from_profile(&profile);
@@ -862,6 +863,7 @@ fn public_site_model_from_profile_falls_back_to_explicit_model_when_haiku_missin
         provider_id: None,
         key_id: None,
         mcp_server_ids: Vec::new(),
+        plugin_ids: Vec::new(),
     };
 
     let (source, model) = public_site_model_from_profile(&profile);
@@ -918,6 +920,7 @@ fn public_site_provider_test_model_from_profile_reads_each_lite_slot() {
         provider_id: None,
         key_id: None,
         mcp_server_ids: Vec::new(),
+        plugin_ids: Vec::new(),
     };
 
     assert_eq!(
@@ -2123,6 +2126,13 @@ fn shift_tab_switches_manager_in_allowed_modes() {
         app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
             .unwrap()
     );
+    assert_eq!(app.page, Page::Plugin);
+    assert_eq!(app.mode, Mode::Normal);
+
+    assert!(
+        app.handle_manager_switch_key(KeyCode::BackTab, KeyModifiers::empty())
+            .unwrap()
+    );
     assert_eq!(app.page, Page::Settings);
     assert_eq!(app.mode, Mode::Normal);
 
@@ -3273,6 +3283,124 @@ fn provider_key_in_use_y_unlinks_profiles_and_removes_key() {
         assert_eq!(profile.key_id, None);
     }
     assert!(app.provider_key_linked_profiles.is_empty());
+}
+
+#[test]
+fn profile_duplicate_shortcut_prefills_name_and_alias() {
+    let mut app = make_test_app();
+    let profile = app
+        .manager
+        .create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    app.refresh().unwrap();
+    app.select_by_id(&profile.id);
+
+    app.handle_profile_page_key(KeyCode::Char('c'), KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.input_buffer, "work (copy)");
+    assert_eq!(app.cursor_pos, app.input_buffer.len());
+    assert_eq!(
+        app.mode,
+        Mode::DuplicateProfileName {
+            profile_id: profile.id.clone(),
+        }
+    );
+
+    app.handle_duplicate_profile_name(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.input_buffer, "work-2");
+    assert_eq!(app.cursor_pos, app.input_buffer.len());
+    assert_eq!(
+        app.mode,
+        Mode::DuplicateProfileAlias {
+            profile_id: profile.id,
+        }
+    );
+}
+
+#[test]
+fn profile_duplicate_flow_refreshes_and_selects_new_profile() {
+    let mut app = make_test_app();
+    let provider = app
+        .manager
+        .add_provider_with_key_name(
+            "Relay",
+            "https://relay.example.invalid",
+            "Default",
+            "sk-relay",
+        )
+        .unwrap();
+    let key_id = provider.keys.keys().next().unwrap().clone();
+    let profile = app
+        .manager
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                model: Some("claude-sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    app.manager
+        .set_provider(&profile.id, &provider.id, &key_id)
+        .unwrap();
+    app.manager
+        .set_launch_args(
+            &profile.id,
+            Some(vec!["--dangerously-skip-permissions".into()]),
+        )
+        .unwrap();
+    app.refresh().unwrap();
+    app.select_by_id(&profile.id);
+
+    app.handle_profile_page_key(KeyCode::Char('c'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_duplicate_profile_name(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+    app.handle_duplicate_profile_alias(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    let duplicated = app.manager.get_profile("work (copy)").unwrap();
+    assert_eq!(duplicated.alias.as_deref(), Some("work-2"));
+    assert_eq!(
+        duplicated.provider_id.as_deref(),
+        Some(provider.id.as_str())
+    );
+    assert_eq!(
+        duplicated.launch_args,
+        Some(vec!["--dangerously-skip-permissions".into()])
+    );
+    assert_eq!(
+        app.selected_profile().map(|profile| profile.id.as_str()),
+        Some(duplicated.id.as_str())
+    );
+    assert!(matches!(app.mode, Mode::Message(_, false)));
+}
+
+#[test]
+fn profile_duplicate_alias_popup_can_clear_alias() {
+    let mut app = make_test_app();
+    let profile = app
+        .manager
+        .create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    app.refresh().unwrap();
+    app.select_by_id(&profile.id);
+
+    app.handle_profile_page_key(KeyCode::Char('c'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_duplicate_profile_name(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+    app.input_buffer.clear();
+    app.cursor_pos = 0;
+    app.handle_duplicate_profile_alias(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    let duplicated = app.manager.get_profile("work (copy)").unwrap();
+    assert_eq!(duplicated.alias, None);
 }
 
 #[test]

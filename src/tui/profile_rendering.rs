@@ -418,6 +418,80 @@ impl App {
         );
     }
 
+    pub(super) fn render_duplicate_name_popup(&self, f: &mut Frame) {
+        let area = centered_rect(56, 7, f.area());
+        f.render_widget(Clear, area);
+
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Duplicate Profile — Name ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        f.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Name: ", Style::default().fg(DIM)),
+                    Span::styled(
+                        display_with_cursor(&self.input_buffer, self.cursor_pos),
+                        Style::default().fg(TEXT).bold(),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Any characters allowed. Enter to continue, Esc/Ctrl+G to cancel.",
+                    Style::default().fg(DIM),
+                )),
+            ]))
+            .block(block),
+            area,
+        );
+    }
+
+    pub(super) fn render_duplicate_alias_popup(&self, f: &mut Frame) {
+        let area = centered_rect(56, 8, f.area());
+        f.render_widget(Clear, area);
+
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Duplicate Profile — Alias ",
+                Style::default().fg(ACCENT).bold(),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+
+        f.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Alias: ", Style::default().fg(DIM)),
+                    Span::styled(
+                        if self.input_buffer.is_empty() {
+                            "█".to_string()
+                        } else {
+                            display_with_cursor(&self.input_buffer, self.cursor_pos)
+                        },
+                        Style::default().fg(TEXT).bold(),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Short CLI-friendly name (a-z, 0-9, -, _). Clear it to save without an alias.",
+                    Style::default().fg(DIM),
+                )),
+            ]))
+            .block(block),
+            area,
+        );
+    }
+
     pub(super) fn render_edit_profile_popup(&self, f: &mut Frame, step: usize) {
         let area = centered_rect(70, 12, f.area());
         f.render_widget(Clear, area);

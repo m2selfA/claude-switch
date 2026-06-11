@@ -28,9 +28,16 @@ pub(super) fn handle_config_command(
             }
             ConfigSettingsCommands::Set {
                 allow_local_runtime_hot_switch,
+                plugin_github_mirror_base_url,
+                clear_plugin_github_mirror_base_url,
                 json,
             } => {
                 manager.set_allow_local_runtime_hot_switch(allow_local_runtime_hot_switch)?;
+                if clear_plugin_github_mirror_base_url {
+                    manager.set_plugin_github_mirror_base_url(None)?;
+                } else if let Some(value) = plugin_github_mirror_base_url {
+                    manager.set_plugin_github_mirror_base_url(Some(value))?;
+                }
                 let settings = manager.global_settings()?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&settings)?);

@@ -1,6 +1,33 @@
 use super::*;
 
 impl ProfileManager {
+    fn hosted_plugin_root_name_from_relative_path(relative_path: &str) -> Option<String> {
+        let mut parts = relative_path
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty());
+        let first = parts.next()?;
+        let second = parts.next()?;
+        Some(format!("{first}/{second}"))
+    }
+
+    fn list_remote_hosted_plugin_roots(
+        host: &str,
+        remote_installed_plugins_dir: &str,
+        remote_os: RemoteOs,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut roots = std::collections::HashSet::new();
+        for marketplace in
+            Self::list_remote_files_if_present(host, remote_installed_plugins_dir, remote_os)?
+        {
+            let marketplace_dir =
+                Self::join_remote_path(remote_installed_plugins_dir, remote_os, &marketplace);
+            for plugin in Self::list_remote_files_if_present(host, &marketplace_dir, remote_os)? {
+                roots.insert(format!("{marketplace}/{plugin}"));
+            }
+        }
+        Ok(roots)
+    }
+
     pub fn sync_remote_aliases_with_progress<F>(
         &self,
         host: &str,
@@ -46,6 +73,8 @@ impl ProfileManager {
             Self::join_remote_path(&remote_generated_root, remote_os, "prompts");
         let remote_plugins_dir =
             Self::join_remote_path(&remote_generated_root, remote_os, "plugins");
+        let remote_installed_plugins_dir =
+            Self::remote_plugin_installed_root_dir(&remote_home, remote_os);
         progress(&format!(
             "[remote:{host}] note: remote auto shims require a compatible remote cswitch on PATH for runtime switching; otherwise they fall back to legacy launch."
         ));
@@ -71,8 +100,11 @@ impl ProfileManager {
         let mut desired_plugin_assets: Vec<(String, String)> = Vec::new();
         let mut desired_plugin_scripts: Vec<(String, String)> = Vec::new();
         let mut desired_mcps: Vec<(String, String)> = Vec::new();
+        let mut desired_hosted_plugin_assets: Vec<(String, String)> = Vec::new();
+        let mut desired_hosted_plugin_scripts: Vec<(String, String)> = Vec::new();
         let mut desired_plugin_names = std::collections::HashSet::new();
         let mut desired_mcp_names = std::collections::HashSet::new();
+        let mut desired_hosted_plugin_roots = std::collections::HashSet::new();
         for profile in &profiles {
             let remote_shim_names = self.remote_shim_file_names(profile, remote_os)?;
             if remote_shim_names.is_empty() {
@@ -190,13 +222,20 @@ impl ProfileManager {
                     }
                 }
             }
+
+            let (hosted_assets, hosted_scripts, hosted_roots) =
+                self.installed_plugin_remote_file_sets(profile, remote_os)?;
+            desired_hosted_plugin_assets.extend(hosted_assets);
+            desired_hosted_plugin_scripts.extend(hosted_scripts);
+            desired_hosted_plugin_roots.extend(hosted_roots);
         }
         if verbose {
             progress(&format!(
-                "[remote:{host}] building {} remote shim(s), {} TinyFish plugin file(s), {} MCP plugin file(s); skipping {} full profile(s)...",
+                "[remote:{host}] building {} remote shim(s), {} TinyFish plugin file(s), {} MCP plugin file(s), {} hosted plugin file(s); skipping {} full profile(s)...",
                 desired_shims.len(),
                 desired_plugin_assets.len() + desired_plugin_scripts.len(),
                 desired_mcps.len(),
+                desired_hosted_plugin_assets.len() + desired_hosted_plugin_scripts.len(),
                 skipped_full_profiles.len()
             ));
         }
@@ -240,6 +279,8 @@ impl ProfileManager {
             .filter(|name| Self::is_managed_generated_mcp_dir_name(name))
             .collect();
         let ignored_mcps_count = existing_mcps_total.saturating_sub(managed_existing_mcps.len());
+        let managed_existing_hosted_plugins =
+            Self::list_remote_hosted_plugin_roots(host, &remote_installed_plugins_dir, remote_os)?;
         let ignored_count = ignored_shims_count
             + ignored_prompts_count
             + ignored_plugins_count
@@ -247,11 +288,12 @@ impl ProfileManager {
 
         if verbose {
             progress(&format!(
-                "[remote:{host}] found {} managed shim(s), {} managed prompt file(s), {} managed TinyFish plugin dir(s), {} managed MCP plugin dir(s); ignoring {} unrelated file(s)",
+                "[remote:{host}] found {} managed shim(s), {} managed prompt file(s), {} managed TinyFish plugin dir(s), {} managed MCP plugin dir(s), {} hosted plugin dir(s); ignoring {} unrelated file(s)",
                 existing_shims_managed_count,
                 managed_existing_prompts.len(),
                 managed_existing_plugins.len(),
                 managed_existing_mcps.len(),
+                managed_existing_hosted_plugins.len(),
                 ignored_count
             ));
         }
@@ -272,6 +314,12 @@ impl ProfileManager {
         }
         if !desired_mcps.is_empty() || !managed_existing_mcps.is_empty() {
             Self::ensure_remote_dir(host, &remote_mcps_dir)?;
+        }
+        if !desired_hosted_plugin_assets.is_empty()
+            || !desired_hosted_plugin_scripts.is_empty()
+            || !managed_existing_hosted_plugins.is_empty()
+        {
+            Self::ensure_remote_dir(host, &remote_installed_plugins_dir)?;
         }
 
         if verbose && !desired_shims.is_empty() {
@@ -316,6 +364,32 @@ impl ProfileManager {
         }
         if !desired_mcps.is_empty() {
             Self::upload_remote_files(host, &remote_mcps_dir, remote_os, &desired_mcps, false)?;
+        }
+        let desired_hosted_plugin_file_count =
+            desired_hosted_plugin_assets.len() + desired_hosted_plugin_scripts.len();
+        if verbose && desired_hosted_plugin_file_count > 0 {
+            progress(&format!(
+                "[remote:{host}] uploading {} hosted plugin file(s)...",
+                desired_hosted_plugin_file_count
+            ));
+        }
+        if !desired_hosted_plugin_assets.is_empty() {
+            Self::upload_remote_files(
+                host,
+                &remote_installed_plugins_dir,
+                remote_os,
+                &desired_hosted_plugin_assets,
+                false,
+            )?;
+        }
+        if !desired_hosted_plugin_scripts.is_empty() {
+            Self::upload_remote_files(
+                host,
+                &remote_installed_plugins_dir,
+                remote_os,
+                &desired_hosted_plugin_scripts,
+                true,
+            )?;
         }
 
         for (file_name, _) in &desired_shims {
@@ -374,6 +448,27 @@ impl ProfileManager {
             }
         }
 
+        for (file_name, _) in desired_hosted_plugin_assets
+            .iter()
+            .chain(desired_hosted_plugin_scripts.iter())
+        {
+            let remote_path =
+                Self::join_remote_path(&remote_installed_plugins_dir, remote_os, file_name);
+            let root_name =
+                Self::hosted_plugin_root_name_from_relative_path(file_name).unwrap_or_default();
+            if managed_existing_hosted_plugins.contains(&root_name) {
+                updated += 1;
+                if verbose {
+                    details.push(format!("  = {}:{}", host, remote_path));
+                }
+            } else {
+                added += 1;
+                if verbose {
+                    details.push(format!("  + {}:{}", host, remote_path));
+                }
+            }
+        }
+
         let desired_shim_names: std::collections::HashSet<&str> = desired_shims
             .iter()
             .map(|(name, _)| name.as_str())
@@ -392,13 +487,18 @@ impl ProfileManager {
             .iter()
             .filter(|name| !desired_mcp_names.contains(*name))
             .count();
+        let stale_hosted_plugin_count = managed_existing_hosted_plugins
+            .iter()
+            .filter(|name| !desired_hosted_plugin_roots.contains(*name))
+            .count();
         if verbose {
             progress(&format!(
-                "[remote:{host}] checking {} stale shim(s), {} stale prompt file(s), {} stale TinyFish plugin dir(s), {} stale MCP plugin dir(s)...",
+                "[remote:{host}] checking {} stale shim(s), {} stale prompt file(s), {} stale TinyFish plugin dir(s), {} stale MCP plugin dir(s), {} stale hosted plugin dir(s)...",
                 stale_shims.len(),
                 stale_prompt_count,
                 stale_plugin_count,
-                stale_mcp_count
+                stale_mcp_count,
+                stale_hosted_plugin_count
             ));
         }
         for stale in stale_shims {
@@ -464,6 +564,32 @@ impl ProfileManager {
                 details.push(format!("  - {}:{} (stale)", host, remote_path));
             }
             Self::remove_remote_mcp_plugin_dir(host, &remote_path, remote_os)?;
+            removed += 1;
+        }
+
+        for stale in managed_existing_hosted_plugins
+            .iter()
+            .filter(|name| !desired_hosted_plugin_roots.contains(*name))
+        {
+            let remote_path = Self::join_remote_path(
+                &remote_installed_plugins_dir,
+                remote_os,
+                &stale.replace(
+                    '/',
+                    &match remote_os {
+                        RemoteOs::Unix => "/".to_string(),
+                        RemoteOs::Windows => "\\".to_string(),
+                    },
+                ),
+            );
+            if verbose {
+                progress(&format!(
+                    "[remote:{host}] removing stale hosted plugin dir: {}",
+                    remote_path
+                ));
+                details.push(format!("  - {}:{} (stale)", host, remote_path));
+            }
+            Self::remove_remote_tree(host, &remote_path, remote_os)?;
             removed += 1;
         }
 

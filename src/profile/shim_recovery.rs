@@ -688,6 +688,9 @@ impl ProfileManager {
             mcp_server_ids: existing
                 .map(|profile| profile.mcp_server_ids.clone())
                 .unwrap_or_default(),
+            plugin_ids: existing
+                .map(|profile| profile.plugin_ids.clone())
+                .unwrap_or_default(),
         }
     }
 }

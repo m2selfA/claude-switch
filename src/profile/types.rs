@@ -144,6 +144,81 @@ pub(crate) struct McpSmartPasteImportResult {
     pub skipped_existing: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginMarketplaceSourceKind {
+    GitHub,
+    Git,
+    Local,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginMarketplace {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub source_kind: PluginMarketplaceSourceKind,
+    pub locator: String,
+    #[serde(default)]
+    pub canonical_url: Option<String>,
+    #[serde(default)]
+    pub added_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledPlugin {
+    pub id: String,
+    pub plugin_name: String,
+    pub marketplace_name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub source_sha: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub explicit: bool,
+    #[serde(default)]
+    pub default_enabled: Option<bool>,
+    pub installed_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostedPluginCatalogItem {
+    pub id: String,
+    pub marketplace_name: String,
+    pub plugin_name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    #[serde(default)]
+    pub default_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledPluginDetails {
+    pub installed: InstalledPlugin,
+    pub linked_profiles: Vec<String>,
+    pub install_root: PathBuf,
+    pub exists: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticLevel {
@@ -197,6 +272,7 @@ pub struct ConfigInspection {
     pub registry_path: PathBuf,
     pub profiles_dir: PathBuf,
     pub generated_root: PathBuf,
+    pub plugins_root: PathBuf,
     pub runtime_root: PathBuf,
     pub profiles: usize,
     pub lightweight_profiles: usize,
@@ -205,6 +281,9 @@ pub struct ConfigInspection {
     pub provider_keys: usize,
     pub mcp_servers: usize,
     pub linked_mcp_refs: usize,
+    pub plugin_marketplaces: usize,
+    pub installed_plugins: usize,
+    pub linked_plugin_refs: usize,
     pub generated_mcp_plugins: usize,
     pub generated_tinyfish_plugins: usize,
     pub generated_prompts: usize,
@@ -216,10 +295,25 @@ pub struct ConfigInspection {
     pub shell_shims_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalSettings {
     #[serde(default)]
     pub allow_local_runtime_hot_switch: bool,
+    #[serde(default = "default_plugin_github_mirror_base_url")]
+    pub plugin_github_mirror_base_url: Option<String>,
+}
+
+pub fn default_plugin_github_mirror_base_url() -> Option<String> {
+    Some("https://wget.la".to_string())
+}
+
+impl Default for GlobalSettings {
+    fn default() -> Self {
+        Self {
+            allow_local_runtime_hot_switch: false,
+            plugin_github_mirror_base_url: default_plugin_github_mirror_base_url(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,6 +337,8 @@ pub struct StatuslineInfo {
     pub key_id: Option<String>,
     pub mcp_servers: usize,
     pub mcp_names: Vec<String>,
+    pub plugins: usize,
+    pub plugin_names: Vec<String>,
     pub project_marker: bool,
 }
 
@@ -253,6 +349,10 @@ pub struct ConfigBundle {
     pub profiles: Vec<Profile>,
     pub providers: Vec<Provider>,
     pub mcp_servers: Vec<McpServer>,
+    #[serde(default)]
+    pub plugin_marketplaces: Vec<PluginMarketplace>,
+    #[serde(default)]
+    pub installed_plugins: Vec<InstalledPlugin>,
     #[serde(default)]
     pub settings: Option<GlobalSettings>,
     pub secrets_included: bool,
@@ -269,6 +369,12 @@ pub struct ConfigImportSummary {
     pub mcp_servers_added: usize,
     pub mcp_servers_updated: usize,
     pub mcp_servers_conflicted: usize,
+    pub plugin_marketplaces_added: usize,
+    pub plugin_marketplaces_updated: usize,
+    pub plugin_marketplaces_conflicted: usize,
+    pub installed_plugins_added: usize,
+    pub installed_plugins_updated: usize,
+    pub installed_plugins_conflicted: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,6 +389,12 @@ pub struct ConfigImportPlan {
     pub mcp_servers_add: Vec<String>,
     pub mcp_servers_update: Vec<String>,
     pub mcp_servers_conflict: Vec<String>,
+    pub plugin_marketplaces_add: Vec<String>,
+    pub plugin_marketplaces_update: Vec<String>,
+    pub plugin_marketplaces_conflict: Vec<String>,
+    pub installed_plugins_add: Vec<String>,
+    pub installed_plugins_update: Vec<String>,
+    pub installed_plugins_conflict: Vec<String>,
     pub secrets_included: bool,
 }
 
@@ -291,6 +403,8 @@ impl ConfigImportPlan {
         self.summary.profiles_conflicted
             + self.summary.providers_conflicted
             + self.summary.mcp_servers_conflicted
+            + self.summary.plugin_marketplaces_conflicted
+            + self.summary.installed_plugins_conflicted
     }
 }
 
@@ -300,6 +414,8 @@ pub struct ConfigBundleValidation {
     pub profiles: usize,
     pub providers: usize,
     pub mcp_servers: usize,
+    pub plugin_marketplaces: usize,
+    pub installed_plugins: usize,
     pub secrets_included: bool,
     pub issues: Vec<DiagnosticItem>,
 }
@@ -441,6 +557,9 @@ pub struct Profile {
     /// Selected MCP servers for lightweight profiles. Stored as MCP server IDs.
     #[serde(default)]
     pub mcp_server_ids: Vec<String>,
+    /// Linked hosted plugins for this profile. Stored as installed plugin ids.
+    #[serde(default)]
+    pub plugin_ids: Vec<String>,
 }
 
 impl Profile {
@@ -455,6 +574,12 @@ pub struct Registry {
     /// Keyed by MCP server `id`.
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServer>,
+    /// Keyed by marketplace `name`.
+    #[serde(default)]
+    pub plugin_marketplaces: HashMap<String, PluginMarketplace>,
+    /// Keyed by installed plugin id (`plugin@marketplace`).
+    #[serde(default)]
+    pub installed_plugins: HashMap<String, InstalledPlugin>,
     /// Keyed by provider `id`.
     #[serde(default)]
     pub providers: HashMap<String, Provider>,

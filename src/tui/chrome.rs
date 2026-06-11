@@ -94,6 +94,7 @@ impl App {
                         Page::Profile => "  profile manager",
                         Page::Provider => "  provider manager",
                         Page::Mcp => "  mcp manager",
+                        Page::Plugin => "  plugin manager",
                         Page::Settings => "  settings",
                     },
                     Style::default().fg(DIM),
@@ -107,12 +108,14 @@ impl App {
             Page::Profile => (self.filtered_indices.len(), self.profiles.len()),
             Page::Provider => (self.providers_cache.len(), self.providers_cache.len()),
             Page::Mcp => (self.mcps_cache.len(), self.mcps_cache.len()),
+            Page::Plugin => (self.plugins_cache.len(), self.plugins_cache.len()),
             Page::Settings => (1, 1),
         };
         let item_name = match self.page {
             Page::Profile => "profile",
             Page::Provider => "provider",
             Page::Mcp => "mcp",
+            Page::Plugin => "plugin",
             Page::Settings => "setting",
         };
         let label = if count == total {
@@ -140,7 +143,7 @@ impl App {
     }
 
     pub(super) fn render_help(&self, f: &mut Frame) {
-        let area = centered_rect(65, 25, f.area());
+        let area = centered_rect(68, 27, f.area());
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -162,6 +165,8 @@ impl App {
             ("t", "Add lightweight profile from provider/key"),
             ("T", "Batch test non-official provider keys"),
             ("M", "Select MCP servers for a lightweight profile"),
+            ("P", "Select hosted plugins for a profile"),
+            ("c", "Duplicate selected profile"),
             ("Ctrl+Y", "Smart input provider from clipboard"),
             ("MCP: Ctrl+Y", "Import MCP JSON from clipboard"),
             (

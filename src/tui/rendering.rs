@@ -39,6 +39,10 @@ impl App {
                 self.render_mcp_list_page(f, cols[0]);
                 self.render_mcp_detail_page(f, cols[1]);
             }
+            Page::Plugin => {
+                self.render_plugin_list_page(f, cols[0]);
+                self.render_plugin_detail_page(f, cols[1]);
+            }
             Page::Settings => {
                 self.render_settings_summary(f, cols[0]);
                 self.render_settings_detail(f, cols[1]);
@@ -51,6 +55,8 @@ impl App {
             Mode::ConfirmDelete => self.render_confirm_delete_popup(f),
             Mode::AddFullName => self.render_add_name_popup(f),
             Mode::AddFullAlias => self.render_add_alias_popup(f),
+            Mode::DuplicateProfileName { .. } => self.render_duplicate_name_popup(f),
+            Mode::DuplicateProfileAlias { .. } => self.render_duplicate_alias_popup(f),
             Mode::EditProfile { step, .. } => self.render_edit_profile_popup(f, *step),
             Mode::LiteProviderSelect => lite::render_lite_provider_select_popup(self, f),
             Mode::LiteKeySelect { .. } => lite::render_lite_key_select_popup(self, f),
@@ -85,6 +91,8 @@ impl App {
                 self.render_mcp_editor_popup(f, *step)
             }
             Mode::McpProfilePicker { .. } => self.render_mcp_profile_picker_popup(f),
+            Mode::PluginInstallPicker => self.render_plugin_install_picker_popup(f),
+            Mode::PluginProfilePicker { .. } => self.render_plugin_profile_picker_popup(f),
             Mode::McpSmartPaste => self.render_mcp_smart_paste_popup(f),
             Mode::ConfirmDeleteMcp { .. } => self.render_confirm_delete_mcp_popup(f),
             Mode::PublicSitePrompt => self.render_public_site_prompt_popup(f),
@@ -167,6 +175,7 @@ impl App {
                     ("t", "lite"),
                     ("T", "public test"),
                     ("M", "mcps"),
+                    ("c", "duplicate"),
                     ("a", "add"),
                     ("e", "edit"),
                     ("m", "[1m]"),
@@ -195,6 +204,16 @@ impl App {
                     ("d", "delete"),
                     ("Ctrl+Y", "import"),
                     ("enter", "link count"),
+                    ("?", "help"),
+                    ("Shift+Tab", "plugins"),
+                    ("q", "quit"),
+                ],
+                Page::Plugin => vec![
+                    ("Ctrl+P/N", "nav"),
+                    ("a", "install"),
+                    ("u", "update"),
+                    ("d", "remove"),
+                    ("enter", "links"),
                     ("?", "help"),
                     ("Shift+Tab", "settings"),
                     ("q", "quit"),

@@ -21,6 +21,12 @@ impl ProfileManager {
         self.save_registry(&registry)
     }
 
+    pub(crate) fn set_plugin_github_mirror_base_url(&self, value: Option<String>) -> Result<()> {
+        let mut registry = self.load_registry()?;
+        registry.settings.plugin_github_mirror_base_url = value;
+        self.save_registry(&registry)
+    }
+
     pub fn new() -> Result<Self> {
         let home = Self::home_dir()?;
         Self::new_in_home_dir(&home)

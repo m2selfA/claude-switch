@@ -43,6 +43,17 @@ pub(crate) enum Commands {
         full: bool,
     },
 
+    /// Duplicate an existing profile with a new name and optional alias
+    Duplicate {
+        /// Source profile name, alias, or id
+        source: String,
+        /// New profile name
+        new_name: String,
+        /// Short CLI-friendly alias (alphanumeric, hyphens, underscores)
+        #[arg(short, long)]
+        alias: Option<String>,
+    },
+
     /// Remove a saved profile
     Remove {
         /// Profile name to remove
@@ -130,6 +141,12 @@ pub(crate) enum Commands {
     Mcp {
         #[command(subcommand)]
         command: McpCommands,
+    },
+
+    /// Manage hosted plugin marketplaces, installs, and profile links
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommands,
     },
 
     /// Inspect and switch running lightweight Claude sessions
@@ -249,6 +266,12 @@ pub(crate) enum ConfigSettingsCommands {
         /// Allow runtime hot-switch for localhost/LAN self-hosted APIs
         #[arg(long)]
         allow_local_runtime_hot_switch: bool,
+        /// Preferred GitHub HTTPS accelerator for hosted plugin git fetches
+        #[arg(long = "plugin-github-mirror-base-url")]
+        plugin_github_mirror_base_url: Option<String>,
+        /// Disable the hosted-plugin GitHub accelerator and use direct GitHub URLs
+        #[arg(long = "clear-plugin-github-mirror-base-url")]
+        clear_plugin_github_mirror_base_url: bool,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -544,6 +567,95 @@ pub(crate) enum McpCommands {
         #[arg(long)]
         strict: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum PluginCommands {
+    /// Manage hosted plugin marketplaces
+    Marketplace {
+        #[command(subcommand)]
+        command: PluginMarketplaceCommands,
+    },
+
+    /// List installed hosted plugins
+    List,
+
+    /// Show one installed hosted plugin
+    Show {
+        /// Installed plugin id or name
+        query: String,
+    },
+
+    /// Install one hosted plugin from configured marketplaces
+    Install {
+        /// Plugin name or plugin@marketplace; omitted allows interactive selection in a TTY
+        query: Option<String>,
+        /// Restrict selection to one marketplace
+        #[arg(long = "marketplace")]
+        marketplace: Option<String>,
+        /// Replace an existing install in place
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Update one installed plugin or every installed plugin
+    Update {
+        /// Installed plugin id or name; omitted updates every installed plugin
+        query: Option<String>,
+    },
+
+    /// Remove one installed hosted plugin
+    Uninstall {
+        /// Installed plugin id or name
+        query: String,
+        /// Also prune orphaned dependency installs afterward
+        #[arg(long)]
+        prune: bool,
+    },
+
+    /// Remove orphaned dependency-only installs
+    Prune,
+
+    /// Link installed hosted plugins to a profile
+    Link {
+        /// Profile name, alias, or id
+        profile: String,
+        /// Installed plugin ids or names
+        plugins: Vec<String>,
+        /// Replace the profile plugin selection instead of appending
+        #[arg(long)]
+        replace: bool,
+    },
+
+    /// Unlink installed hosted plugins from a profile
+    Unlink {
+        /// Profile name, alias, or id
+        profile: String,
+        /// Installed plugin ids or names
+        plugins: Vec<String>,
+        /// Remove all linked hosted plugins
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum PluginMarketplaceCommands {
+    /// List configured marketplaces
+    List,
+
+    /// Add a marketplace from owner/repo, git URL, or local path
+    Add {
+        locator: String,
+        #[arg(long)]
+        replace: bool,
+    },
+
+    /// Refresh a configured marketplace cache
+    Update { query: String },
+
+    /// Remove a configured marketplace
+    Remove { query: String },
 }
 
 #[derive(Subcommand)]

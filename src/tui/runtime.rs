@@ -81,6 +81,10 @@ impl App {
                 Page::Mcp
             }
             Page::Mcp => {
+                self.refresh_plugin_state();
+                Page::Plugin
+            }
+            Page::Plugin => {
                 self.settings_allow_local_runtime_hot_switch = self
                     .manager
                     .allow_local_runtime_hot_switch()
@@ -216,6 +220,12 @@ impl App {
                         Mode::AddFullAlias => {
                             self.handle_add_full_alias(key.code, key.modifiers)?;
                         }
+                        Mode::DuplicateProfileName { .. } => {
+                            self.handle_duplicate_profile_name(key.code, key.modifiers)?;
+                        }
+                        Mode::DuplicateProfileAlias { .. } => {
+                            self.handle_duplicate_profile_alias(key.code, key.modifiers)?;
+                        }
                         Mode::LiteProviderSelect => {
                             lite::handle_lite_provider_select(self, key.code, key.modifiers)?;
                         }
@@ -296,6 +306,12 @@ impl App {
                         Mode::McpProfilePicker { .. } => {
                             self.handle_mcp_profile_picker(key.code, key.modifiers)?;
                         }
+                        Mode::PluginInstallPicker => {
+                            self.handle_plugin_install_picker(key.code, key.modifiers)?;
+                        }
+                        Mode::PluginProfilePicker { .. } => {
+                            self.handle_plugin_profile_picker(key.code, key.modifiers)?;
+                        }
                         Mode::McpSmartPaste => {
                             self.handle_mcp_smart_paste(key.code, key.modifiers)?;
                         }
@@ -334,6 +350,17 @@ impl App {
                 insert_str_at_cursor(&mut self.input_buffer, &mut self.cursor_pos, text);
             }
             Mode::AddFullAlias => {
+                insert_filtered_str_at_cursor(
+                    &mut self.input_buffer,
+                    &mut self.cursor_pos,
+                    text,
+                    is_alias_char,
+                );
+            }
+            Mode::DuplicateProfileName { .. } => {
+                insert_str_at_cursor(&mut self.input_buffer, &mut self.cursor_pos, text);
+            }
+            Mode::DuplicateProfileAlias { .. } => {
                 insert_filtered_str_at_cursor(
                     &mut self.input_buffer,
                     &mut self.cursor_pos,
@@ -380,6 +407,9 @@ impl App {
             }
             Mode::McpProfilePicker { .. } => {
                 insert_str_at_cursor(&mut self.mcp_filter_buf, &mut self.cursor_pos, text);
+            }
+            Mode::PluginInstallPicker | Mode::PluginProfilePicker { .. } => {
+                insert_str_at_cursor(&mut self.plugin_filter_buf, &mut self.cursor_pos, text);
             }
             Mode::McpSmartPaste => {
                 insert_str_at_cursor(&mut self.mcp_oauth_buf, &mut self.cursor_pos, text);
@@ -461,6 +491,7 @@ impl App {
             Page::Profile => self.handle_profile_page_key(code, modifiers),
             Page::Provider => self.handle_provider_page_normal_key(code, modifiers),
             Page::Mcp => self.handle_mcp_page_normal_key(code, modifiers),
+            Page::Plugin => self.handle_plugin_page_normal_key(code, modifiers),
             Page::Settings => self.handle_settings_page_normal_key(code, modifiers),
         }
     }

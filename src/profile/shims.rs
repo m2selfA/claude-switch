@@ -73,10 +73,16 @@ impl ProfileManager {
             }
             let dir = self.profile_dir(p);
             let alias_name = p.alias.as_deref().unwrap_or(&p.name);
+            let hosted_plugin_args = self
+                .profile_plugin_dirs(p)?
+                .into_iter()
+                .map(|root| format!(" --plugin-dir '{}'", root.display()))
+                .collect::<String>();
             lines.push(format!(
-                "alias claude-{}=\"CLAUDE_CONFIG_DIR='{}' claude\"",
+                "alias claude-{}=\"CLAUDE_CONFIG_DIR='{}' claude{}\"",
                 alias_name,
                 dir.display(),
+                hosted_plugin_args,
             ));
         }
         Ok(lines.join("\n"))
@@ -99,10 +105,16 @@ impl ProfileManager {
             }
             let dir = self.profile_dir(p);
             let alias_name = p.alias.as_deref().unwrap_or(&p.name);
+            let hosted_plugin_args = self
+                .profile_plugin_dirs(p)?
+                .into_iter()
+                .map(|root| format!(" --plugin-dir '{}'", root.display()))
+                .collect::<String>();
             lines.push(format!(
-                "function claude-{} {{ $env:CLAUDE_CONFIG_DIR='{}'; claude @args }}",
+                "function claude-{} {{ $env:CLAUDE_CONFIG_DIR='{}'; claude{} @args }}",
                 alias_name,
                 dir.display(),
+                hosted_plugin_args,
             ));
         }
         Ok(lines.join("\n"))

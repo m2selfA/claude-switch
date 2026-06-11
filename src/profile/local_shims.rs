@@ -204,6 +204,23 @@ impl ProfileManager {
         );
         lines.push(":build_settings".into());
 
+        let hosted_plugin_roots =
+            self.profile_plugin_home_relative_roots(profile, RemoteOs::Windows)?;
+        if !hosted_plugin_roots.is_empty() {
+            let hosted_plugin_args = hosted_plugin_roots
+                .iter()
+                .map(|root| format!(" --plugin-dir \"{root}\""))
+                .collect::<String>();
+            lines.push(format!("set \"_HOSTED_PLUGIN_ARGS={hosted_plugin_args}\""));
+        } else {
+            lines.push("set \"_HOSTED_PLUGIN_ARGS=\"".into());
+        }
+        let hosted_plugin_part = if hosted_plugin_roots.is_empty() {
+            ""
+        } else {
+            "%_HOSTED_PLUGIN_ARGS%"
+        };
+
         let mcp_servers = self.profile_mcp_servers(profile)?;
         let mcp_plugin_enabled = !mcp_servers.is_empty();
         if mcp_plugin_enabled {
@@ -283,19 +300,19 @@ impl ProfileManager {
         if has_launch {
             if tf_enabled {
                 lines.push(":launch_with_hooks_extras".into());
-                lines.push(format!("claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\"{mcp_plugin_part} %_LAUNCH_ARGS% %_R%"));
+                lines.push(format!("claude{hosted_plugin_part} --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\"{mcp_plugin_part} %_LAUNCH_ARGS% %_R%"));
                 lines.push("exit /b %errorlevel%".into());
             }
             lines.push(":launch_with_extras".into());
             lines.push(format!(
-                "{settings_prefix}{mcp_plugin_part} %_LAUNCH_ARGS% %_R%"
+                "{settings_prefix}{hosted_plugin_part}{mcp_plugin_part} %_LAUNCH_ARGS% %_R%"
             ));
             lines.push("exit /b %errorlevel%".into());
         }
 
         if tf_enabled {
             lines.push(":launch_with_hooks_plain".into());
-            lines.push(format!("claude --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\"{mcp_plugin_part} %_R%"));
+            lines.push(format!("claude{hosted_plugin_part} --settings \"%_TF_SETTINGS%\" --plugin-dir \"%_TF_PLUGIN_DIR%\"{mcp_plugin_part} %_R%"));
             lines.push("exit /b %errorlevel%".into());
         }
 
@@ -306,7 +323,9 @@ impl ProfileManager {
         }
 
         lines.push(":launch_plain".into());
-        lines.push(format!("{settings_prefix}{mcp_plugin_part} %_R%"));
+        lines.push(format!(
+            "{settings_prefix}{hosted_plugin_part}{mcp_plugin_part} %_R%"
+        ));
         lines.push("exit /b %errorlevel%".into());
 
         Ok(lines.join("\r\n") + "\r\n")
@@ -366,6 +385,23 @@ impl ProfileManager {
         lines.push("goto loop".into());
         lines.push(":build_settings".into());
 
+        let hosted_plugin_roots =
+            self.profile_plugin_home_relative_roots(profile, RemoteOs::Windows)?;
+        if !hosted_plugin_roots.is_empty() {
+            let hosted_plugin_args = hosted_plugin_roots
+                .iter()
+                .map(|root| format!(" --plugin-dir \"{root}\""))
+                .collect::<String>();
+            lines.push(format!("set \"_HOSTED_PLUGIN_ARGS={hosted_plugin_args}\""));
+        } else {
+            lines.push("set \"_HOSTED_PLUGIN_ARGS=\"".into());
+        }
+        let hosted_plugin_part = if hosted_plugin_roots.is_empty() {
+            ""
+        } else {
+            "%_HOSTED_PLUGIN_ARGS%"
+        };
+
         let mcp_servers = self.profile_mcp_servers(profile)?;
         let mcp_plugin_enabled = !mcp_servers.is_empty();
         if mcp_plugin_enabled {
@@ -400,13 +436,15 @@ impl ProfileManager {
         if has_launch {
             lines.push(":launch_with_extras".into());
             lines.push(format!(
-                "{settings_prefix}{mcp_plugin_part} %_LAUNCH_ARGS% %_R%"
+                "{settings_prefix}{hosted_plugin_part}{mcp_plugin_part} %_LAUNCH_ARGS% %_R%"
             ));
             lines.push("exit /b %errorlevel%".into());
         }
 
         lines.push(":launch_plain".into());
-        lines.push(format!("{settings_prefix}{mcp_plugin_part} %_R%"));
+        lines.push(format!(
+            "{settings_prefix}{hosted_plugin_part}{mcp_plugin_part} %_R%"
+        ));
         lines.push("exit /b %errorlevel%".into());
 
         Ok(lines.join("\r\n") + "\r\n")
@@ -688,6 +726,19 @@ impl ProfileManager {
             lines.push("TF_PLUGIN_ARGS=()".into());
         }
 
+        let hosted_plugin_roots =
+            self.profile_plugin_home_relative_roots(profile, RemoteOs::Unix)?;
+        if !hosted_plugin_roots.is_empty() {
+            let mut hosted_plugin_line = "HOSTED_PLUGIN_ARGS=(".to_string();
+            for root in &hosted_plugin_roots {
+                hosted_plugin_line.push_str(&format!("--plugin-dir \"{root}\" "));
+            }
+            hosted_plugin_line.push(')');
+            lines.push(hosted_plugin_line);
+        } else {
+            lines.push("HOSTED_PLUGIN_ARGS=()".into());
+        }
+
         let mcp_servers = self.profile_mcp_servers(profile)?;
         if !mcp_servers.is_empty() {
             lines.push(format!(
@@ -762,12 +813,12 @@ impl ProfileManager {
 
         if has_launch {
             lines.push(format!(
-                "if $EXTRA; then exec claude{0}{1} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; else exec claude{0} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; fi",
+                "if $EXTRA; then exec claude{0}{1} \"${{HOSTED_PLUGIN_ARGS[@]}}\" \"${{TF_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; else exec claude{0} \"${{HOSTED_PLUGIN_ARGS[@]}}\" \"${{TF_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; fi",
                 settings_part, launch_part
             ));
         } else {
             lines.push(format!(
-                "exec claude{0} \"${{TF_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"",
+                "exec claude{0} \"${{HOSTED_PLUGIN_ARGS[@]}}\" \"${{TF_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"",
                 settings_part
             ));
         }
@@ -825,6 +876,19 @@ impl ProfileManager {
             lines.push("SETTINGS_ARG=(--settings \"$BASE_SETTINGS\")".into());
         }
 
+        let hosted_plugin_roots =
+            self.profile_plugin_home_relative_roots(profile, RemoteOs::Unix)?;
+        if !hosted_plugin_roots.is_empty() {
+            let mut hosted_plugin_line = "HOSTED_PLUGIN_ARGS=(".to_string();
+            for root in &hosted_plugin_roots {
+                hosted_plugin_line.push_str(&format!("--plugin-dir \"{root}\" "));
+            }
+            hosted_plugin_line.push(')');
+            lines.push(hosted_plugin_line);
+        } else {
+            lines.push("HOSTED_PLUGIN_ARGS=()".into());
+        }
+
         let mcp_servers = self.profile_mcp_servers(profile)?;
         if !mcp_servers.is_empty() {
             lines.push(format!(
@@ -858,11 +922,11 @@ impl ProfileManager {
 
         if has_launch {
             lines.push(format!(
-                "if $EXTRA; then exec claude{settings_part}{launch_part} \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; else exec claude{settings_part} \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; fi"
+                "if $EXTRA; then exec claude{settings_part}{launch_part} \"${{HOSTED_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; else exec claude{settings_part} \"${{HOSTED_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\"; fi"
             ));
         } else {
             lines.push(format!(
-                "exec claude{settings_part} \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\""
+                "exec claude{settings_part} \"${{HOSTED_PLUGIN_ARGS[@]}}\" \"${{MCP_PLUGIN_ARGS[@]}}\" \"${{ARGS[@]}}\""
             ));
         }
 

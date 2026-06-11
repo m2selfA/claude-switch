@@ -39,6 +39,60 @@ fn make_manager(tmp: &TempDir) -> ProfileManager {
     }
 }
 
+fn write_test_plugin_marketplace(root: &Path) {
+    fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+    fs::create_dir_all(root.join("plugins").join("app").join(".claude-plugin")).unwrap();
+    fs::create_dir_all(root.join("plugins").join("dep").join(".claude-plugin")).unwrap();
+    fs::write(
+        root.join(".claude-plugin").join("marketplace.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "local-market",
+            "description": "Local test marketplace",
+            "plugins": [
+                {
+                    "name": "app",
+                    "description": "App plugin",
+                    "version": "1.2.0",
+                    "dependencies": ["dep"],
+                    "source": "./plugins/app"
+                },
+                {
+                    "name": "dep",
+                    "description": "Dependency plugin",
+                    "version": "1.0.0",
+                    "source": "./plugins/dep"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("plugins")
+            .join("app")
+            .join(".claude-plugin")
+            .join("plugin.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "app",
+            "version": "1.2.0"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("plugins")
+            .join("dep")
+            .join(".claude-plugin")
+            .join("plugin.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "dep",
+            "version": "1.0.0"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 fn auth_migration_env_guard() -> MutexGuard<'static, ()> {
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     ENV_LOCK
@@ -162,6 +216,74 @@ fn home_dir_layout_keeps_registry_and_generated_shims_under_same_root() {
     assert_eq!(
         ProfileManager::sh_bin_dir_for_home(tmp.path()),
         tmp.path().join(".varusers").join("bin")
+    );
+}
+
+#[test]
+fn hosted_plugin_install_from_local_marketplace_installs_dependency() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let marketplace_dir = tmp.path().join("marketplace");
+    write_test_plugin_marketplace(&marketplace_dir);
+
+    let (marketplace, items) = mgr
+        .add_plugin_marketplace(marketplace_dir.to_string_lossy().as_ref(), false)
+        .unwrap();
+    assert_eq!(marketplace.name, "local-market");
+    assert_eq!(items.len(), 2);
+
+    let installed = mgr.install_hosted_plugin("app@local-market", true).unwrap();
+    assert_eq!(installed.id, "app@local-market");
+    assert!(installed.explicit);
+    let installed_plugins = mgr.list_installed_plugins().unwrap();
+    assert_eq!(installed_plugins.len(), 2);
+    assert!(
+        installed_plugins
+            .iter()
+            .any(|plugin| plugin.id == "dep@local-market" && !plugin.explicit)
+    );
+}
+
+#[test]
+fn direct_lightweight_launch_prep_adds_hosted_plugins_before_settings() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let marketplace_dir = tmp.path().join("marketplace");
+    write_test_plugin_marketplace(&marketplace_dir);
+    mgr.add_plugin_marketplace(marketplace_dir.to_string_lossy().as_ref(), false)
+        .unwrap();
+    mgr.install_hosted_plugin("app@local-market", true).unwrap();
+
+    let profile = mgr
+        .create_lightweight_profile(
+            "local",
+            Some("local"),
+            LightweightEnv {
+                auth_token: Some("sk-local".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    mgr.set_profile_plugins(&profile.id, &[String::from("app@local-market")])
+        .unwrap();
+
+    let profile = mgr.get_profile(&profile.id).unwrap();
+    let mut cmd = std::process::Command::new("claude");
+    mgr.prepare_default_local_direct_lightweight_launch(&mut cmd, &profile)
+        .unwrap();
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let plugin_idx = args.iter().position(|arg| arg == "--plugin-dir").unwrap();
+    let settings_idx = args.iter().position(|arg| arg == "--settings").unwrap();
+    assert!(plugin_idx < settings_idx);
+    assert_eq!(
+        args[plugin_idx + 1],
+        mgr.plugin_install_root("local-market", "app")
+            .display()
+            .to_string()
     );
 }
 
@@ -409,6 +531,7 @@ fn save_and_load_registry_round_trips() {
             provider_id: None,
             key_id: None,
             mcp_server_ids: Vec::new(),
+            plugin_ids: Vec::new(),
         },
     );
     mgr.save_registry(&reg).unwrap();
@@ -620,6 +743,196 @@ fn rename_profile_errors_on_duplicate_name() {
     mgr.add_profile_from("Profile B", Some("b"), &s2).unwrap();
     let err = mgr.rename_profile(&p1.id, "Profile B", None).unwrap_err();
     assert!(err.to_string().contains("already in use"), "{err}");
+}
+
+#[test]
+fn suggest_duplicate_name_suffixes_existing_copy_names() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let source = make_claude_dir(&tmp.path().join("source"));
+    let copy = make_claude_dir(&tmp.path().join("copy"));
+    mgr.add_profile_from("work", Some("work"), &source).unwrap();
+    mgr.add_profile_from("work (copy)", Some("work-copy"), &copy)
+        .unwrap();
+
+    assert_eq!(mgr.suggest_duplicate_name("work").unwrap(), "work (copy 2)");
+}
+
+#[test]
+fn duplicate_profile_copies_full_profile_directory_and_launch_args() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let src = make_claude_dir(&tmp.path().join("source"));
+    let original = mgr.add_profile_from("work", Some("work"), &src).unwrap();
+    mgr.set_launch_args(
+        &original.id,
+        Some(vec!["--dangerously-skip-permissions".into()]),
+    )
+    .unwrap();
+    let original = mgr.get_profile(&original.id).unwrap();
+    let original_dir = mgr.profile_dir(&original);
+
+    let duplicated = mgr
+        .duplicate_profile(&original.id, "work copy", Some("work-copy"))
+        .unwrap();
+    let duplicate_dir = mgr.profile_dir(&duplicated);
+
+    assert_ne!(duplicated.id, original.id);
+    assert_eq!(duplicated.kind, ProfileKind::Full);
+    assert_eq!(
+        duplicated.launch_args,
+        Some(vec!["--dangerously-skip-permissions".into()])
+    );
+    assert!(duplicated.last_used.is_none());
+    assert!(original_dir.exists());
+    assert!(duplicate_dir.exists());
+    assert_eq!(
+        fs::read_to_string(original_dir.join(".claude.json")).unwrap(),
+        fs::read_to_string(duplicate_dir.join(".claude.json")).unwrap()
+    );
+}
+
+#[test]
+fn duplicate_profile_copies_lightweight_links_and_plugin_refs() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let provider = mgr
+        .add_provider_with_key_name(
+            "Relay",
+            "https://relay.example.invalid",
+            "Default",
+            "sk-relay",
+        )
+        .unwrap();
+    let key_id = provider.keys.keys().next().unwrap().clone();
+    let mcp = mgr
+        .add_mcp_server(McpServerInput {
+            name: "filesystem".into(),
+            server_type: "stdio".into(),
+            command: Some("npx".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let marketplace_dir = tmp.path().join("marketplace");
+    write_test_plugin_marketplace(&marketplace_dir);
+    mgr.add_plugin_marketplace(marketplace_dir.to_string_lossy().as_ref(), false)
+        .unwrap();
+    mgr.install_hosted_plugin("app@local-market", true).unwrap();
+
+    let original = mgr
+        .create_lightweight_profile(
+            "work",
+            Some("work"),
+            LightweightEnv {
+                auth_token: Some("sk-inline".into()),
+                base_url: Some("https://inline.example.invalid".into()),
+                model: Some("claude-sonnet".into()),
+                extras: vec!["FOO=bar".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    mgr.set_launch_args(
+        &original.id,
+        Some(vec!["--dangerously-skip-permissions".into()]),
+    )
+    .unwrap();
+    mgr.set_provider(&original.id, &provider.id, &key_id)
+        .unwrap();
+    mgr.set_profile_mcps(&original.id, std::slice::from_ref(&mcp.id))
+        .unwrap();
+    mgr.set_profile_plugins(&original.id, &[String::from("app@local-market")])
+        .unwrap();
+    let mut registry = mgr.load_registry().unwrap();
+    registry.profiles.get_mut(&original.id).unwrap().last_used = Some(Utc::now());
+    mgr.save_registry(&registry).unwrap();
+
+    let duplicated = mgr
+        .duplicate_profile(&original.id, "work copy", None)
+        .unwrap();
+
+    assert_ne!(duplicated.id, original.id);
+    assert_eq!(duplicated.kind, ProfileKind::Lightweight);
+    assert_eq!(duplicated.alias.as_deref(), Some("work-2"));
+    assert_eq!(
+        duplicated.env.as_ref().and_then(|env| env.model.as_deref()),
+        Some("claude-sonnet")
+    );
+    assert_eq!(
+        duplicated.launch_args,
+        Some(vec!["--dangerously-skip-permissions".into()])
+    );
+    assert_eq!(
+        duplicated.provider_id.as_deref(),
+        Some(provider.id.as_str())
+    );
+    assert_eq!(duplicated.key_id.as_deref(), Some(key_id.as_str()));
+    assert_eq!(duplicated.mcp_server_ids, vec![mcp.id]);
+    assert_eq!(
+        duplicated.plugin_ids,
+        vec![String::from("app@local-market")]
+    );
+    assert!(duplicated.last_used.is_none());
+    assert!(duplicated.added >= original.added);
+}
+
+#[test]
+fn duplicate_profile_uses_name_derived_alias_and_suffixes_conflicts() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    mgr.create_lightweight_profile("source", None, LightweightEnv::default())
+        .unwrap();
+    mgr.create_lightweight_profile("existing", Some("copy-name"), LightweightEnv::default())
+        .unwrap();
+
+    let duplicated = mgr.duplicate_profile("source", "Copy Name", None).unwrap();
+
+    assert_eq!(duplicated.alias.as_deref(), Some("copy-name-2"));
+}
+
+#[test]
+fn duplicate_profile_errors_on_duplicate_name() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    mgr.create_lightweight_profile("source", Some("source"), LightweightEnv::default())
+        .unwrap();
+    mgr.create_lightweight_profile("existing", Some("existing"), LightweightEnv::default())
+        .unwrap();
+
+    let err = mgr
+        .duplicate_profile("source", "existing", Some("source-copy"))
+        .unwrap_err();
+
+    assert!(err.to_string().contains("already in use"), "{err}");
+}
+
+#[test]
+fn duplicate_profile_errors_on_invalid_explicit_alias() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    mgr.create_lightweight_profile("source", Some("source"), LightweightEnv::default())
+        .unwrap();
+
+    let err = mgr
+        .duplicate_profile("source", "source copy", Some("bad alias"))
+        .unwrap_err();
+
+    assert!(err.to_string().contains("invalid"), "{err}");
+}
+
+#[test]
+fn duplicate_profile_can_save_without_alias_when_override_is_explicit() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let original = mgr
+        .create_lightweight_profile("source", Some("source"), LightweightEnv::default())
+        .unwrap();
+
+    let duplicated = mgr
+        .duplicate_profile_with_alias_override(&original.id, "source copy", None, false)
+        .unwrap();
+
+    assert_eq!(duplicated.alias, None);
 }
 
 // ── lightweight profiles ─────────────────────────────────────────────────
@@ -991,6 +1304,7 @@ fn migration_adds_key_id_for_single_key_provider_links() {
             provider_id: Some(provider_id.clone()),
             key_id: None,
             mcp_server_ids: Vec::new(),
+            plugin_ids: Vec::new(),
         },
     );
     mgr.save_registry(&reg).unwrap();
@@ -1690,6 +2004,7 @@ fn recover_shims_parses_current_cmd_settings_variable() {
         provider_id: None,
         key_id: None,
         mcp_server_ids: Vec::new(),
+        plugin_ids: Vec::new(),
     };
     let content = mgr.generate_cmd_content(&profile).unwrap();
     let recovered = ProfileManager::parse_recoverable_shim("claude-cur.cmd", &content).unwrap();
@@ -1725,6 +2040,7 @@ fn recover_shims_ignores_explicit_local_gateway_variants() {
         provider_id: None,
         key_id: None,
         mcp_server_ids: Vec::new(),
+        plugin_ids: Vec::new(),
     };
     let shim_dir = tmp.path().join("shims");
     fs::create_dir_all(&shim_dir).unwrap();
@@ -1771,6 +2087,7 @@ fn recover_shims_parses_current_shell_settings_variable() {
         provider_id: None,
         key_id: None,
         mcp_server_ids: Vec::new(),
+        plugin_ids: Vec::new(),
     };
     let content = mgr.generate_sh_content(&profile).unwrap();
     let recovered = ProfileManager::parse_recoverable_shim("claude-scur", &content).unwrap();
@@ -3791,7 +4108,10 @@ fn config_import_rejects_profiles_with_missing_provider_references() {
             provider_id: Some("missing-provider".into()),
             key_id: Some("missing-key".into()),
             mcp_server_ids: Vec::new(),
+            plugin_ids: Vec::new(),
         }],
+        plugin_marketplaces: Vec::new(),
+        installed_plugins: Vec::new(),
         providers: Vec::new(),
         mcp_servers: Vec::new(),
         settings: Some(GlobalSettings::default()),

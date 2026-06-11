@@ -9,6 +9,12 @@ pub(super) enum Mode {
     ConfirmDelete,
     AddFullName,
     AddFullAlias,
+    DuplicateProfileName {
+        profile_id: String,
+    },
+    DuplicateProfileAlias {
+        profile_id: String,
+    },
     Message(String, bool),
     LiteProviderSelect,
     LiteKeySelect {
@@ -121,6 +127,10 @@ pub(super) enum Mode {
     McpProfilePicker {
         profile_id: String,
     },
+    PluginInstallPicker,
+    PluginProfilePicker {
+        profile_id: String,
+    },
     McpSmartPaste,
     ConfirmDeleteMcp {
         mcp_id: String,
@@ -136,6 +146,7 @@ pub(super) enum Page {
     Profile,
     Provider,
     Mcp,
+    Plugin,
     Settings,
 }
 
@@ -209,6 +220,12 @@ pub struct App {
     pub(super) mcp_profile_links_cache: Vec<Profile>,
     pub(super) mcp_selected_ids: Vec<String>,
     pub(super) mcp_filter_buf: String,
+    pub(super) plugins_cache: Vec<InstalledPlugin>,
+    pub(super) plugin_catalog_cache: Vec<HostedPluginCatalogItem>,
+    pub(super) plugin_list_state: ListState,
+    pub(super) plugin_profile_links_cache: Vec<Profile>,
+    pub(super) plugin_selected_ids: Vec<String>,
+    pub(super) plugin_filter_buf: String,
     pub(super) mcp_name_buf: String,
     pub(super) mcp_type_idx: usize,
     pub(super) mcp_command_buf: String,
@@ -311,6 +328,12 @@ impl App {
             mcp_profile_links_cache: Vec::new(),
             mcp_selected_ids: Vec::new(),
             mcp_filter_buf: String::new(),
+            plugins_cache: Vec::new(),
+            plugin_catalog_cache: Vec::new(),
+            plugin_list_state: ListState::default(),
+            plugin_profile_links_cache: Vec::new(),
+            plugin_selected_ids: Vec::new(),
+            plugin_filter_buf: String::new(),
             mcp_name_buf: String::new(),
             mcp_type_idx: 0,
             mcp_command_buf: String::new(),
