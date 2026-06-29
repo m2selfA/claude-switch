@@ -681,8 +681,15 @@ fn parses_diagnostics_and_shell_commands() {
 
 #[test]
 fn parses_mcp_export_import_validate_commands() {
-    let cli = Cli::try_parse_from(["cswitch", "mcp", "export", "github", "--output", "mcp.json"])
-        .unwrap();
+    let cli = Cli::try_parse_from([
+        "cswitch",
+        "mcp",
+        "export",
+        "github",
+        "--output",
+        ".mcp.json",
+    ])
+    .unwrap();
     match cli.command {
         Some(Commands::Mcp {
             command:
@@ -694,17 +701,17 @@ fn parses_mcp_export_import_validate_commands() {
         }) => {
             assert_eq!(queries, vec!["github"]);
             assert!(!all);
-            assert_eq!(output, Some(PathBuf::from("mcp.json")));
+            assert_eq!(output, Some(PathBuf::from(".mcp.json")));
         }
         _ => panic!("unexpected mcp export parse result"),
     }
 
-    let cli = Cli::try_parse_from(["cswitch", "mcp", "import", "mcp.json", "--replace"]).unwrap();
+    let cli = Cli::try_parse_from(["cswitch", "mcp", "import", ".mcp.json", "--replace"]).unwrap();
     match cli.command {
         Some(Commands::Mcp {
             command: McpCommands::Import { input, replace },
         }) => {
-            assert_eq!(input, PathBuf::from("mcp.json"));
+            assert_eq!(input, PathBuf::from(".mcp.json"));
             assert!(replace);
         }
         _ => panic!("unexpected mcp import parse result"),

@@ -590,7 +590,7 @@ pub(crate) enum McpCommands {
         all: bool,
     },
 
-    /// Export saved MCP servers as Claude-compatible mcp.json content
+    /// Export saved MCP servers as Claude-compatible .mcp.json content
     Export {
         /// MCP ids or names; omitted means all servers
         queries: Vec<String>,
@@ -602,7 +602,7 @@ pub(crate) enum McpCommands {
         output: Option<PathBuf>,
     },
 
-    /// Import MCP servers from a Claude-compatible mcp.json file
+    /// Import MCP servers from a Claude-compatible .mcp.json file
     Import {
         /// Input JSON file containing mcpServers
         input: PathBuf,

@@ -161,6 +161,10 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn has_trimmed_line(content: &str, expected: &str) -> bool {
+    content.lines().any(|line| line.trim() == expected)
+}
+
 #[cfg(windows)]
 fn write_windows_probe_script(dir: &Path, name: &str, suffix: &str, output: &str) -> PathBuf {
     let path = dir.join(format!("{name}{suffix}"));
@@ -188,6 +192,33 @@ fn write_windows_volta_probe_shims(dir: &Path, output: &str) {
         "@echo off\r\nvolta run %~n0 %*\r\n",
     )
     .unwrap();
+}
+
+#[cfg(windows)]
+fn windows_cmd_exe() -> PathBuf {
+    env::var_os("ComSpec")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .map(|root| root.join("System32").join("cmd.exe"))
+                .filter(|path| path.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"))
+}
+
+#[cfg(windows)]
+fn replace_cmd_hint_with_path_lookup(content: &str) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if line.starts_with("set \"_CSWITCH_HINT=") {
+            lines.push("set \"_CSWITCH_HINT=\"".to_string());
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    lines.join("\r\n") + "\r\n"
 }
 
 #[test]
@@ -3578,7 +3609,7 @@ fn mcp_server_crud_links_only_lightweight_profiles() {
 }
 
 #[test]
-fn mcp_plugin_generation_writes_mcp_json_and_manifest() {
+fn mcp_plugin_generation_writes_dot_mcp_json_and_manifest() {
     let tmp = TempDir::new().unwrap();
     let mgr = make_manager(&tmp);
     let mut env = HashMap::new();
@@ -3611,11 +3642,9 @@ fn mcp_plugin_generation_writes_mcp_json_and_manifest() {
             .join("plugin.json")
             .exists()
     );
+    assert!(!plugin_root.join("mcp.json").exists());
     let config: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(plugin_root.join(".mcp.json")).unwrap()).unwrap();
-    let compat_config: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(plugin_root.join("mcp.json")).unwrap()).unwrap();
-    assert_eq!(config, compat_config);
     assert_eq!(
         config["$schema"].as_str(),
         Some("https://json.schemastore.org/claude-code-settings.json")
@@ -3631,6 +3660,262 @@ fn mcp_plugin_generation_writes_mcp_json_and_manifest() {
     assert_eq!(
         config["mcpServers"]["github"]["alwaysLoad"].as_bool(),
         Some(false)
+    );
+}
+
+#[test]
+fn mcp_plugin_generation_removes_legacy_mcp_json() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let server = mgr
+        .add_mcp_server(McpServerInput {
+            name: "filesystem".into(),
+            server_type: "stdio".into(),
+            command: Some("npx".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let lite = mgr
+        .create_lightweight_profile("lite", Some("lite-mcp-prune"), LightweightEnv::default())
+        .unwrap();
+    let linked = mgr
+        .set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+        .unwrap();
+    let servers = mgr.profile_mcp_servers(&linked).unwrap();
+    let plugin_root = mgr
+        .upsert_local_profile_mcp_plugin(&linked, &servers)
+        .unwrap();
+    fs::write(plugin_root.join("mcp.json"), "{\"stale\":true}").unwrap();
+
+    mgr.upsert_local_profile_mcp_plugin(&linked, &servers)
+        .unwrap();
+
+    assert!(plugin_root.join(".mcp.json").exists());
+    assert!(!plugin_root.join("mcp.json").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn local_windows_managed_mcp_generation_expands_tilde_path_fields() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let mut env = HashMap::new();
+    env.insert("CONFIG_PATH".into(), "~/cfg/config.json".into());
+    env.insert("TOKEN".into(), "${GITHUB_TOKEN}".into());
+    env.insert("HOME_ONLY".into(), "~".into());
+    let headers = HashMap::from([("Authorization".into(), "~/still-header".into())]);
+    let oauth = Some(serde_json::json!({
+        "tokenUrl": "~/oauth"
+    }));
+    let server = mgr
+        .add_mcp_server(McpServerInput {
+            name: "paths".into(),
+            server_type: "stdio".into(),
+            command: Some("~\\bin\\tool.cmd".into()),
+            args: vec![
+                "~/arg/one".into(),
+                "~\\arg\\two".into(),
+                "~".into(),
+                "~user\\bin".into(),
+            ],
+            env,
+            cwd: Some("~/workspace".into()),
+            url: Some("~/leave-as-url".into()),
+            headers,
+            oauth,
+            headers_helper: Some("~/.claude/helper.ps1".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let lite = mgr
+        .create_lightweight_profile("lite", Some("lite-mcp-tilde"), LightweightEnv::default())
+        .unwrap();
+    let linked = mgr
+        .set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+        .unwrap();
+    let servers = mgr.profile_mcp_servers(&linked).unwrap();
+    let plugin_root = mgr
+        .upsert_local_profile_mcp_plugin(&linked, &servers)
+        .unwrap();
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(plugin_root.join(".mcp.json")).unwrap()).unwrap();
+    let actual_command = config["mcpServers"]["paths"]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let actual_home = actual_command
+        .strip_suffix(r"\bin\tool.cmd")
+        .expect("expanded command should end with the known suffix")
+        .to_string();
+    let expected_cwd = format!(r"{actual_home}\workspace");
+    let expected_arg_one = format!(r"{actual_home}\arg\one");
+    let expected_arg_two = format!(r"{actual_home}\arg\two");
+    let expected_env_path = format!(r"{actual_home}\cfg\config.json");
+    let expected_headers_helper = format!(r"{actual_home}\.claude\helper.ps1");
+
+    assert_eq!(
+        config["mcpServers"]["paths"]["command"].as_str(),
+        Some(actual_command.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["cwd"].as_str(),
+        Some(expected_cwd.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][0].as_str(),
+        Some(expected_arg_one.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][1].as_str(),
+        Some(expected_arg_two.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][2].as_str(),
+        Some(actual_home.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][3].as_str(),
+        Some("~user\\bin")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["CONFIG_PATH"].as_str(),
+        Some(expected_env_path.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["TOKEN"].as_str(),
+        Some("${GITHUB_TOKEN}")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["HOME_ONLY"].as_str(),
+        Some(actual_home.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["headersHelper"].as_str(),
+        Some(expected_headers_helper.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["url"].as_str(),
+        Some("~/leave-as-url")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["headers"]["Authorization"].as_str(),
+        Some("~/still-header")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["oauth"]["tokenUrl"].as_str(),
+        Some("~/oauth")
+    );
+}
+
+#[test]
+fn profile_mcp_config_for_remote_windows_expands_tilde_and_normalizes_sftp_home() {
+    let server = McpServer {
+        id: "mcp_test".into(),
+        name: "paths".into(),
+        server_type: "stdio".into(),
+        command: Some("~/bin/tool.cmd".into()),
+        args: vec!["~\\arg\\two".into(), "~".into()],
+        env: HashMap::from([("CONFIG_PATH".into(), "~\\cfg\\config.json".into())]),
+        cwd: Some("~/workspace".into()),
+        url: Some("~/leave-as-url".into()),
+        headers: HashMap::from([("Authorization".into(), "~/still-header".into())]),
+        oauth: Some(serde_json::json!({
+            "tokenUrl": "~/oauth"
+        })),
+        headers_helper: Some("~/helpers/header.ps1".into()),
+        timeout: None,
+        always_load: None,
+        disabled: None,
+    };
+
+    let config = ProfileManager::profile_mcp_config_for_target(
+        &[server],
+        RemoteOs::Windows,
+        Some("/C:/Users/alice"),
+    )
+    .unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+
+    assert_eq!(
+        config["mcpServers"]["paths"]["command"].as_str(),
+        Some(r"C:\Users\alice\bin\tool.cmd")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["cwd"].as_str(),
+        Some(r"C:\Users\alice\workspace")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][0].as_str(),
+        Some(r"C:\Users\alice\arg\two")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][1].as_str(),
+        Some(r"C:\Users\alice")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["CONFIG_PATH"].as_str(),
+        Some(r"C:\Users\alice\cfg\config.json")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["headersHelper"].as_str(),
+        Some(r"C:\Users\alice\helpers\header.ps1")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["url"].as_str(),
+        Some("~/leave-as-url")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["headers"]["Authorization"].as_str(),
+        Some("~/still-header")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["oauth"]["tokenUrl"].as_str(),
+        Some("~/oauth")
+    );
+}
+
+#[test]
+fn profile_mcp_config_for_unix_preserves_tilde_literals() {
+    let server = McpServer {
+        id: "mcp_test".into(),
+        name: "paths".into(),
+        server_type: "stdio".into(),
+        command: Some("~/bin/tool".into()),
+        args: vec!["~\\arg\\two".into()],
+        env: HashMap::from([("CONFIG_PATH".into(), "~/cfg/config.json".into())]),
+        cwd: Some("~/workspace".into()),
+        url: None,
+        headers: HashMap::new(),
+        oauth: None,
+        headers_helper: Some("~/helpers/header.sh".into()),
+        timeout: None,
+        always_load: None,
+        disabled: None,
+    };
+
+    let config =
+        ProfileManager::profile_mcp_config_for_target(&[server], RemoteOs::Unix, None).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+
+    assert_eq!(
+        config["mcpServers"]["paths"]["command"].as_str(),
+        Some("~/bin/tool")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["cwd"].as_str(),
+        Some("~/workspace")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][0].as_str(),
+        Some("~\\arg\\two")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["CONFIG_PATH"].as_str(),
+        Some("~/cfg/config.json")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["headersHelper"].as_str(),
+        Some("~/helpers/header.sh")
     );
 }
 
@@ -3798,6 +4083,36 @@ fn doctor_reports_stale_mcp_plugin_state() {
         .unwrap();
     let report = mgr.doctor_report().unwrap();
     assert!(report.items.iter().any(|item| {
+        item.level == DiagnosticLevel::Warn
+            && item.area == "mcp"
+            && item.message.contains("artifacts have not been generated")
+    }));
+}
+
+#[test]
+fn doctor_accepts_generated_mcp_plugin_with_only_dot_mcp_json() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let server = mgr
+        .add_mcp_server(McpServerInput {
+            name: "filesystem".into(),
+            server_type: "stdio".into(),
+            command: Some("npx".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let lite = mgr
+        .create_lightweight_profile("lite", Some("lite-doctor-ok"), LightweightEnv::default())
+        .unwrap();
+    let linked = mgr
+        .set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+        .unwrap();
+    let servers = mgr.profile_mcp_servers(&linked).unwrap();
+    mgr.upsert_local_profile_mcp_plugin(&linked, &servers)
+        .unwrap();
+
+    let report = mgr.doctor_report().unwrap();
+    assert!(!report.items.iter().any(|item| {
         item.level == DiagnosticLevel::Warn
             && item.area == "mcp"
             && item.message.contains("artifacts have not been generated")
@@ -4631,6 +4946,18 @@ fn generate_cmd_content_for_local_gateway_search_fetch_embeds_mode_and_fail_clos
     assert!(content.contains("--local-gateway-mode search-fetch"));
     assert!(content.contains(":tinyfish_required"));
     assert!(content.contains("TinyFish is required for this shim variant"));
+    assert!(has_trimmed_line(
+        &content,
+        ">&2 echo claude-switch dynamic launch unavailable for this shim."
+    ));
+    assert!(has_trimmed_line(
+        &content,
+        ">&2 echo claude-switch dynamic launch unavailable; falling back to legacy shim."
+    ));
+    assert!(has_trimmed_line(
+        &content,
+        ">&2 echo TinyFish is required for this shim variant but the 'tinyfish' command is unavailable."
+    ));
     assert!(content.contains("set \"_TF_SETTINGS="));
     assert!(content.contains(
         "set \"_TF_PLUGIN_DIR=%USERPROFILE%\\.claude-switch\\generated\\plugins\\tinyfish-full\""
@@ -4734,6 +5061,14 @@ fn generate_sh_content_for_local_gateway_fetch_only_uses_static_plugin_dir() {
         )
     );
     assert!(content.contains("--local-gateway-mode fetch-only"));
+    assert!(has_trimmed_line(
+        &content,
+        "echo \"TinyFish is required for this shim variant but the 'tinyfish' command is unavailable.\" >&2"
+    ));
+    assert!(!has_trimmed_line(
+        &content,
+        "echo \"TinyFish is required for this shim variant but the 'tinyfish' command is unavailable.\""
+    ));
 }
 
 #[test]
@@ -4942,6 +5277,98 @@ fn generated_cmd_subagent_hook_does_not_trigger_cmd_parse_error() {
     assert!(!combined.contains("The system cannot find the file specified."));
 }
 
+#[cfg(windows)]
+#[test]
+fn generated_cmd_dynamic_fallback_warning_stays_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile("work", Some("work"), LightweightEnv::default())
+        .unwrap();
+    let mut content = replace_cmd_hint_with_path_lookup(&mgr.generate_cmd_content(&lite).unwrap());
+    content = content.replace(
+        "if not defined _CSWITCH goto dynamic_unavailable",
+        "goto dynamic_unavailable",
+    );
+    content = content.replace(
+        "claude --settings \"%_SETTINGS%\" %_R%",
+        "echo legacy-claude",
+    );
+    let shim_path = tmp.path().join("claude-work.cmd");
+    fs::write(&shim_path, content).unwrap();
+
+    let cmd_exe = windows_cmd_exe();
+    let system32 = cmd_exe.parent().unwrap().to_path_buf();
+    let path = env::join_paths([system32]).unwrap();
+    let output = std::process::Command::new(&cmd_exe)
+        .arg("/c")
+        .arg(&shim_path)
+        .arg("--help")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status.code()
+    );
+    assert_eq!(stdout.trim(), "legacy-claude");
+    assert!(
+        stderr.contains("claude-switch dynamic launch unavailable; falling back to legacy shim.")
+    );
+    assert!(!stdout.contains("falling back to legacy shim"));
+}
+
+#[cfg(windows)]
+#[test]
+fn generated_cmd_tinyfish_requirement_stays_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let mgr = make_manager(&tmp);
+    let lite = mgr
+        .create_lightweight_profile(
+            "local-prof",
+            Some("lp"),
+            LightweightEnv {
+                auth_token: Some("sk-test".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let content = mgr
+        .generate_cmd_content_for_local_gateway_mode(&lite, LocalGatewayToolMode::SearchFetch)
+        .unwrap();
+    let shim_path = tmp.path().join("claude-lp-search-fetch.cmd");
+    fs::write(&shim_path, content).unwrap();
+
+    let cmd_exe = windows_cmd_exe();
+    let system32 = cmd_exe.parent().unwrap().to_path_buf();
+    let path = env::join_paths([system32]).unwrap();
+    let output = std::process::Command::new(&cmd_exe)
+        .arg("/c")
+        .arg(&shim_path)
+        .arg("--help")
+        .env("PATH", path)
+        .env("CLAUDE_SWITCH_SHIM_MODE", "legacy")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout.trim().is_empty());
+    assert!(stderr.contains(
+        "TinyFish is required for this shim variant but the 'tinyfish' command is unavailable."
+    ));
+    assert!(!stdout.contains("TinyFish is required"));
+}
+
 #[test]
 fn remove_remote_plugin_dir_reports_runner_errors() {
     let result = ProfileManager::remove_remote_plugin_dir_with_runner(
@@ -4951,6 +5378,24 @@ fn remove_remote_plugin_dir_reports_runner_errors() {
         |_| anyhow::bail!("permission denied"),
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn remove_remote_mcp_plugin_dir_removes_dot_and_legacy_files() {
+    let mut batch = String::new();
+    ProfileManager::remove_remote_mcp_plugin_dir_with_runner(
+        "host",
+        "/tmp/cswitch-mcp-profile-test",
+        RemoteOs::Unix,
+        |stdin| {
+            batch = stdin.to_string();
+            Ok(String::new())
+        },
+    )
+    .unwrap();
+
+    assert!(batch.contains("rm \"/tmp/cswitch-mcp-profile-test/.mcp.json\""));
+    assert!(batch.contains("rm \"/tmp/cswitch-mcp-profile-test/mcp.json\""));
 }
 
 #[test]
@@ -5533,6 +5978,14 @@ fn generate_cmd_auto_shim_tries_dynamic_launch_before_legacy() {
     assert!(content.contains("shim launch --profile-id"));
     assert!(content.contains("dynamic_unavailable"));
     assert!(content.contains("falling back to legacy shim"));
+    assert!(has_trimmed_line(
+        &content,
+        ">&2 echo claude-switch dynamic launch unavailable for this shim."
+    ));
+    assert!(has_trimmed_line(
+        &content,
+        ">&2 echo claude-switch dynamic launch unavailable; falling back to legacy shim."
+    ));
     assert!(content.contains("claude --settings"));
     assert!(
         content.find(":dispatch_launch").unwrap() < content.find("shim launch --probe").unwrap()
@@ -5552,6 +6005,22 @@ fn generate_sh_auto_shim_tries_dynamic_launch_before_legacy() {
     assert!(content.contains("shim launch --probe"));
     assert!(content.contains("shim launch --profile-id \"$PROFILE_ID\""));
     assert!(content.contains("falling back to legacy shim"));
+    assert!(has_trimmed_line(
+        &content,
+        "echo \"claude-switch dynamic launch unavailable for this shim.\" >&2"
+    ));
+    assert!(has_trimmed_line(
+        &content,
+        "echo \"claude-switch dynamic launch unavailable; falling back to legacy shim.\" >&2"
+    ));
+    assert!(!has_trimmed_line(
+        &content,
+        "echo \"claude-switch dynamic launch unavailable for this shim.\""
+    ));
+    assert!(!has_trimmed_line(
+        &content,
+        "echo \"claude-switch dynamic launch unavailable; falling back to legacy shim.\""
+    ));
     assert!(content.contains("exec claude"));
 }
 

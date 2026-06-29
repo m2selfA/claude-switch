@@ -289,6 +289,18 @@ impl ProfileManager {
         Ok(())
     }
 
+    pub(super) fn remove_remote_file_if_exists(
+        host: &str,
+        remote_path: &str,
+        remote_os: RemoteOs,
+    ) -> Result<bool> {
+        match Self::remove_remote_file(host, remote_path, remote_os) {
+            Ok(()) => Ok(true),
+            Err(error) if Self::is_benign_sftp_missing_error(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) fn is_benign_sftp_missing_error(error: &anyhow::Error) -> bool {
         let message = error.to_string().to_ascii_lowercase();
         message.contains("no such file")

@@ -2,6 +2,62 @@ use super::*;
 use std::collections::HashMap;
 
 impl ProfileManager {
+    fn normalize_generated_windows_home(home: &str) -> String {
+        let mut normalized = if home.len() >= 3
+            && home.as_bytes()[0] == b'/'
+            && home.as_bytes()[1].is_ascii_alphabetic()
+            && home.as_bytes()[2] == b':'
+        {
+            home[1..].to_string()
+        } else {
+            home.to_string()
+        };
+        normalized = normalized.replace('/', "\\");
+        while normalized.ends_with('\\')
+            && !(normalized.len() == 3
+                && normalized.as_bytes()[1] == b':'
+                && normalized.as_bytes()[2] == b'\\')
+        {
+            normalized.pop();
+        }
+        normalized
+    }
+
+    fn expand_windows_generated_tilde(value: &str, windows_home: &str) -> String {
+        if value == "~" {
+            return windows_home.to_string();
+        }
+
+        let Some(rest) = value
+            .strip_prefix("~/")
+            .or_else(|| value.strip_prefix("~\\"))
+        else {
+            return value.to_string();
+        };
+
+        let suffix = rest.trim_start_matches(['/', '\\']).replace('/', "\\");
+        if suffix.is_empty() {
+            windows_home.to_string()
+        } else {
+            format!("{windows_home}\\{suffix}")
+        }
+    }
+
+    fn mcp_pathlike_value_for_target(
+        value: &str,
+        target_os: RemoteOs,
+        windows_home: Option<&str>,
+    ) -> String {
+        match (target_os, windows_home) {
+            (RemoteOs::Windows, Some(home))
+                if value == "~" || value.starts_with("~/") || value.starts_with("~\\") =>
+            {
+                Self::expand_windows_generated_tilde(value, home)
+            }
+            _ => value.to_string(),
+        }
+    }
+
     pub(crate) fn parse_mcp_smart_paste_inputs(raw: &str) -> Result<Vec<McpServerInput>> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -312,6 +368,96 @@ impl ProfileManager {
         serde_json::Value::Object(object)
     }
 
+    fn mcp_server_config_value_for_target(
+        server: &McpServer,
+        target_os: RemoteOs,
+        windows_home: Option<&str>,
+    ) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "type".into(),
+            serde_json::Value::String(server.server_type.clone()),
+        );
+        if let Some(command) = &server.command {
+            object.insert(
+                "command".into(),
+                serde_json::Value::String(Self::mcp_pathlike_value_for_target(
+                    command,
+                    target_os,
+                    windows_home,
+                )),
+            );
+        }
+        if !server.args.is_empty() {
+            object.insert(
+                "args".into(),
+                serde_json::json!(
+                    server
+                        .args
+                        .iter()
+                        .map(|arg| Self::mcp_pathlike_value_for_target(
+                            arg,
+                            target_os,
+                            windows_home
+                        ))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        if !server.env.is_empty() {
+            let env = server
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        Self::mcp_pathlike_value_for_target(value, target_os, windows_home),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            object.insert("env".into(), serde_json::json!(env));
+        }
+        if let Some(cwd) = &server.cwd {
+            object.insert(
+                "cwd".into(),
+                serde_json::Value::String(Self::mcp_pathlike_value_for_target(
+                    cwd,
+                    target_os,
+                    windows_home,
+                )),
+            );
+        }
+        if let Some(url) = &server.url {
+            object.insert("url".into(), serde_json::Value::String(url.clone()));
+        }
+        if !server.headers.is_empty() {
+            object.insert("headers".into(), serde_json::json!(server.headers));
+        }
+        if let Some(oauth) = &server.oauth {
+            object.insert("oauth".into(), oauth.clone());
+        }
+        if let Some(headers_helper) = &server.headers_helper {
+            object.insert(
+                "headersHelper".into(),
+                serde_json::Value::String(Self::mcp_pathlike_value_for_target(
+                    headers_helper,
+                    target_os,
+                    windows_home,
+                )),
+            );
+        }
+        if let Some(timeout) = server.timeout {
+            object.insert("timeout".into(), serde_json::json!(timeout));
+        }
+        if let Some(always_load) = server.always_load {
+            object.insert("alwaysLoad".into(), serde_json::json!(always_load));
+        }
+        if let Some(disabled) = server.disabled {
+            object.insert("disabled".into(), serde_json::json!(disabled));
+        }
+        serde_json::Value::Object(object)
+    }
+
     pub(super) fn profile_mcp_servers(&self, profile: &Profile) -> Result<Vec<McpServer>> {
         if profile.mcp_server_ids.is_empty() {
             return Ok(Vec::new());
@@ -343,6 +489,36 @@ impl ProfileManager {
                 );
             }
             mcp_servers.insert(server.name.clone(), Self::mcp_server_config_value(server));
+        }
+        let root = serde_json::json!({
+            "$schema": "https://json.schemastore.org/claude-code-settings.json",
+            "mcpServers": mcp_servers,
+        });
+        serde_json::to_string_pretty(&root).context("Failed to serialize MCP config JSON")
+    }
+
+    pub(super) fn profile_mcp_config_for_target(
+        servers: &[McpServer],
+        target_os: RemoteOs,
+        windows_home: Option<&str>,
+    ) -> Result<String> {
+        let normalized_windows_home = matches!(target_os, RemoteOs::Windows)
+            .then(|| windows_home.map(Self::normalize_generated_windows_home))
+            .flatten();
+        let windows_home = normalized_windows_home.as_deref();
+
+        let mut mcp_servers = serde_json::Map::new();
+        for server in servers {
+            if mcp_servers.contains_key(&server.name) {
+                bail!(
+                    "Duplicate MCP server name '{}' in profile selection.",
+                    server.name
+                );
+            }
+            mcp_servers.insert(
+                server.name.clone(),
+                Self::mcp_server_config_value_for_target(server, target_os, windows_home),
+            );
         }
         let root = serde_json::json!({
             "$schema": "https://json.schemastore.org/claude-code-settings.json",

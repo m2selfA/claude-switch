@@ -213,12 +213,15 @@ impl ProfileManager {
                             Self::profile_mcp_manifest_relative_path(profile, remote_os),
                             Self::profile_mcp_plugin_manifest(profile)?,
                         ));
-                        let mcp_config = Self::profile_mcp_config(&mcp_servers)?;
-                        for config_path in
-                            Self::profile_mcp_config_relative_paths(profile, remote_os)
-                        {
-                            desired_mcps.push((config_path, mcp_config.clone()));
-                        }
+                        let mcp_config = Self::profile_mcp_config_for_target(
+                            &mcp_servers,
+                            remote_os,
+                            Some(remote_home.as_str()),
+                        )?;
+                        desired_mcps.push((
+                            Self::profile_mcp_config_relative_path(profile, remote_os),
+                            mcp_config,
+                        ));
                     }
                 }
             }
@@ -364,6 +367,20 @@ impl ProfileManager {
         }
         if !desired_mcps.is_empty() {
             Self::upload_remote_files(host, &remote_mcps_dir, remote_os, &desired_mcps, false)?;
+        }
+        for plugin_name in &desired_mcp_names {
+            let plugin_root = Self::join_remote_path(&remote_mcps_dir, remote_os, plugin_name);
+            let legacy_remote_path = Self::join_remote_path(&plugin_root, remote_os, "mcp.json");
+            if Self::remove_remote_file_if_exists(host, &legacy_remote_path, remote_os)? {
+                removed += 1;
+                if verbose {
+                    progress(&format!(
+                        "[remote:{host}] removing legacy MCP compatibility file: {}",
+                        legacy_remote_path
+                    ));
+                    details.push(format!("  - {}:{} (legacy)", host, legacy_remote_path));
+                }
+            }
         }
         let desired_hosted_plugin_file_count =
             desired_hosted_plugin_assets.len() + desired_hosted_plugin_scripts.len();

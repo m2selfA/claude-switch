@@ -88,20 +88,14 @@ impl ProfileManager {
         }
     }
 
-    pub(super) fn profile_mcp_config_relative_paths(
+    pub(super) fn profile_mcp_config_relative_path(
         profile: &Profile,
         remote_os: RemoteOs,
-    ) -> [String; 2] {
+    ) -> String {
         let dir_name = Self::profile_mcp_plugin_dir_name(profile);
         match remote_os {
-            RemoteOs::Unix => [
-                format!("{dir_name}/.mcp.json"),
-                format!("{dir_name}/mcp.json"),
-            ],
-            RemoteOs::Windows => [
-                format!("{dir_name}\\.mcp.json"),
-                format!("{dir_name}\\mcp.json"),
-            ],
+            RemoteOs::Unix => format!("{dir_name}/.mcp.json"),
+            RemoteOs::Windows => format!("{dir_name}\\.mcp.json"),
         }
     }
 
@@ -280,6 +274,14 @@ impl ProfileManager {
         Ok(())
     }
 
+    pub(super) fn remove_file_if_exists(path: &Path) -> Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[cfg(unix)]
     pub(super) fn set_executable_if_possible(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -311,10 +313,21 @@ impl ProfileManager {
     ) -> Result<PathBuf> {
         let plugin_root = self.local_profile_mcp_plugin_root(profile);
         let manifest_path = plugin_root.join(".claude-plugin").join("plugin.json");
-        let mcp_config = Self::profile_mcp_config(servers)?;
+        let legacy_config_path = plugin_root.join("mcp.json");
+        #[cfg(windows)]
+        let mcp_config = {
+            let home = Self::home_dir()?;
+            Self::profile_mcp_config_for_target(
+                servers,
+                RemoteOs::Windows,
+                Some(home.to_string_lossy().as_ref()),
+            )?
+        };
+        #[cfg(not(windows))]
+        let mcp_config = Self::profile_mcp_config_for_target(servers, RemoteOs::Unix, None)?;
         Self::write_if_changed(&manifest_path, &Self::profile_mcp_plugin_manifest(profile)?)?;
         Self::write_if_changed(&plugin_root.join(".mcp.json"), &mcp_config)?;
-        Self::write_if_changed(&plugin_root.join("mcp.json"), &mcp_config)?;
+        Self::remove_file_if_exists(&legacy_config_path)?;
         Ok(plugin_root)
     }
 

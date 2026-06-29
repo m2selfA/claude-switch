@@ -292,8 +292,7 @@ impl ProfileManager {
             }
             if profile.kind == ProfileKind::Lightweight && !profile.mcp_server_ids.is_empty() {
                 let plugin_root = self.local_profile_mcp_plugin_root(profile);
-                if !plugin_root.join(".mcp.json").exists() || !plugin_root.join("mcp.json").exists()
-                {
+                if !plugin_root.join(".mcp.json").exists() {
                     report.items.push(Self::diagnostic(
                         DiagnosticLevel::Warn,
                         "mcp",

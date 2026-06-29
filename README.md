@@ -13,7 +13,7 @@ Two isolation modes:
 ### Cargo (requires Rust)
 
 ```bash
-cargo install cswitch --version 0.8.2
+cargo install cswitch --version 0.8.3
 ```
 
 ### Pre-built binaries
@@ -127,8 +127,8 @@ cswitch
 | `cswitch mcp add <name> --type http --url <url> [--header KEY=VALUE]...` | Add a remote MCP server |
 | `cswitch mcp link <profile> <mcp>... [--replace]` | Select MCP servers for a lightweight profile |
 | `cswitch mcp unlink <profile> <mcp>...` | Remove selected MCP servers from a lightweight profile |
-| `cswitch mcp export [<mcp>...] [--all] [-o <file>]` | Export saved MCP servers as Claude-compatible `mcp.json` content |
-| `cswitch mcp import <file> [--replace]` | Import MCP servers from a Claude-compatible `mcp.json` / `.mcp.json` file |
+| `cswitch mcp export [<mcp>...] [--all] [-o <file>]` | Export saved MCP servers as Claude-compatible `.mcp.json` content |
+| `cswitch mcp import <file> [--replace]` | Import MCP servers from a Claude-compatible `.mcp.json` file |
 | `cswitch mcp validate [<mcp>...] [--all] [--strict]` | Validate saved MCP server entries and report missing commands, stale fields, deprecated SSE, and disabled servers |
 | `cswitch plugin marketplace list` | List configured hosted plugin marketplaces |
 | `cswitch plugin marketplace add <locator> [--replace]` | Add a hosted plugin marketplace from `owner/repo`, a git URL, or a local path |
@@ -343,7 +343,7 @@ cswitch paseo export --include-secrets --with-extras --full-config -o paseo.conf
 
 ## MCP import/export
 
-`cswitch mcp export` writes a Claude-compatible JSON document with `$schema` and `mcpServers`. With no MCP names it exports all saved servers; pass specific ids/names to export a subset, or `-o mcp.json` to write a file.
+`cswitch mcp export` writes a Claude-compatible JSON document with `$schema` and `mcpServers`. With no MCP names it exports all saved servers; pass specific ids/names to export a subset, or `-o .mcp.json` to write a file.
 
 ```bash
 cswitch mcp export github filesystem -o .mcp.json
@@ -399,7 +399,7 @@ Stored in `~/.claude-switch/profiles/<alias-or-name>/`. Launch sets `CLAUDE_CONF
 
 ### Lightweight profiles
 
-No dedicated profile directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` on launch. For ordinary profiles this remains an inline settings payload. Localhost/LAN lightweight profiles also stay on that inline-settings path by default, while explicit local gateway modes can still materialize managed TinyFish plugin files under `~/.claude-switch/generated/`. Other TinyFish-enhanced profiles likewise use managed plugin files written as standard Claude plugin directories containing `.claude-plugin/plugin.json` and `hooks/hooks.json`, while TinyFish-specific permissions remain inline in `--settings`. If a lightweight profile selects MCP servers, `cswitch` generates a separate profile-scoped plugin under `~/.claude-switch/generated/mcps/` containing `.mcp.json` plus a compatibility `mcp.json`, then passes it to Claude with `--plugin-dir`. Token and base URL can also come from a linked shared provider/key.
+No dedicated profile directory — env vars (token, base URL, model IDs, extras) are stored in the registry and passed via `--settings` on launch. For ordinary profiles this remains an inline settings payload. Localhost/LAN lightweight profiles also stay on that inline-settings path by default, while explicit local gateway modes can still materialize managed TinyFish plugin files under `~/.claude-switch/generated/`. Other TinyFish-enhanced profiles likewise use managed plugin files written as standard Claude plugin directories containing `.claude-plugin/plugin.json` and `hooks/hooks.json`, while TinyFish-specific permissions remain inline in `--settings`. If a lightweight profile selects MCP servers, `cswitch` generates a separate profile-scoped plugin under `~/.claude-switch/generated/mcps/` containing `.mcp.json`, then passes it to Claude with `--plugin-dir`. Token and base URL can also come from a linked shared provider/key.
 
 `extras` may also include the reserved control entry `CLAUDE_SWITCH_TINYFISH=off` to keep a profile on the normal inline-settings path even when its `base_url` would otherwise trigger TinyFish plugin generation.
 
