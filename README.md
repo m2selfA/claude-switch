@@ -13,7 +13,7 @@ Two isolation modes:
 ### Cargo (requires Rust)
 
 ```bash
-cargo install cswitch --version 0.8.3
+cargo install cswitch --version 0.8.4
 ```
 
 ### Pre-built binaries
@@ -352,6 +352,8 @@ cswitch mcp validate --all
 ```
 
 Imported server names become the keys under `mcpServers`, matching Claude Code conventions. `--replace` updates existing same-name registry entries; without it, duplicate names fail fast.
+
+For managed profile-scoped MCP plugins generated under `~/.claude-switch/generated/mcps/`, leading `~` in path-like MCP fields (`command`, `args`, `env` values, `cwd`, and `headersHelper`) is expanded to the target OS home path when `.mcp.json` is generated.
 
 You can also sync shims to remote machines with:
 

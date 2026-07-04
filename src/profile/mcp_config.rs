@@ -2,6 +2,14 @@ use super::*;
 use std::collections::HashMap;
 
 impl ProfileManager {
+    fn normalize_generated_unix_home(home: &str) -> String {
+        let mut normalized = home.replace('\\', "/");
+        while normalized.ends_with('/') && normalized.len() > 1 {
+            normalized.pop();
+        }
+        normalized
+    }
+
     fn normalize_generated_windows_home(home: &str) -> String {
         let mut normalized = if home.len() >= 3
             && home.as_bytes()[0] == b'/'
@@ -21,6 +29,26 @@ impl ProfileManager {
             normalized.pop();
         }
         normalized
+    }
+
+    fn expand_unix_generated_tilde(value: &str, unix_home: &str) -> String {
+        if value == "~" {
+            return unix_home.to_string();
+        }
+
+        let Some(rest) = value
+            .strip_prefix("~/")
+            .or_else(|| value.strip_prefix("~\\"))
+        else {
+            return value.to_string();
+        };
+
+        let suffix = rest.trim_start_matches(['/', '\\']).replace('\\', "/");
+        if suffix.is_empty() {
+            unix_home.to_string()
+        } else {
+            format!("{unix_home}/{suffix}")
+        }
     }
 
     fn expand_windows_generated_tilde(value: &str, windows_home: &str) -> String {
@@ -46,14 +74,16 @@ impl ProfileManager {
     fn mcp_pathlike_value_for_target(
         value: &str,
         target_os: RemoteOs,
-        windows_home: Option<&str>,
+        target_home: Option<&str>,
     ) -> String {
-        match (target_os, windows_home) {
-            (RemoteOs::Windows, Some(home))
-                if value == "~" || value.starts_with("~/") || value.starts_with("~\\") =>
-            {
-                Self::expand_windows_generated_tilde(value, home)
-            }
+        let should_expand = value == "~" || value.starts_with("~/") || value.starts_with("~\\");
+        if !should_expand {
+            return value.to_string();
+        }
+
+        match (target_os, target_home) {
+            (RemoteOs::Unix, Some(home)) => Self::expand_unix_generated_tilde(value, home),
+            (RemoteOs::Windows, Some(home)) => Self::expand_windows_generated_tilde(value, home),
             _ => value.to_string(),
         }
     }
@@ -371,7 +401,7 @@ impl ProfileManager {
     fn mcp_server_config_value_for_target(
         server: &McpServer,
         target_os: RemoteOs,
-        windows_home: Option<&str>,
+        target_home: Option<&str>,
     ) -> serde_json::Value {
         let mut object = serde_json::Map::new();
         object.insert(
@@ -384,7 +414,7 @@ impl ProfileManager {
                 serde_json::Value::String(Self::mcp_pathlike_value_for_target(
                     command,
                     target_os,
-                    windows_home,
+                    target_home,
                 )),
             );
         }
@@ -395,11 +425,7 @@ impl ProfileManager {
                     server
                         .args
                         .iter()
-                        .map(|arg| Self::mcp_pathlike_value_for_target(
-                            arg,
-                            target_os,
-                            windows_home
-                        ))
+                        .map(|arg| Self::mcp_pathlike_value_for_target(arg, target_os, target_home))
                         .collect::<Vec<_>>()
                 ),
             );
@@ -411,7 +437,7 @@ impl ProfileManager {
                 .map(|(key, value)| {
                     (
                         key.clone(),
-                        Self::mcp_pathlike_value_for_target(value, target_os, windows_home),
+                        Self::mcp_pathlike_value_for_target(value, target_os, target_home),
                     )
                 })
                 .collect::<HashMap<_, _>>();
@@ -423,7 +449,7 @@ impl ProfileManager {
                 serde_json::Value::String(Self::mcp_pathlike_value_for_target(
                     cwd,
                     target_os,
-                    windows_home,
+                    target_home,
                 )),
             );
         }
@@ -442,7 +468,7 @@ impl ProfileManager {
                 serde_json::Value::String(Self::mcp_pathlike_value_for_target(
                     headers_helper,
                     target_os,
-                    windows_home,
+                    target_home,
                 )),
             );
         }
@@ -500,12 +526,13 @@ impl ProfileManager {
     pub(super) fn profile_mcp_config_for_target(
         servers: &[McpServer],
         target_os: RemoteOs,
-        windows_home: Option<&str>,
+        target_home: Option<&str>,
     ) -> Result<String> {
-        let normalized_windows_home = matches!(target_os, RemoteOs::Windows)
-            .then(|| windows_home.map(Self::normalize_generated_windows_home))
-            .flatten();
-        let windows_home = normalized_windows_home.as_deref();
+        let normalized_target_home = match target_os {
+            RemoteOs::Unix => target_home.map(Self::normalize_generated_unix_home),
+            RemoteOs::Windows => target_home.map(Self::normalize_generated_windows_home),
+        };
+        let target_home = normalized_target_home.as_deref();
 
         let mut mcp_servers = serde_json::Map::new();
         for server in servers {
@@ -517,7 +544,7 @@ impl ProfileManager {
             }
             mcp_servers.insert(
                 server.name.clone(),
-                Self::mcp_server_config_value_for_target(server, target_os, windows_home),
+                Self::mcp_server_config_value_for_target(server, target_os, target_home),
             );
         }
         let root = serde_json::json!({

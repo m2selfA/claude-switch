@@ -3807,6 +3807,120 @@ fn local_windows_managed_mcp_generation_expands_tilde_path_fields() {
     );
 }
 
+#[cfg(not(windows))]
+#[test]
+fn local_unix_managed_mcp_generation_expands_tilde_path_fields() {
+    let tmp = TempDir::new().unwrap();
+    let _home_guard = EnvVarGuard::set(CLAUDE_SWITCH_HOME_ENV, tmp.path());
+    let mgr = make_manager(&tmp);
+    let mut env = HashMap::new();
+    env.insert("CONFIG_PATH".into(), "~/cfg/config.json".into());
+    env.insert("TOKEN".into(), "${GITHUB_TOKEN}".into());
+    env.insert("HOME_ONLY".into(), "~".into());
+    let headers = HashMap::from([("Authorization".into(), "~/still-header".into())]);
+    let oauth = Some(serde_json::json!({
+        "tokenUrl": "~/oauth"
+    }));
+    let server = mgr
+        .add_mcp_server(McpServerInput {
+            name: "paths".into(),
+            server_type: "stdio".into(),
+            command: Some("~\\bin\\tool".into()),
+            args: vec![
+                "~/arg/one".into(),
+                "~\\arg\\two".into(),
+                "~".into(),
+                "~user/bin".into(),
+            ],
+            env,
+            cwd: Some("~/workspace".into()),
+            url: Some("~/leave-as-url".into()),
+            headers,
+            oauth,
+            headers_helper: Some("~/.claude/helper.sh".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let lite = mgr
+        .create_lightweight_profile("lite", Some("lite-mcp-tilde"), LightweightEnv::default())
+        .unwrap();
+    let linked = mgr
+        .set_profile_mcps(&lite.id, std::slice::from_ref(&server.id))
+        .unwrap();
+    let servers = mgr.profile_mcp_servers(&linked).unwrap();
+    let plugin_root = mgr
+        .upsert_local_profile_mcp_plugin(&linked, &servers)
+        .unwrap();
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(plugin_root.join(".mcp.json")).unwrap()).unwrap();
+    let actual_command = config["mcpServers"]["paths"]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let actual_home = actual_command
+        .strip_suffix("/bin/tool")
+        .expect("expanded command should end with the known suffix")
+        .to_string();
+    let expected_cwd = format!("{actual_home}/workspace");
+    let expected_arg_one = format!("{actual_home}/arg/one");
+    let expected_arg_two = format!("{actual_home}/arg/two");
+    let expected_env_path = format!("{actual_home}/cfg/config.json");
+    let expected_headers_helper = format!("{actual_home}/.claude/helper.sh");
+
+    assert_eq!(
+        config["mcpServers"]["paths"]["command"].as_str(),
+        Some(actual_command.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["cwd"].as_str(),
+        Some(expected_cwd.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][0].as_str(),
+        Some(expected_arg_one.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][1].as_str(),
+        Some(expected_arg_two.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][2].as_str(),
+        Some(actual_home.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][3].as_str(),
+        Some("~user/bin")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["CONFIG_PATH"].as_str(),
+        Some(expected_env_path.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["TOKEN"].as_str(),
+        Some("${GITHUB_TOKEN}")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["HOME_ONLY"].as_str(),
+        Some(actual_home.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["headersHelper"].as_str(),
+        Some(expected_headers_helper.as_str())
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["url"].as_str(),
+        Some("~/leave-as-url")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["headers"]["Authorization"].as_str(),
+        Some("~/still-header")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["oauth"]["tokenUrl"].as_str(),
+        Some("~/oauth")
+    );
+}
+
 #[test]
 fn profile_mcp_config_for_remote_windows_expands_tilde_and_normalizes_sftp_home() {
     let server = McpServer {
@@ -3875,47 +3989,80 @@ fn profile_mcp_config_for_remote_windows_expands_tilde_and_normalizes_sftp_home(
 }
 
 #[test]
-fn profile_mcp_config_for_unix_preserves_tilde_literals() {
+fn profile_mcp_config_for_unix_expands_tilde_and_normalizes_separators() {
     let server = McpServer {
         id: "mcp_test".into(),
         name: "paths".into(),
         server_type: "stdio".into(),
         command: Some("~/bin/tool".into()),
-        args: vec!["~\\arg\\two".into()],
-        env: HashMap::from([("CONFIG_PATH".into(), "~/cfg/config.json".into())]),
+        args: vec!["~\\arg\\two".into(), "~".into(), "~user\\bin".into()],
+        env: HashMap::from([
+            ("CONFIG_PATH".into(), "~/cfg/config.json".into()),
+            ("TOKEN".into(), "${GITHUB_TOKEN}".into()),
+        ]),
         cwd: Some("~/workspace".into()),
-        url: None,
-        headers: HashMap::new(),
-        oauth: None,
+        url: Some("~/leave-as-url".into()),
+        headers: HashMap::from([("Authorization".into(), "~/still-header".into())]),
+        oauth: Some(serde_json::json!({
+            "tokenUrl": "~/oauth"
+        })),
         headers_helper: Some("~/helpers/header.sh".into()),
         timeout: None,
         always_load: None,
         disabled: None,
     };
 
-    let config =
-        ProfileManager::profile_mcp_config_for_target(&[server], RemoteOs::Unix, None).unwrap();
+    let config = ProfileManager::profile_mcp_config_for_target(
+        &[server],
+        RemoteOs::Unix,
+        Some("/home/alice/"),
+    )
+    .unwrap();
     let config: serde_json::Value = serde_json::from_str(&config).unwrap();
 
     assert_eq!(
         config["mcpServers"]["paths"]["command"].as_str(),
-        Some("~/bin/tool")
+        Some("/home/alice/bin/tool")
     );
     assert_eq!(
         config["mcpServers"]["paths"]["cwd"].as_str(),
-        Some("~/workspace")
+        Some("/home/alice/workspace")
     );
     assert_eq!(
         config["mcpServers"]["paths"]["args"][0].as_str(),
-        Some("~\\arg\\two")
+        Some("/home/alice/arg/two")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][1].as_str(),
+        Some("/home/alice")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["args"][2].as_str(),
+        Some("~user\\bin")
     );
     assert_eq!(
         config["mcpServers"]["paths"]["env"]["CONFIG_PATH"].as_str(),
-        Some("~/cfg/config.json")
+        Some("/home/alice/cfg/config.json")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["env"]["TOKEN"].as_str(),
+        Some("${GITHUB_TOKEN}")
     );
     assert_eq!(
         config["mcpServers"]["paths"]["headersHelper"].as_str(),
-        Some("~/helpers/header.sh")
+        Some("/home/alice/helpers/header.sh")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["url"].as_str(),
+        Some("~/leave-as-url")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["headers"]["Authorization"].as_str(),
+        Some("~/still-header")
+    );
+    assert_eq!(
+        config["mcpServers"]["paths"]["oauth"]["tokenUrl"].as_str(),
+        Some("~/oauth")
     );
 }
 

@@ -324,7 +324,14 @@ impl ProfileManager {
             )?
         };
         #[cfg(not(windows))]
-        let mcp_config = Self::profile_mcp_config_for_target(servers, RemoteOs::Unix, None)?;
+        let mcp_config = {
+            let home = Self::home_dir()?;
+            Self::profile_mcp_config_for_target(
+                servers,
+                RemoteOs::Unix,
+                Some(home.to_string_lossy().as_ref()),
+            )?
+        };
         Self::write_if_changed(&manifest_path, &Self::profile_mcp_plugin_manifest(profile)?)?;
         Self::write_if_changed(&plugin_root.join(".mcp.json"), &mcp_config)?;
         Self::remove_file_if_exists(&legacy_config_path)?;
